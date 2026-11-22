@@ -1,0 +1,101 @@
+# Secrets are created imperatively and never stored in git:
+#   kubectl -n openagentix-knowledge create secret generic kb-admin \
+#     --from-literal=KB_ADMIN_TOKEN="$(openssl rand -hex 32)"
+#   # only when KB_STORE=postgres:
+#   kubectl -n openagentix-knowledge create secret generic kb-database \
+#     --from-literal=KB_DATABASE_URL="$KB_DATABASE_URL"
+#   # only when an embeddings endpoint needs a key:
+#   kubectl -n openagentix-knowledge create secret generic kb-embeddings \
+#     --from-literal=KB_EMBEDDINGS_API_KEY="$KB_EMBEDDINGS_API_KEY"
+#
+# The kb-admin Secret is optional: if it is absent the pod still starts and the
+# admin API (/v1) answers 403 to everything (ingestion disabled).
+#
+# SECURITY: /mcp has NO authentication. It must only be reachable from the tool
+# gateway (ToolHive/vMCP in namespace mcp-tools). Apply deploy/networkpolicy.yaml
+# (your CNI must enforce NetworkPolicy, or it is silently ignored) and do not
+# expose this Service through an Ingress or LoadBalancer.
+#
+# Agents reach the MCP endpoint (via the tool gateway) at
+#   http://kb.openagentix-knowledge.svc.cluster.local:8080/mcp
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kb
+  namespace: openagentix-knowledge
+  labels: {app: kb}
+spec:
+  # The memory store is per-process, so keep one replica with it. With
+  # KB_STORE=postgres the service is stateless and can be scaled freely, as long
+  # as KB_MCP_STATELESS stays "true" (the default). KB_MCP_STATELESS=false keeps
+  # MCP sessions in process memory and therefore needs exactly one replica.
+  replicas: 1
+  selector:
+    matchLabels: {app: kb}
+  template:
+    metadata:
+      labels: {app: kb}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35   # > KB_SHUTDOWN_GRACE (25s)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kb
+          image: openagentix/kb:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: KB_ADDR, value: ":8080"}
+            # "memory" = zero-dependency dev mode (data lost on restart).
+            # Switch to "postgres" and create the kb-database Secret for real use.
+            - {name: KB_STORE, value: memory}
+            - {name: KB_DB_SCHEMA, value: kb}
+            - name: KB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: kb-admin, key: KB_ADMIN_TOKEN, optional: true}
+            - name: KB_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: kb-database, key: KB_DATABASE_URL, optional: true}
+            # Optional hybrid search: point at any OpenAI-compatible /v1/embeddings
+            # endpoint (e.g. the model gateway). Unset = lexical search only.
+            # - {name: KB_EMBEDDINGS_URL, value: "http://model-gateway.openagentix-gateway.svc.cluster.local:4000/v1"}
+            # - {name: KB_EMBEDDINGS_MODEL, value: "text-embedding-3-small"}
+            # - {name: KB_EMBEDDINGS_DIM, value: "1536"}
+            # - name: KB_EMBEDDINGS_API_KEY
+            #   valueFrom:
+            #     secretKeyRef: {name: kb-embeddings, key: KB_EMBEDDINGS_API_KEY, optional: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 25m, memory: 64Mi}
+            limits: {cpu: 500m, memory: 256Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kb
+  namespace: openagentix-knowledge
+  labels: {app: kb}
+spec:
+  selector: {app: kb}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

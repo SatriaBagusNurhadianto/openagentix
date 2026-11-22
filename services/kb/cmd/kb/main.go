@@ -1,0 +1,90 @@
+// Command kb serves the OpenAgentix knowledge base: an MCP endpoint for agents
+// and an admin REST API for ingestion, over a pluggable store.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/openagentix/openagentix/services/kb/internal/chunk"
+	"github.com/openagentix/openagentix/services/kb/internal/config"
+	"github.com/openagentix/openagentix/services/kb/internal/embed"
+	"github.com/openagentix/openagentix/services/kb/internal/kb"
+	"github.com/openagentix/openagentix/services/kb/internal/server"
+	"github.com/openagentix/openagentix/services/kb/internal/store"
+	"github.com/openagentix/openagentix/services/kb/internal/store/memory"
+	"github.com/openagentix/openagentix/services/kb/internal/store/postgres"
+)
+
+// version is stamped at build time with -ldflags "-X main.version=...".
+var version = "dev"
+
+func main() {
+	level := slog.LevelInfo
+	if v := os.Getenv("KB_LOG_LEVEL"); v != "" {
+		_ = level.UnmarshalText([]byte(v))
+	}
+	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	if err := run(ctx, os.Getenv, log, nil); err != nil && !errors.Is(err, context.Canceled) {
+		log.Error("kb stopped", "err", err)
+		os.Exit(1)
+	}
+	log.Info("kb stopped")
+}
+
+// run wires everything and serves until ctx is cancelled. onListen, if set,
+// receives the bound address once the listener is up.
+func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onListen func(addr string)) error {
+	cfg, err := config.Load(getenv)
+	if err != nil {
+		return fmt.Errorf("invalid configuration: %w", err)
+	}
+	var embedder embed.Embedder = embed.None{}
+	if cfg.EmbeddingsEnabled() {
+		embedder, err = embed.NewOpenAI(embed.OpenAIConfig{
+			URL: cfg.EmbeddingsURL, Model: cfg.EmbeddingsModel, APIKey: cfg.EmbeddingsAPIKey,
+			Dim: cfg.EmbeddingsDim, Timeout: cfg.EmbeddingsTimeout,
+		})
+		if err != nil {
+			return fmt.Errorf("embeddings: %w", err)
+		}
+	}
+	var st store.Store
+	switch cfg.Store {
+	case "postgres":
+		st, err = postgres.Open(ctx, postgres.Options{URL: cfg.DatabaseURL, Schema: cfg.DBSchema, VectorDim: embedder.Dimensions()})
+		if err != nil {
+			return fmt.Errorf("postgres store: %w", err)
+		}
+	default:
+		st = memory.New(embedder.Dimensions())
+	}
+	defer st.Close()
+
+	svc := &kb.Service{
+		Store: st, Embedder: embedder,
+		Chunk:       chunk.Options{MaxChars: cfg.ChunkMaxChars, Overlap: cfg.ChunkOverlap},
+		DocMaxChars: cfg.DocMaxChars, Log: log,
+		QueryEmbedTimeout: cfg.QueryEmbedTimeout, MaxChunksPerDoc: cfg.MaxChunksPerDoc,
+	}
+	ln, err := net.Listen("tcp", cfg.Addr)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+	log.Info("kb starting", append(cfg.LogAttrs(), "version", version, "listen", ln.Addr().String())...)
+	if cfg.AdminToken == "" && !cfg.AdminAllowAnonymous {
+		log.Warn("admin API disabled: set KB_ADMIN_TOKEN to enable ingestion")
+	}
+	if onListen != nil {
+		onListen(ln.Addr().String())
+	}
+	return server.Run(ctx, server.Deps{Svc: svc, Cfg: cfg, Log: log, Version: version}, ln)
+}

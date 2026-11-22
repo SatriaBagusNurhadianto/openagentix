@@ -1,0 +1,33 @@
+# Restricts who can reach the kb pod. /mcp has no authentication of its own, so
+# network policy is what keeps it private to the tool gateway.
+#
+# NOTE: NetworkPolicy is only enforced if the cluster's CNI implements it
+# (Calico, Cilium, ...). On a CNI that does not (e.g. plain kindnet/flannel) this
+# object is accepted and silently does nothing.
+#
+# Ingress allowed:
+#   - from namespace mcp-tools          -> MCP (/mcp), port 8080
+#   - from pods in this same namespace  -> admin API (/v1) for ingest jobs, port 8080
+# MCP and admin share port 8080, so the admin API is also reachable from mcp-tools
+# at the network level; it stays protected by KB_ADMIN_TOKEN (bearer, fail-closed).
+# Kubelet probes originate on the node and are allowed by CNIs that enforce
+# policy; if yours blocks them, add an ipBlock for the node CIDR.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kb-ingress
+  namespace: openagentix-knowledge
+spec:
+  podSelector:
+    matchLabels: {app: kb}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: mcp-tools}
+      ports:
+        - {protocol: TCP, port: 8080}
+    - from:
+        - podSelector: {}
+      ports:
+        - {protocol: TCP, port: 8080}

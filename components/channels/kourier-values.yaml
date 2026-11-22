@@ -1,0 +1,16 @@
+# Values for the Agent Kourier release installed by components/channels/kourier.sh (chart agent-kourier 0.6.0, the image is
+# pinned by digest by the chart itself). install.sh adds, from the openagentix chart (one source of truth), the namespace
+# list `config.connectionNamespaces`, the egress rule to the kagent controller and the API server's address.
+config:
+  source: crds                 # ChatConnection / Binding / AgentBackend custom resources, rendered by charts/openagentix
+chatListener:
+  enabled: true                # webhook connections need it: POST /chat/webhook/<namespace>/<connection>, port 8081, ClusterIP only
+  # Ingress is deliberately off: the listener is not exposed. Test with `kubectl port-forward` (README "Channels and triggers").
+networkPolicy:
+  enabled: true                # egress: DNS, the API server, the kagent controller (extraEgress), Slack :443; ingress: chatFrom, metricsFrom
+  # Who may reach the chat port. Pods of this namespace only (that is, Kourier itself): a `kubectl port-forward` is not
+  # affected by it. Put your ingress controller's pods here when you expose webhooks (see README).
+  chatFrom:
+    - podSelector: {}
+  metricsFrom: []              # nobody scrapes the metrics port by default; add your Prometheus here
+# Left at the chart defaults: SQLite on a 1Gi PVC, 50m/64Mi requests, 256Mi limit, one replica, no Ingress, no ServiceMonitor.

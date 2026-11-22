@@ -70,6 +70,11 @@ spec:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.bridge.namespace }}}}
           podSelector: {matchLabels: {app: telegram-bridge}}
         {{- end }}
+        {{- if .Values.channels.kourier.enabled }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.channels.kourier.broker.namespace | quote }}}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.channels.kourier.broker.podLabels | nindent 14 }}
+        {{- end }}
         {{- range $n.extraA2ACallers }}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace | quote }}}}
           {{- if .podLabels }}

@@ -22,6 +22,66 @@ networkPolicy:
   extraA2ACallers: []
   controllerPort: 8083                   # A2A, REST API and the sandbox task-store gRPC share this port
 
+# ---- Channels and triggers (Agent Kourier, optional) --------------------------------------------
+# Agent Kourier (https://github.com/agentkourier/agent-kourier) connects chat platforms (Slack) and signed webhooks to
+# kagent agents. OFF by default: nothing below renders until `channels.kourier.enabled` is true. install.sh installs the
+# pinned Kourier release (components/channels/kourier.sh) when it sees the block enabled, BEFORE this chart, so the CRDs
+# exist; without the CRDs the chart renders no Kourier custom resources. The chart renders no Secret values: each
+# connection names an existing Secret. See README "Channels and triggers" for the three mapping patterns.
+channels:
+  kourier:
+    enabled: false
+    namespace: openagentix-channels      # "team" namespace: holds the connections, bindings and their Secrets
+    broker:                              # where install.sh puts Kourier's own release (one release, alone in its namespace)
+      namespace: agent-kourier
+      serviceAccount: agent-kourier
+      podLabels: {app.kubernetes.io/name: agent-kourier}   # admitted by the controller NetworkPolicy, with the namespace
+    backend:
+      name: kagent                       # AgentBackend name (dialect kagent-v1)
+      url: ""                            # default: the kagent controller Service on networkPolicy.controllerPort
+  # One entry per chat service account / webhook source. Fields: name, platform (slack|webhook), existingSecret
+  # (Secret in channels.kourier.namespace; keys by platform: slack socket = botToken+appToken, slack http = botToken+
+  # signingSecret, webhook = webhookSecret (hmac-sha256) or token), optional allowedNamespaces, and the platform block
+  # (`slack:` or `webhook:`), copied unchanged into the ChatConnection spec.
+  connections: []
+  #  - name: orders-hook
+  #    platform: webhook
+  #    existingSecret: orders-hook-webhook      # install.sh generates it (random, never printed) when absent
+  #    webhook:
+  #      identity: orders-system
+  #      verify: {scheme: hmac-sha256, header: X-Signature, prefix: "sha256="}
+  #      channel: {from: [/channel]}
+  #      actor: {from: [/user/login]}
+  #      thread: {field: conversation, prefix: conv-}
+  #      delivery: {header: X-Delivery-Id}
+  #      fields:
+  #        - {name: event, from: [/event], kind: id}
+  #        - {name: conversation, from: [/conversation], kind: id}
+  #        - {name: question, from: [/question]}
+  #  - name: team-slack
+  #    platform: slack
+  #    existingSecret: team-slack-tokens        # keys botToken, appToken (you create it, see README "Slack")
+  #    slack: {mode: socket}
+  # One entry per (connection channel -> agent). Fields: name, connection, channel, agent (an agents[].name; the render
+  # fails otherwise), userId (X-User-Id sent to kagent: default kourier:<binding name>; ONE memory scope per Binding),
+  # output (none|live|final; default none on webhook connections, Kourier's default live otherwise), triggers[] (copied
+  # unchanged), and optional chat (extra spec.chat fields such as progress, threadReplies, mentions), interactions,
+  # feedback, session (copied unchanged).
+  bindings: []
+  # Pattern 1, a trigger per agent: one webhook connection, one Binding per agent, each with its own channel value
+  # and `match`, so an event is routed to the agent that owns it:
+  #  - {name: orders-to-assistant, connection: orders-hook, channel: orders, agent: assistant,
+  #     triggers: [{type: webhookEvent, match: {event: '^order\.failed$'}, promptTemplate: "...", limits: {...}}]}
+  #  - {name: deploys-to-ops, connection: orders-hook, channel: deploys, agent: ops,
+  #     triggers: [{type: webhookEvent, match: {event: '^deploy\.'}, promptTemplate: "...", limits: {...}}]}
+  # Pattern 2, one bot, an agent per Slack channel: one connection, one Binding per channel:
+  #  - {name: eng, connection: team-slack, channel: C0ENG000001, agent: assistant, output: live, triggers: [{type: mention}]}
+  #  - {name: sec, connection: team-slack, channel: C0SEC000001, agent: security, output: live, triggers: [{type: mention}]}
+  # Pattern 3, one bot per agent: one Slack app (connection, with its own tokens) per agent:
+  #  connections: [{name: slack-assistant, ...existingSecret: assistant-slack-tokens}, {name: slack-security, ...existingSecret: security-slack-tokens}]
+  #  bindings:    [{name: a, connection: slack-assistant, channel: C0ENG000001, agent: assistant, ...},
+  #                {name: s, connection: slack-security,  channel: C0ENG000001, agent: security, ...}]
+
 # ---- Telegram -> A2A bridge --------------------------------------------------------------------
 bridge:
   enabled: true

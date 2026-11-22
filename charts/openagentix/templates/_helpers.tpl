@@ -42,3 +42,9 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- define "oa.memoryBaseUrl" -}}
 http://{{ .Values.memory.gatewayAlias }}.{{ .Values.gateway.namespace }}.svc.cluster.local{{ if ne (int .Values.gateway.port) 80 }}:{{ .Values.gateway.port }}{{ end }}/v1
 {{- end -}}
+
+{{/* JSON list: the distinct Secrets named by channels.connections[], sorted. */}}
+{{- define "oa.channelSecrets" -}}
+{{- $s := list -}}{{- range .Values.channels.connections }}{{ $s = append $s .existingSecret }}{{ end -}}
+{{- $s | uniq | sortAlpha | toJson -}}
+{{- end -}}

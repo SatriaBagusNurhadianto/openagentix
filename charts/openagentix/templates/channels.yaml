@@ -1,0 +1,124 @@
+{{- /*
+Channels and triggers: Agent Kourier resources, rendered only when channels.kourier.enabled. The Kourier release itself
+(CRDs, broker) is installed by install.sh before this chart. The chart never renders Secret values.
+*/ -}}
+{{- if .Values.channels.kourier.enabled }}
+{{- $c := .Values.channels }}
+{{- $k := $c.kourier }}
+{{- if not .Values.kagent.enabled }}{{ fail "channels.kourier.enabled needs kagent.enabled=true (Kourier talks to kagent agents)" }}{{ end }}
+{{- $agents := list }}{{ range .Values.agents }}{{ $agents = append $agents .name }}{{ end }}
+{{- $conns := dict }}
+{{- range $c.connections }}
+{{- if not .name }}{{ fail "channels.connections[]: every entry needs a name" }}{{ end }}
+{{- if not (has .platform (list "slack" "webhook")) }}{{ fail (printf "channels.connections[%s]: platform must be slack or webhook, got %q" .name (toString .platform)) }}{{ end }}
+{{- if not .existingSecret }}{{ fail (printf "channels.connections[%s]: existingSecret is required (the chart never renders Secret values)" .name) }}{{ end }}
+{{- $_ := set $conns .name .platform }}
+{{- end }}
+{{- range $c.bindings }}
+{{- if not (hasKey $conns .connection) }}{{ fail (printf "binding %q: connection %q is not in channels.connections[] (have: %s)" .name (toString .connection) (keys $conns | sortAlpha | join ", ")) }}{{ end }}
+{{- if not (has .agent $agents) }}{{ fail (printf "binding %q: agent %q is not in agents[] (have: %s)" .name (toString .agent) (join ", " $agents)) }}{{ end }}
+{{- end }}
+{{- $backendUrl := default (printf "http://kagent-controller.%s.svc.cluster.local:%v" .Values.kagent.namespace .Values.networkPolicy.controllerPort) $k.backend.url }}
+{{- $ns := $k.namespace }}
+---
+# Marker and hand-off for install.sh: which namespaces to create, where Kourier lives, and the egress rule the broker's
+# own NetworkPolicy needs to reach the kagent controller (one source of truth: derived from this chart's values).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openagentix-channels
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+data:
+  namespace: {{ $ns | quote }}
+  brokerNamespace: {{ $k.broker.namespace | quote }}
+  brokerEgress: {{ list (dict "to" (list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Values.kagent.namespace)) "podSelector" (dict "matchLabels" .Values.networkPolicy.controllerPodLabels))) "ports" (list (dict "port" (int .Values.networkPolicy.controllerPort) "protocol" "TCP"))) | toJson | quote }}
+{{- if $c.connections }}
+---
+# The broker reads each connection's Secret with its own ServiceAccount: list+watch on exactly those Secrets.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: agent-kourier-secrets
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames:
+    {{- range (include "oa.channelSecrets" . | fromJsonArray) }}
+      - {{ . | quote }}
+    {{- end }}
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: agent-kourier-secrets
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: agent-kourier-secrets}
+subjects:
+  - {kind: ServiceAccount, name: {{ $k.broker.serviceAccount | quote }}, namespace: {{ $k.broker.namespace | quote }}}
+{{- end }}
+{{- if .Capabilities.APIVersions.Has "agentkourier.dev/v1alpha1" }}
+---
+apiVersion: agentkourier.dev/v1alpha1
+kind: AgentBackend
+metadata:
+  name: {{ $k.backend.name }}
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  dialect: kagent-v1
+  url: {{ $backendUrl | quote }}
+{{- range $c.connections }}
+---
+apiVersion: agentkourier.dev/v1alpha1
+kind: ChatConnection
+metadata:
+  name: {{ .name }}
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  platform: {{ .platform }}
+  credentialsSecretRef: {name: {{ .existingSecret | quote }}}
+  {{- with .allowedNamespaces }}
+  allowedNamespaces: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- if and (eq .platform "slack") .slack }}
+  slack: {{- toYaml .slack | nindent 4 }}
+  {{- end }}
+  {{- if and (eq .platform "webhook") .webhook }}
+  webhook: {{- toYaml .webhook | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- range $c.bindings }}
+{{- $platform := get $conns .connection }}
+{{- $chat := dict "connectionRef" (dict "name" .connection) "channel" .channel }}
+{{- if .triggers }}{{ $_ := set $chat "triggers" .triggers }}{{ end }}
+{{- if .output }}{{ $_ := set $chat "output" .output }}{{ else if eq $platform "webhook" }}{{ $_ := set $chat "output" "none" }}{{ end }}
+{{- $chat = merge $chat (default dict .chat) }}
+---
+apiVersion: agentkourier.dev/v1alpha1
+kind: Binding
+metadata:
+  name: {{ .name }}
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  agent: {name: {{ .agent | quote }}, namespace: {{ $.Values.kagent.namespace | quote }}, backendRef: {name: {{ $k.backend.name | quote }}}}
+  identity: {userId: {{ default (printf "kourier:%s" .name) .userId | quote }}}
+  chat: {{- toYaml $chat | nindent 4 }}
+  {{- with .interactions }}
+  interactions: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .feedback }}
+  feedback: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with .session }}
+  session: {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

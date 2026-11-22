@@ -153,6 +153,100 @@ kubectl exec -n kagent kagent-pg-0 -- psql -U postgres -d kagent -c \
 
 **Footprint** (kind, 1 arm64 node): the embedding server idles at 74 MiB and was 133 MiB after a few calls (requests 192 MiB, limit 512 MiB, 1 GiB PVC for the model); kagent's PostgreSQL stayed at 60 to 61 MiB with pgvector on and a few rows; the `memory` table with two rows is 96 kB. The node's memory requests went from 3714 Mi to 3906 Mi.
 
+## Channels and triggers
+
+[Agent Kourier](https://github.com/agentkourier/agent-kourier) (0.6.0, pinned) connects chat platforms and signed webhooks to kagent agents. It is a small broker (one pod, SQLite on a 1Gi PVC, about 58 MB resident) that watches three custom resources: a **ChatConnection** (one Slack app or one webhook source, with its Secret), a **Binding** (connection channel -> agent, with triggers, limits and the user id the agent sees) and an **AgentBackend** (how to reach kagent, dialect `kagent-v1`). OpenAgentix renders all three from values; Kourier itself is installed by `install.sh`. It is **off by default**: with `channels.kourier.enabled: false` the chart renders nothing for it (byte-identical output to before).
+
+**Enable it.** The one switch is the chart value `channels.kourier.enabled`, set in a values file you pass every run (Helm replaces release values on each run):
+
+```sh
+VALUES_FILE=components/channels/demo-values.yaml ./install.sh     # Kourier on, one demo webhook connection and binding to `assistant`
+```
+
+When the chart renders the block, `install.sh` (before the chart, so the CRDs exist): creates the Secret of each webhook connection if it is absent (random, never printed, kept on re-runs), checks that Slack Secrets exist, installs the `agent-kourier` Helm release in namespace `agent-kourier` (`components/channels/kourier.sh`; verifies the chart and the image digest with `cosign` when it is installed and says so when it skips that), then installs the chart. A re-run changes nothing (same chart version and values: no new revision, no pod restart). The chart also admits Kourier's pod to the kagent controller's port 8083 (a NetworkPolicy peer derived from the same switch, so a later install cannot drop it; `networkPolicy.extraA2ACallers` still works next to it). Kourier's own NetworkPolicy is on (`components/channels/kourier-values.yaml`): egress only to DNS, the API server, the kagent controller and port 443 outside the private ranges (Slack); ingress only the chat port from pods in its own namespace. Without a values file that enables it, a run that finds Kourier installed prints a note and removes the connections and bindings from the release; `./uninstall.sh` removes the Kourier release (see below).
+
+**Values.** Connections and bindings live in the top-level `channels` block (see `charts/openagentix/values.yaml` for all fields and the three patterns as comments). A webhook connection and a binding to `assistant`:
+
+```yaml
+channels:
+  kourier: {enabled: true}
+  connections:
+    - name: orders-hook
+      platform: webhook
+      existingSecret: orders-hook-webhook          # install.sh generates it (key webhookSecret) when absent
+      webhook:                                      # copied unchanged into the ChatConnection spec
+        identity: orders-system
+        verify: {scheme: hmac-sha256, header: X-Signature, prefix: "sha256="}
+        channel: {from: [/channel]}
+        actor: {from: [/user/login]}
+        thread: {field: conversation, prefix: conv-}
+        delivery: {header: X-Delivery-Id}
+        fields:
+          - {name: event, from: [/event], kind: id}
+          - {name: conversation, from: [/conversation], kind: id}
+          - {name: detail, from: [/detail]}
+  bindings:
+    - name: orders-assistant
+      connection: orders-hook
+      channel: orders
+      agent: assistant                              # must be one of agents[].name, or the render fails
+      triggers:                                     # copied unchanged
+        - type: webhookEvent
+          match: {event: '^order\.failed$'}
+          promptTemplate: |
+            Order {{ .Fields.conversation }} failed. Find out why and say what to do. The detail is in the untrusted data block.
+          limits: {rateLimit: {maxRuns: 20, per: 1h, maxConcurrent: 2}, maxRunsPerDay: 100}
+```
+
+The Secret is only referenced: the chart renders no Secret values. The chart also renders a Role that lets Kourier's ServiceAccount `list` and `watch` exactly the Secrets your connections name. The `userId` of a binding is what kagent sees as the caller (default `kourier:<binding name>`).
+
+**Three ways to map agents.**
+
+- **A trigger per agent.** One webhook connection, one binding per agent. Each binding has its own `channel` value and its own `match`, so each event goes to the agent that owns it (`orders` to `assistant`, `deploys` to `ops`).
+- **One bot, an agent per channel.** One Slack connection, one binding per Slack channel id, each naming another agent: `{name: eng, connection: team-slack, channel: C0ENG000001, agent: assistant}`, `{name: sec, connection: team-slack, channel: C0SEC000001, agent: security}`.
+- **One bot per agent.** One Slack app, so one connection and one Secret, per agent, each with a binding to its agent (the bots can sit in the same channel).
+
+**Define a webhook trigger for an agent.** Add a connection (how to verify the signature and where the channel, actor, conversation and fields are in the JSON body) and a binding with a `webhookEvent` trigger whose `match` is a regular expression over a field you declared, plus a `promptTemplate` (fields of kind `id` may be used in the template and thread key; `text` fields reach the agent only as untrusted data). Always set `limits`: excess events are dropped, not queued, and the sender is still told `200`.
+
+**Test it locally.** The chat listener Service is ClusterIP only; nothing is exposed. Port-forward and send a signed event (the demo connection `demo-webhook`, header `X-Demo-Signature`; the secret is read from the cluster at signing time and never printed):
+
+```sh
+kubectl port-forward -n agent-kourier svc/agent-kourier-chat 8081:8081 &
+BODY='{"event":"question.asked","channel":"demo","user":{"login":"alice"},"conversation":"c1","question":"Does lodash 4.17.20 have known vulnerabilities? How many?"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$(kubectl get secret -n openagentix-channels demo-webhook -o jsonpath='{.data.webhookSecret}' | base64 -d)" -hex | awk '{print $NF}')
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8081/chat/webhook/openagentix-channels/demo-webhook \
+  -H 'Content-Type: application/json' -H "X-Demo-Signature: sha256=$SIG" -H 'X-Demo-Delivery: d1' --data-binary "$BODY"
+```
+
+After a fresh install the binding can stay `Ready=False` (reason `AgentNotReady`) for a few minutes after the agent is Ready: Kourier re-checks the agent only periodically. A `200` means accepted; a wrong signature is `401`. The agent's answer is not returned (see limits): `kubectl logs -n agent-kourier deploy/agent-kourier` shows `session turn started` and `session turn ended outcome=completed`, and the text is in kagent's task store (`kagent.session_task` in the kagent PostgreSQL).
+
+**Exposure.** The chat listener stays a ClusterIP Service on port 8081 and the chart creates no Ingress and no public endpoint. To receive real webhooks you would add an Ingress (or Gateway API route) in front of `agent-kourier-chat:8081` for the path `/chat/webhook/<namespace>/<connection>` only, terminate TLS there, and put the ingress controller's pods in `networkPolicy.chatFrom` (a values file passed with `KOURIER_VALUES_FILE`, replacing the default in `components/channels/kourier-values.yaml`) so the policy admits it; Kourier's chart has `chatListener.ingress` for the Ingress object. Webhook authenticity rests on the HMAC (or token) of the connection, so use a long random Secret.
+
+**Limits (read before relying on it).**
+
+- Upstream is experimental and 0.x with one maintainer; the webhook platform is the newest part. Pin and re-run the spike checks (`spikes/kourier/NOTES.md`) when you upgrade.
+- A webhook has **no reply route**: the binding's `output` must be `none`, and the answer is visible only in kagent's store. The agent has to act through its own tools (see `docs/decisions/0002-schedules-and-trigger-delivery.md`).
+- **No direct messages**: Kourier serves channels and mentions, so Telegram (which is chat-by-DM) stays on our own bridge.
+- **One memory scope per Binding.** Every conversation of a binding runs as the binding's fixed `userId`; kagent's long-term memory is keyed by agent and user id, so all of a binding's conversations share it. Give different teams different bindings.
+- **Anyone in a bound Slack channel can use the agent** (and spend its budget); the channel is the access control.
+- The kagent controller does not authenticate callers (insecure mode), so Kourier's `userId` is an unauthenticated claim and the NetworkPolicy peer is the only fence.
+- A Kourier restart in the middle of a turn ends the turn recorded as `refused` on kagent 1.0.1 (it re-attaches with a call kagent answers `UNSUPPORTED_OPERATION`), even though the task completes. With a Slack reply route the user would see a failure notice instead of the answer.
+- Rate limits drop the excess; the dedupe key is the body hash and lives in memory.
+
+**Slack (UNTESTED).** The Slack path of this integration has not been run: the project had no Slack tokens. The values and RBAC follow Kourier's documentation and CRD schema only. When you have them:
+
+1. Create a Slack app with Socket Mode on, a bot token (`xoxb-...`) and an app-level token (`xapp-...`, scope `connections:write`); subscribe the bot to `app_mention` and `message.channels`, and invite it to the channel. See Kourier's `docs/reference/platforms.md` for scopes.
+2. Create the Secret yourself, in `channels.kourier.namespace` (default `openagentix-channels`), with exactly the keys `botToken` and `appToken` (HTTP mode needs `botToken` and `signingSecret` instead). Do not put the values in a file or in shell history you keep:
+
+   ```sh
+   kubectl create namespace openagentix-channels --dry-run=client -o yaml | kubectl apply -f -
+   kubectl create secret generic team-slack-tokens -n openagentix-channels --from-literal=botToken="$SLACK_BOT_TOKEN" --from-literal=appToken="$SLACK_APP_TOKEN"
+   ```
+3. Add to your values file: a connection `{name: team-slack, platform: slack, existingSecret: team-slack-tokens, slack: {mode: socket}}` and a binding `{name: eng, connection: team-slack, channel: <Slack channel id>, agent: assistant, output: live, triggers: [{type: mention}]}`; run the installer with that file. `kubectl get bindings.agentkourier.dev -n openagentix-channels` shows `READY`.
+4. Check what the spike could not: streaming cards, the restart caveat with a real reply path, thread-to-session mapping and the memory scope per channel.
+
+**Uninstall.** `./uninstall.sh` removes the openagentix release and then the `agent-kourier` release. It leaves the namespaces `agent-kourier` and `openagentix-channels`, Kourier's PVC and CRDs and the generated webhook Secret. `PURGE_SECRETS=1` also deletes the webhook Secrets install.sh generated (never your Slack Secrets); `PURGE_DATA=1` also deletes Kourier's PVC and its three CRDs (the chart marks them `keep`; deleting them deletes any ChatConnection, Binding or AgentBackend still present).
+
 ## Add an agent
 
 Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt; `memory: {enabled: true}` turns on long-term memory, see "Memory"):
@@ -200,7 +294,7 @@ What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy)
 **Protected**
 
 - **Network, `mcp-tools` (chart, `networkPolicy.enabled`, default on).** MCP backends and their proxies accept connections only from their own namespace and from the ToolHive operator. The vMCP (port 4483) additionally accepts the Substrate egress proxy (`atenet-egress` in `ate-system`) and the kagent controller pod. A pod in `default` or in another namespace times out.
-- **Network, kagent controller port 8083.** A2A, the REST API and the sandboxes' task-store gRPC share this port. It accepts the Telegram bridge pod (selected by pod label `app=telegram-bridge` in `openagentix-gateway`, not the whole namespace), every pod in the `kagent` namespace (UI, tools, worker pool) and `atenet-egress`. Other pods time out. Ports other than 8083 are left open, as before (the controller listens on no other).
+- **Network, kagent controller port 8083.** A2A, the REST API and the sandboxes' task-store gRPC share this port. It accepts the Telegram bridge pod (selected by pod label `app=telegram-bridge` in `openagentix-gateway`, not the whole namespace), every pod in the `kagent` namespace (UI, tools, worker pool), `atenet-egress` and, when `channels.kourier.enabled`, the Agent Kourier pod (namespace and pod labels). Other pods time out. Ports other than 8083 are left open, as before (the controller listens on no other).
 - **Tool identity (chart, `mcp.virtual.incomingAuth.type: oidc`, default).** The vMCP rejects requests without a valid Substrate actor JWT (HTTP 401, also for a malformed token). The RemoteMCPServer asks Substrate for a token with the dedicated audience `openagentix-vmcp`, and the egress proxy adds it to every tool call. The vMCP verifies issuer, signature (explicit JWKS URL, TLS checked against the Substrate service CA, which `install.sh` copies into a ConfigMap), audience and expiry. No `insecure*` flag is set; `jwksAllowPrivateIP` is on because the IdP's ClusterIP is a private address.
 - **Network, `openagentix-knowledge` (chart, same switch).** The kb pod accepts port 8080 only from the vMCP pod (selected by namespace and pod labels); the kb port carries both `/mcp` (no authentication, by design) and the admin API (bearer token), so the policy and the token together are the control. PostgreSQL accepts only the kb pod. The embedding server accepts only the model gateway proxy pod (the kb pod in direct mode). Checked with a pod in `default` (all three time out), another pod in the knowledge namespace (all three time out) and a non-vMCP pod in `mcp-tools` (kb times out). A request to `/v1/embeddings` on the gateway without a key or with a wrong key gets 401.
 - **Tool authorization (optional).** `mcp.virtual.incomingAuth.toolAccess` turns into Cedar `permit` rules keyed on the token's `atespace` claim and the tool name; with it set, a tool not listed is refused (and hidden from the agent's tool list). Verified: with `osv_query_vulnerability` left out, Cedar logged deny for it and allow for the others, and the agent answered through `osv_query_vulnerabilities_batch` instead.
@@ -246,6 +340,9 @@ components/model-gateway/       agentgateway install script, original manifests 
 components/tools/               ToolHive install script, original manifests, example skill, verify/ clients, NOTES
 components/agents/              the original hand-applied assistant agent (now rendered by the chart)
 hack/kind-config.yaml           kind cluster config (node image pin) used by install.sh
+components/channels/            Agent Kourier install script, its values, a demo webhook values file
+docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: proposed)
+spikes/kourier/                 Agent Kourier spike (evidence; superseded by the integration)
 spikes/kagent/                  kagent + Substrate bring-up (up.sh, values) and NOTES
 spikes/ax/                      Google AX spike; not installed
 ```

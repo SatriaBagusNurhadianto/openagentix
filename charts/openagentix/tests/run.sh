@@ -456,6 +456,123 @@ eq "extra caller without podLabels admits its whole namespace" "$(q "$D2" "$CP|[
 eq "extra callers do not open the other ports"         "$(q "$D2" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
 eq "default policy is byte-identical when the list is empty" "$(q "$D" "$CP|.spec.ingress|length")" 2
 
+echo "# channels and triggers (Agent Kourier, opt-in)"
+KAPI="--api-versions agentkourier.dev/v1alpha1"
+CHF="$(dirname "$0")/.channels.yaml"
+cat > "$CHF" <<'YAML'
+channels:
+  kourier:
+    enabled: true
+  connections:
+    - name: orders-hook
+      platform: webhook
+      existingSecret: orders-hook-webhook
+      webhook:
+        identity: orders-system
+        verify: {scheme: hmac-sha256, header: X-Sig, prefix: "sha256="}
+        channel: {from: [/channel]}
+        actor: {from: [/user/login]}
+        thread: {field: conversation, prefix: conv-}
+        delivery: {header: X-Delivery}
+        fields:
+          - {name: event, from: [/event], kind: id}
+          - {name: conversation, from: [/conversation], kind: id}
+    - name: team-slack
+      platform: slack
+      existingSecret: team-slack-tokens
+      slack: {mode: socket}
+  bindings:
+    - name: orders-assistant
+      connection: orders-hook
+      channel: orders
+      agent: assistant
+      triggers:
+        - type: webhookEvent
+          match: {event: '^order\.failed$'}
+          promptTemplate: "Check order {{ .Fields.conversation }}."
+          limits: {rateLimit: {maxRuns: 5, per: 1h, maxConcurrent: 1}, maxRunsPerDay: 20}
+    - name: eng-slack
+      connection: team-slack
+      channel: C0123456789
+      agent: assistant
+      userId: slack-eng
+      output: final
+      triggers:
+        - {type: mention}
+    - name: eng-default
+      connection: team-slack
+      channel: C0999999999
+      agent: assistant
+      triggers:
+        - {type: personMessage}
+YAML
+D=$(docs)
+eq "default render has no agentkourier.dev objects"    "$(count "$D" '(.apiVersion|startswith("agentkourier.dev"))')" 0
+eq "default render has no channels namespace objects"  "$(count "$D" '.metadata.namespace=="openagentix-channels"')" 0
+eq "channels.kourier.enabled defaults to false"        "$(yq -c .channels.kourier.enabled "$CHART/values.yaml")" false
+eq "channels.connections and bindings default to empty" "$(yq -c '[.channels.connections,.channels.bindings]' "$CHART/values.yaml")" '[[],[]]'
+H0=$(helm template openagentix "$CHART" -n openagentix-system 2>&1 | shasum -a 256)
+H1=$(helm template openagentix "$CHART" -n openagentix-system -f <(sed 's/enabled: true/enabled: false/' "$CHF") $KAPI 2>&1 | shasum -a 256)
+eq "enabled=false with connections/bindings defined renders byte-identical to the defaults" "$H1" "$H0"
+D=$(docs -f "$CHF")
+eq "enabled but CRDs absent (no api-versions): no Kourier custom resources" "$(count "$D" '(.apiVersion|startswith("agentkourier.dev"))')" 0
+eq "enabled but CRDs absent: Role and marker ConfigMap still render" "$(count "$D" '.metadata.namespace=="openagentix-channels"')" 3
+D=$(docs -f "$CHF" $KAPI)
+eq "AgentBackend, 2 ChatConnections, 3 Bindings"       "$(q "$D" '[.[]|select(.apiVersion|startswith("agentkourier.dev"))|.kind]|sort|join(",")')" AgentBackend,Binding,Binding,Binding,ChatConnection,ChatConnection
+eq "CRs live in channels.kourier.namespace"            "$(q "$D" '[.[]|select(.apiVersion|startswith("agentkourier.dev"))|.metadata.namespace]|unique|join(",")')" openagentix-channels
+AB='.[]|select(.kind=="AgentBackend")'
+eq "AgentBackend dialect kagent-v1"                    "$(q "$D" "$AB|.spec.dialect")" kagent-v1
+eq "AgentBackend url derived from kagent values"       "$(q "$D" "$AB|.spec.url")" http://kagent-controller.kagent.svc.cluster.local:8083
+CW='.[]|select(.kind=="ChatConnection" and .metadata.name=="orders-hook")'
+CS='.[]|select(.kind=="ChatConnection" and .metadata.name=="team-slack")'
+eq "webhook connection: platform and Secret reference" "$(q "$D" "$CW|.spec.platform+\" \"+.spec.credentialsSecretRef.name")" "webhook orders-hook-webhook"
+eq "webhook settings pass through faithfully"          "$(q "$D" "$CW|.spec.webhook|[.identity,.verify.scheme,.verify.header,.verify.prefix,.channel.from[0],.actor.from[0],.thread.field,.thread.prefix,.delivery.header,(.fields|length)]|join(\" \")")" "orders-system hmac-sha256 X-Sig sha256= /channel /user/login conversation conv- X-Delivery 2"
+eq "webhook connection has no slack block"             "$(q "$D" "$CW|.spec|has(\"slack\")")" false
+eq "slack connection: platform, Secret, mode"          "$(q "$D" "$CS|.spec.platform+\" \"+.spec.credentialsSecretRef.name+\" \"+.spec.slack.mode")" "slack team-slack-tokens socket"
+eq "slack connection has no webhook block"             "$(q "$D" "$CS|.spec|has(\"webhook\")")" false
+BW='.[]|select(.kind=="Binding" and .metadata.name=="orders-assistant")'
+BS='.[]|select(.kind=="Binding" and .metadata.name=="eng-slack")'
+eq "binding: agent ref (name, namespace, backend)"     "$(q "$D" "$BW|.spec.agent|.name+\" \"+.namespace+\" \"+.backendRef.name")" "assistant kagent kagent"
+eq "binding: connection and channel"                   "$(q "$D" "$BW|.spec.chat|.connectionRef.name+\" \"+.channel")" "orders-hook orders"
+eq "binding: default userId is kourier:<binding name>" "$(q "$D" "$BW|.spec.identity.userId")" kourier:orders-assistant
+eq "binding: explicit userId wins"                     "$(q "$D" "$BS|.spec.identity.userId")" slack-eng
+eq "binding on a webhook connection defaults to output none" "$(q "$D" "$BW|.spec.chat.output")" none
+eq "binding: explicit output honoured"                 "$(q "$D" "$BS|.spec.chat.output")" final
+eq "binding on slack without output omits it (Kourier default live)" "$(q "$D" '.[]|select(.kind=="Binding" and .metadata.name=="eng-default")|.spec.chat|has("output")')" false
+eq "webhook trigger passes through (type, match, template, limits)" "$(q "$D" "$BW|.spec.chat.triggers[0]|[.type,.match.event,.promptTemplate,.limits.rateLimit.maxRuns,.limits.maxRunsPerDay]|map(tostring)|join(\"|\")")" 'webhookEvent|^order\.failed$|Check order {{ .Fields.conversation }}.|5|20'
+eq "mention trigger passes through"                    "$(q "$D" "$BS|.spec.chat.triggers[0].type")" mention
+RL='.[]|select(.kind=="Role" and .metadata.namespace=="openagentix-channels")'
+eq "Role grants list+watch on exactly the connection Secrets" "$(q "$D" "$RL|.rules|map((.resources|join(\",\"))+\":\"+(.resourceNames|sort|join(\",\"))+\":\"+(.verbs|sort|join(\",\")))|join(\";\")")" "secrets:orders-hook-webhook,team-slack-tokens:list,watch"
+eq "RoleBinding grants it to the broker ServiceAccount"  "$(q "$D" '.[]|select(.kind=="RoleBinding" and .metadata.namespace=="openagentix-channels")|.subjects[0]|.kind+" "+.name+" "+.namespace')" "ServiceAccount agent-kourier agent-kourier"
+eq "marker ConfigMap names the team and broker namespaces" "$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-channels")|.data.namespace+" "+.data.brokerNamespace')" "openagentix-channels agent-kourier"
+eq "marker ConfigMap carries the broker egress rule to the controller" "$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-channels")|.data.brokerEgress|fromjson|.[0]|[.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],.to[0].podSelector.matchLabels["app.kubernetes.io/component"],(.ports[0].port|tostring)]|join(" ")')" "kagent controller 8083"
+eq "no Secret objects, no data/stringData"             "$(count "$D" '.kind=="Secret" or (has("data") and .kind!="ConfigMap") or has("stringData")')" 0
+S1=$(docs -f "$CHF" $KAPI --set channels.connections[0].token=SENTINEL-CH-777)
+eq "stray token value is never rendered"               "$(q "$S1" 'tostring|contains("SENTINEL-CH-777")')" false
+echo "# channels: validation and network policy"
+EB='--set channels.bindings[0].agent=ghost'
+eq "binding to an unknown agent fails the render"      "$([ -n "$(render_err -f "$CHF" $KAPI $EB)" ] && echo failed || echo rendered)" failed
+eq "the failure names the agent and lists the valid ones" "$(render_err -f "$CHF" $KAPI $EB | command grep -c 'binding "orders-assistant": agent "ghost" is not in agents\[\].*assistant')" 1
+eq "binding to an unknown connection fails the render" "$([ -n "$(render_err -f "$CHF" $KAPI --set channels.bindings[0].connection=nope)" ] && echo failed || echo rendered)" failed
+eq "unknown platform fails the render"                 "$([ -n "$(render_err -f "$CHF" $KAPI --set channels.connections[0].platform=irc)" ] && echo failed || echo rendered)" failed
+eq "connection without existingSecret fails the render" "$([ -n "$(render_err -f "$CHF" $KAPI --set channels.connections[0].existingSecret=)" ] && echo failed || echo rendered)" failed
+eq "channels enabled without kagent fails the render"  "$([ -n "$(render_err -f "$CHF" $KAPI --set kagent.enabled=false)" ] && echo failed || echo rendered)" failed
+eq "an invalid binding is not checked while the block is disabled" "$([ -z "$(render_err -f "$CHF" $KAPI $EB --set channels.kourier.enabled=false)" ] && echo rendered || echo failed)" rendered
+KP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
+Dd=$(docs)
+eq "controller policy has no Kourier peer by default"  "$(q "$Dd" "$KP|[.spec.ingress[].from[]?|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"agent-kourier\")]|length")" 0
+eq "enabled: controller policy admits the Kourier pod (namespace AND pod labels)" "$(q "$D" "$KP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"agent-kourier\")|.podSelector.matchLabels[\"app.kubernetes.io/name\"]]|join(\",\")")" agent-kourier
+eq "enabled: 8083 has one more source than the default (4)" "$(q "$D" "$KP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]|length")" 4
+EXC="$(dirname "$0")/.extra2.yaml"
+printf 'networkPolicy:\n  extraA2ACallers:\n    - namespace: other-ns\n' > "$EXC"
+D2=$(docs -f "$CHF" -f "$EXC" $KAPI); rm -f "$EXC"
+eq "extraA2ACallers still works next to the Kourier peer (5)" "$(q "$D2" "$KP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]|length")" 5
+D3=$(docs -f "$CHF" $KAPI --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no controller policy, so no peer" "$(count "$D3" '.kind=="NetworkPolicy"')" 0
+D4=$(docs -f "$CHF" $KAPI --set channels.connections=null --set channels.bindings=null)
+eq "no connections: no Role, no Kourier connection/binding" "$(count "$D4" '.kind=="Role" or .kind=="ChatConnection" or .kind=="Binding"')" 0
+rm -f "$CHF"
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

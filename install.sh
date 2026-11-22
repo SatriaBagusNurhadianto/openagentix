@@ -20,8 +20,13 @@
 #   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents, networkPolicy.extraA2ACallers for a
-#                        chat gateway such as spikes/kourier). Helm replaces rather than merges the release values, so pass the
+#                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
 #                        same files on every run, or the extras disappear.
+#   KOURIER_VALUES_FILE="k.yaml"  extra values for the Agent Kourier release (see components/channels/kourier-values.yaml)
+# Channels and triggers (Agent Kourier) are opt-in. The ONE switch is the chart value channels.kourier.enabled (default false), set
+# in a VALUES_FILE, e.g. VALUES_FILE=components/channels/demo-values.yaml ./install.sh . When it is true this script installs the
+# pinned Kourier release (components/channels/kourier.sh, cosign-verified when cosign exists) BEFORE the chart, generates the
+# Secret of each webhook connection when absent (random, never printed), and the chart admits Kourier's pod to the kagent controller.
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
@@ -101,7 +106,8 @@ $K config use-context "$CTX" >/dev/null
 
 # --- 3. what will the chart render? (agents, namespaces, images) -------------------------------------------
 VALS=(); for f in ${VALUES_FILE:-}; do VALS+=(-f "$f"); done
-render(){ helm template $RELEASE $CHART -n "$RELEASE_NS" ${VALS[@]+"${VALS[@]}"} "$@" | yq -c 'select(.!=null)'; }
+# --api-versions: the Agent Kourier CRDs are installed later in this run, but the objects they define must be planned now.
+render(){ helm template $RELEASE $CHART -n "$RELEASE_NS" --api-versions agentkourier.dev/v1alpha1 ${VALS[@]+"${VALS[@]}"} "$@" | yq -c 'select(.!=null)'; }
 RENDERED=$(render) || die "chart does not render; run: helm template $RELEASE $CHART ${VALUES_FILE:+-f $VALUES_FILE}"
 AGENT_KEYS=$(jq -r 'select(.kind=="ModelConfig")|[.metadata.annotations["openagentix.io/agent"],.spec.apiKeySecret,.metadata.namespace]|@tsv' <<<"$RENDERED")
 NAMESPACES=$(jq -r 'select(.metadata.namespace!=null)|.metadata.namespace' <<<"$RENDERED" | sort -u)
@@ -146,15 +152,16 @@ put_secret $GW_NS gemini-api-key Authorization GOOGLE_API_KEY
 put_secret $BRIDGE_NS $BRIDGE_SECRET TELEGRAM_BOT_TOKEN TELEGRAM_BOT_TOKEN
 put_secret $BRIDGE_NS $BRIDGE_SECRET TELEGRAM_ALLOWED_CHAT_IDS TELEGRAM_ALLOWED_CHAT_IDS
 
+mk_random_secret(){  # ns name key [bytes]: created only if absent, value from openssl, never printed
+  $K get secret -n "$1" "$2" >/dev/null 2>&1 && { echo "secret $1/$2: kept"; return 0; }
+  $K create secret generic "$2" -n "$1" --from-file="$3"=<(printf '%s' "$(openssl rand -hex "${4:-24}")") >/dev/null && echo "secret $1/$2 key $3: generated"
+}
+
 # Knowledge base Secrets: each is created only if absent (so re-runs never rotate a password or token), values come
 # from openssl and are never printed. kb-database is built from the kb-postgres password.
 if [ -n "$KB_DEP" ]; then
   KB_NS=$(jq -r '.metadata.namespace' <<<"$KB_DEP")
   kb_secret_ref(){ jq -r --arg v "$1" '.spec.template.spec.containers[0].env[]|select(.name==$v)|.valueFrom.secretKeyRef|[.name,.key]|@tsv' <<<"$KB_DEP"; }
-  mk_random_secret(){  # ns name key
-    $K get secret -n "$1" "$2" >/dev/null 2>&1 && { echo "secret $1/$2: kept"; return 0; }
-    $K create secret generic "$2" -n "$1" --from-file="$3"=<(printf '%s' "$(openssl rand -hex 24)") >/dev/null && echo "secret $1/$2 key $3: generated"
-  }
   IFS=$'\t' read -r ADM_S ADM_K <<<"$(kb_secret_ref KB_ADMIN_TOKEN)"
   IFS=$'\t' read -r DB_S DB_K <<<"$(kb_secret_ref KB_DATABASE_URL)"
   mk_random_secret "$KB_NS" "$ADM_S" "$ADM_K"
@@ -205,6 +212,28 @@ if [ -n "$CA_REF" ]; then
   [ -n "$CA_PEM" ] || die "ClusterTrustBundle $CTB not found or empty (is Substrate installed?). Set mcp.virtual.incomingAuth.type=anonymous to skip OIDC."
   $K create configmap "$CA_CM" -n "$CA_NS" --from-file="$CA_KEY"=<(printf '%s\n' "$CA_PEM") --dry-run=client -o yaml | $K apply -f - >/dev/null
   echo "ConfigMap $CA_NS/$CA_CM key $CA_KEY from ClusterTrustBundle $CTB"
+fi
+
+# --- 4c. channels and triggers (Agent Kourier), only when the chart renders the marker (channels.kourier.enabled) ------------
+CH_CM=$(jq -c 'select(.kind=="ConfigMap" and .metadata.name=="openagentix-channels")' <<<"$RENDERED")
+if [ -n "$CH_CM" ]; then
+  log "channels and triggers (Agent Kourier)"
+  CH_NS=$(jq -r '.data.namespace' <<<"$CH_CM"); CH_BROKER_NS=$(jq -r '.data.brokerNamespace' <<<"$CH_CM")
+  # Webhook connections: the Secret key follows the verify scheme (hmac-sha256: webhookSecret, token: token). Slack Secrets hold the
+  # operator's own tokens: only checked, never created here.
+  while IFS=$'\t' read -r cplat csec cscheme; do
+    [ -n "$csec" ] || continue
+    if [ "$cplat" = webhook ]; then
+      case "$cscheme" in token) ckey=token;; *) ckey=webhookSecret;; esac
+      mk_random_secret "$CH_NS" "$csec" "$ckey" 32
+    else
+      $K get secret -n "$CH_NS" "$csec" >/dev/null 2>&1 || echo "WARN: Secret $CH_NS/$csec for the $cplat connection does not exist: create it first (README \"Channels and triggers\", keys botToken and appToken)"
+    fi
+  done < <(jq -r 'select(.kind=="ChatConnection")|[.spec.platform,.spec.credentialsSecretRef.name,(.spec.webhook.verify.scheme//"")]|@tsv' <<<"$RENDERED")
+  KOURIER_TEAM_NS="$CH_NS" KOURIER_NS="$CH_BROKER_NS" KOURIER_EGRESS="$(jq -r '.data.brokerEgress' <<<"$CH_CM")" \
+    CLUSTER="$CLUSTER" KUBE_CONTEXT="$CTX" KUBECTL="$K" bash components/channels/kourier.sh install
+elif helm status agent-kourier -n agent-kourier >/dev/null 2>&1; then
+  echo "NOTE: Agent Kourier is installed but channels.kourier.enabled is false in these values: this run removes its connections and bindings. Pass the same VALUES_FILE as before to keep them, or ./uninstall.sh to remove Kourier."
 fi
 
 # --- 5. images ----------------------------------------------------------------------------------------------
@@ -276,6 +305,10 @@ done < <(jq -r 'select(.metadata.namespace!=null)|[((.kind|ascii_downcase)+(if (
 log "helm upgrade --install $RELEASE"  # (adoption happens just above)
 helm upgrade --install $RELEASE $CHART -n "$RELEASE_NS" --create-namespace ${VALS[@]+"${VALS[@]}"} ${SET[@]+"${SET[@]}"} --wait --timeout 5m
 
+if [ -n "$CH_CM" ]; then   # the broker's CRDs must have been there: the chart skips Kourier objects silently without them
+  helm get manifest $RELEASE -n "$RELEASE_NS" | yq -e 'select(.kind=="AgentBackend")' >/dev/null || die "Agent Kourier CRDs were not found by Helm: the AgentBackend was not installed (kubectl get crd agentbackends.agentkourier.dev)"
+fi
+
 # Helm does not patch objects it merely adopted when old and new manifests are equal, so converge them once with
 # server-side apply (no-op for objects Helm just created).
 helm get manifest $RELEASE -n "$RELEASE_NS" | $K apply --server-side --force-conflicts --field-manager=openagentix-install -f - >/dev/null
@@ -298,6 +331,12 @@ for a in $(jq -r 'select(.kind=="Agent")|.metadata.name' <<<"$RENDERED"); do
   $K wait "agent/$a" -n $KAGENT_NS --for=condition=Ready --timeout="$AGENT_WAIT" || echo "WARN: agent $a not Ready yet: $K get agent $a -n $KAGENT_NS -o yaml"
 done
 $K wait remotemcpserver --all -n $KAGENT_NS --for=condition=Accepted --timeout=120s >/dev/null 2>&1 || echo "WARN: a RemoteMCPServer is not Accepted yet (vMCP may still be starting): $K get remotemcpserver -n $KAGENT_NS"
+
+if [ -n "$CH_CM" ]; then
+  log "waiting for the Kourier bindings"
+  $K wait bindings.agentkourier.dev --all -n "$CH_NS" --for=condition=Ready --timeout=180s || echo "WARN: a Binding is not Ready yet: $K get bindings.agentkourier.dev -n $CH_NS"
+  $K get bindings.agentkourier.dev -n "$CH_NS"
+fi
 
 log "DONE"
 $K get pods -n $BRIDGE_NS

@@ -21,26 +21,26 @@ echo "# defaults"
 D=$(docs)
 eq "default render is non-empty"                       "$(q "$D" 'length>0')" true
 eq "bridge Deployment rendered once"                   "$(count "$D" '.kind=="Deployment" and .metadata.name=="telegram-bridge"')" 1
-eq "bridge lives in openagentix-gateway"               "$(q "$D" '.[]|select(.kind=="Deployment")|.metadata.namespace')" openagentix-gateway
-eq "bridge keeps legacy selector app=telegram-bridge"  "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.selector.matchLabels.app')" telegram-bridge
-eq "bridge strategy Recreate"                          "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.strategy.type')" Recreate
-eq "bridge image"                                      "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].image')" openagentix/telegram-bridge:dev
-eq "bridge A2A_URL derived from bridge.agent"          "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="A2A_URL")|.value')" http://kagent-controller.kagent.svc.cluster.local:8083/agents/kagent/assistant
-eq "bridge token comes from secretKeyRef"              "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|.valueFrom.secretKeyRef.name')" telegram-bridge
-eq "bridge token env has no literal value"             "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|has("value")')" false
-eq "allowlist env present by default, optional"        "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOWED_CHAT_IDS")|.valueFrom.secretKeyRef.optional')" true
-eq "bot is not open to everyone by default"            "$(q "$D" '[.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOW_ALL")]|length')" 0
-eq "bridge liveness probe hits /healthz"               "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].livenessProbe.httpGet|.path+":"+(.port|tostring)')" /healthz:health
-eq "bridge exposes health port 8080"                   "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].ports[]|select(.name=="health")|.containerPort')" 8080
+eq "bridge lives in openagentix-gateway"               "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.metadata.namespace')" openagentix-gateway
+eq "bridge keeps legacy selector app=telegram-bridge"  "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.selector.matchLabels.app')" telegram-bridge
+eq "bridge strategy Recreate"                          "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.strategy.type')" Recreate
+eq "bridge image"                                      "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].image')" openagentix/telegram-bridge:dev
+eq "bridge A2A_URL derived from bridge.agent"          "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="A2A_URL")|.value')" http://kagent-controller.kagent.svc.cluster.local:8083/agents/kagent/assistant
+eq "bridge token comes from secretKeyRef"              "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|.valueFrom.secretKeyRef.name')" telegram-bridge
+eq "bridge token env has no literal value"             "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|has("value")')" false
+eq "allowlist env present by default, optional"        "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOWED_CHAT_IDS")|.valueFrom.secretKeyRef.optional')" true
+eq "bot is not open to everyone by default"            "$(q "$D" '[.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOW_ALL")]|length')" 0
+eq "bridge liveness probe hits /healthz"               "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].livenessProbe.httpGet|.path+":"+(.port|tostring)')" /healthz:health
+eq "bridge exposes health port 8080"                   "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].ports[]|select(.name=="health")|.containerPort')" 8080
 
 echo "# bridge toggles"
 D=$(docs --set bridge.enabled=false)
-eq "bridge.enabled=false renders no Deployment"        "$(count "$D" '.kind=="Deployment"')" 0
+eq "bridge.enabled=false renders no bridge Deployment" "$(count "$D" '.kind=="Deployment" and .metadata.name=="telegram-bridge"')" 0
 D=$(docs --set bridge.allowlist.enabled=false)
-eq "allowlist.enabled=false drops the env var"         "$(q "$D" '[.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOWED_CHAT_IDS")]|length')" 0
-eq "allowlist.enabled=false opens the bot explicitly"  "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOW_ALL")|.value')" true
+eq "allowlist.enabled=false drops the env var"         "$(q "$D" '[.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOWED_CHAT_IDS")]|length')" 0
+eq "allowlist.enabled=false opens the bot explicitly"  "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_ALLOW_ALL")|.value')" true
 D=$(docs --set bridge.existingSecret=my-secret --set bridge.tokenKey=TOK --set bridge.a2aUrl=http://x/y)
-eq "bridge.existingSecret honoured"                    "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|.valueFrom.secretKeyRef|.name+"/"+.key')" my-secret/TOK
+eq "bridge.existingSecret honoured"                    "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="TELEGRAM_BOT_TOKEN")|.valueFrom.secretKeyRef|.name+"/"+.key')" my-secret/TOK
 eq "bridge.a2aUrl overrides derived url"               "$(q "$D" '.[]|select(.kind=="Deployment")|.spec.template.spec.containers[0].env[]|select(.name=="A2A_URL")|.value')" http://x/y
 
 echo "# model gateway"
@@ -49,11 +49,11 @@ eq "one Gateway"                                       "$(count "$D" '.kind=="Ga
 eq "Gateway class agentgateway"                        "$(q "$D" '.[]|select(.kind=="Gateway")|.spec.gatewayClassName')" agentgateway
 eq "Gateway ns"                                        "$(q "$D" '.[]|select(.kind=="Gateway")|.metadata.namespace')" agentgateway-system
 eq "listener allows AgentgatewayModel"                 "$(q "$D" '.[]|select(.kind=="Gateway")|[.spec.listeners[0].allowedRoutes.kinds[].kind]|index("AgentgatewayModel")!=null')" true
-eq "default model claude-haiku"                        "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.metadata.name')" claude-haiku
-eq "claude-haiku provider Anthropic"                   "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.spec.provider')" Anthropic
-eq "claude-haiku auth secret"                          "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.spec.policies.auth.secretRef.name')" anthropic-api-key
-eq "claude-haiku upstream model rewrite"               "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.spec.policies.transformations[0].expression')" '"claude-haiku-5-5"'
-eq "model parentRef is the gateway"                    "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.spec.parentRefs[0].name')" model-gateway
+eq "default model claude-haiku"                        "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="claude-haiku")|.metadata.name')" claude-haiku
+eq "claude-haiku provider Anthropic"                   "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="claude-haiku")|.spec.provider')" Anthropic
+eq "claude-haiku auth secret"                          "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="claude-haiku")|.spec.policies.auth.secretRef.name')" anthropic-api-key
+eq "claude-haiku upstream model rewrite"               "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="claude-haiku")|.spec.policies.transformations[0].expression')" '"claude-haiku-5-5"'
+eq "model parentRef is the gateway"                    "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="claude-haiku")|.spec.parentRefs[0].name')" model-gateway
 eq "exactly ONE AgentgatewayPolicy"                    "$(count "$D" '.kind=="AgentgatewayPolicy"')" 1
 eq "policy: strict api-key auth"                       "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.traffic.apiKeyAuthentication.mode')" Strict
 eq "policy: per-user token budget"                     "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.traffic.rateLimit.local[0].key')" apiKey.user_id
@@ -78,7 +78,7 @@ gateway:
       failover: [gemini, claude-haiku]
 YAML
 D=$(docs -f "$(dirname "$0")/.extra-models.yaml")
-eq "models come from values (3 now)"                   "$(count "$D" '.kind=="AgentgatewayModel"')" 3
+eq "models come from values (3 chat models + embed-default)" "$(count "$D" '.kind=="AgentgatewayModel"')" 4
 eq "failover model renders virtualModel targets"       "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="auto")|[.spec.virtualModel.failover.targets[]|.modelRef.name+":"+(.priority|tostring)]|join(",")')" gemini:0,claude-haiku:1
 rm -f "$(dirname "$0")/.extra-models.yaml"
 
@@ -117,7 +117,7 @@ eq "template modelConfig ref"                          "$(q "$D" '.[]|select(.ki
 eq "mcp binding kind"                                  "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.server.kind')" RemoteMCPServer
 eq "mcp binding has NO apiGroup (webhook rejects it)"  "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.server|has("apiGroup")')" false
 eq "mcp binding server name"                           "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.server.name')" toolhive-vmcp
-eq "mcp binding tool allowlist (5)"                    "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 5
+eq "mcp binding tool allowlist (5 + 3 kb tools)"                    "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 8
 eq "harness uses substrate worker pool"                "$(q "$D" '.[]|select(.kind=="Harness")|.spec.substrate.workerPoolRef.name')" kagent-default
 eq "harness image is digest pinned"                    "$(q "$D" '.[]|select(.kind=="Harness")|.spec.workload.image|test("@sha256:[0-9a-f]{64}$")')" true
 eq "skill source is a digest-pinned oci ref"           "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.skills[0].source.oci|test("@sha256:[0-9a-f]{64}$")')" true
@@ -168,7 +168,7 @@ D=$(docs)
 VP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress")'
 CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
 BP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-mcp-tools-default")'
-eq "3 NetworkPolicies by default"                      "$(count "$D" '.kind=="NetworkPolicy"')" 3
+eq "3 platform NetworkPolicies by default (knowledge ns excluded)" "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge"')" 3
 eq "mcp-tools default policy lives in mcp-tools"       "$(q "$D" "$BP|.metadata.namespace")" mcp-tools
 eq "mcp-tools default policy selects every pod"        "$(q "$D" "$BP|.spec.podSelector|length")" 0
 eq "mcp-tools default policy is ingress-only"          "$(q "$D" "$BP|.spec.policyTypes|join(\",\")")" Ingress
@@ -183,13 +183,13 @@ eq "controller: 8083 sources are bridge pod, kagent ns, egress proxy" "$(q "$D" 
 eq "controller: bridge source is pod-scoped (ns AND pod label in one entry)" "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" openagentix-gateway
 eq "controller: ports other than 8083 stay open"       "$(q "$D" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
 D=$(docs --set networkPolicy.enabled=false)
-eq "networkPolicy.enabled=false renders none"          "$(count "$D" '.kind=="NetworkPolicy"')" 0
+eq "networkPolicy.enabled=false renders none (also in the knowledge ns)" "$(count "$D" '.kind=="NetworkPolicy"')" 0
 D=$(docs --set mcp.enabled=false)
-eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy")|.metadata.name]|join(",")')" openagentix-kagent-controller
+eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge")|.metadata.name]|join(",")')" openagentix-kagent-controller
 D=$(docs --set bridge.enabled=false)
 eq "bridge.enabled=false drops the bridge source"      "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")]|length")" 0
 D=$(docs --set kagent.enabled=false)
-eq "kagent.enabled=false: no controller policy, vMCP policy keeps ns sources" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy")|.metadata.name]|sort|join(",")')" openagentix-mcp-tools-default,openagentix-vmcp-ingress
+eq "kagent.enabled=false: no controller policy, vMCP policy keeps ns sources" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge")|.metadata.name]|sort|join(",")')" openagentix-mcp-tools-default,openagentix-vmcp-ingress
 
 echo "# tool-layer identity (stage 2)"
 D=$(docs)
@@ -238,6 +238,134 @@ eq "permit is keyed on the atespace claim and the tool" "$(q "$D" "$V|.spec.inco
 eq "second atespace is rendered too"                   "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies[2]|test(\"atespace == \\\"other\\\"\")")" true
 E=$(render_err --set mcp.virtual.incomingAuth.type=anonymous --set 'mcp.virtual.incomingAuth.toolAccess[0].atespace=x' --set 'mcp.virtual.incomingAuth.toolAccess[0].tools[0]=fetch_fetch')
 eq "toolAccess without oidc fails (anonymous has no identity)" "$([ -n "$E" ] && echo failed || echo rendered)" failed
+
+echo "# knowledge base (kb + pgvector + local embeddings)"
+D=$(docs)
+KNS=openagentix-knowledge
+inns() { count "$1" ".metadata.namespace==\"$KNS\" and ($2)"; }
+KB='.[]|select(.kind=="Deployment" and .metadata.name=="kb")'
+KC="$KB|.spec.template.spec.containers[0]"
+KE="$KC|.env[]"
+eq "knowledge block renders into its own namespace"    "$(q "$D" '[.[]|select(.metadata.namespace=="openagentix-knowledge")|.kind]|sort|join(",")')" Deployment,Deployment,NetworkPolicy,NetworkPolicy,NetworkPolicy,PersistentVolumeClaim,Service,Service,Service,StatefulSet
+eq "kb Deployment, kb image"                           "$(q "$D" "$KC|.image")" openagentix/kb:dev
+eq "kb uses the postgres store"                        "$(q "$D" "$KE|select(.name==\"KB_STORE\")|.value")" postgres
+eq "kb database URL comes from a Secret"               "$(q "$D" "$KE|select(.name==\"KB_DATABASE_URL\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" kb-database/KB_DATABASE_URL
+eq "kb database URL has no literal value"              "$(q "$D" "$KE|select(.name==\"KB_DATABASE_URL\")|has(\"value\")")" false
+eq "kb admin token comes from a Secret"                "$(q "$D" "$KE|select(.name==\"KB_ADMIN_TOKEN\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" kb-admin/KB_ADMIN_TOKEN
+eq "kb admin token is NOT optional (no silent open/closed API)" "$(q "$D" "$KE|select(.name==\"KB_ADMIN_TOKEN\")|.valueFrom.secretKeyRef.optional // false")" false
+eq "kb embeds through the model gateway"               "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_URL\")|.value")" http://model-gateway.agentgateway-system.svc.cluster.local/v1
+eq "kb embeddings model is the gateway alias"          "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_MODEL\")|.value")" embed-default
+eq "kb embeddings dimension"                           "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_DIM\")|.value")" 384
+eq "kb embeddings key is its own virtual key (Secret)" "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" kb-virtual-key/OPENAI_API_KEY
+eq "kb pod is annotated for install.sh virtual key creation" "$(q "$D" "$KB|.metadata.annotations[\"openagentix.io/gateway-user\"]+\"/\"+.metadata.annotations[\"openagentix.io/gateway-key-secret\"]")" kb/kb-virtual-key
+eq "kb runs non-root, read-only rootfs, no capabilities" "$(q "$D" "$KB|.spec.template.spec|[.securityContext.runAsNonRoot,.containers[0].securityContext.readOnlyRootFilesystem,.containers[0].securityContext.allowPrivilegeEscalation,(.containers[0].securityContext.capabilities.drop|join(\",\"))]|map(tostring)|join(\" \")")" "true true false ALL"
+eq "kb probes: /healthz liveness, /readyz readiness"   "$(q "$D" "$KC|[.livenessProbe.httpGet.path,.readinessProbe.httpGet.path]|join(\",\")")" /healthz,/readyz
+eq "kb has requests and limits"                        "$(q "$D" "$KC|.resources|(.requests.memory!=null) and (.limits.memory!=null) and (.requests.cpu!=null)")" true
+eq "kb waits for its postgres in an initContainer (no crash-restart on first start)" "$(q "$D" "$KB|.spec.template.spec.initContainers|map(.name)|join(\",\")")" wait-for-postgres
+eq "kb chunk size is tuned for the small embedding model (600 / overlap 100)" "$(q "$D" "[$KE|select(.name==\"KB_CHUNK_MAX_CHARS\" or .name==\"KB_CHUNK_OVERLAP\")|.value]|join(\"/\")")" 600/100
+eq "kb pod template has no source-hash annotation by default" "$(q "$D" "$KB|.spec.template.metadata.annotations|has(\"openagentix.io/source-hash\")")" false
+D3=$(docs --set-string knowledge.kb.sourceHash=abc123)
+eq "kb sourceHash becomes a pod annotation (rolls the pod when the code changes)" "$(q "$D3" "$KB|.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" abc123
+eq "kb Service exposes 8080 only"                      "$(q "$D" '.[]|select(.kind=="Service" and .metadata.name=="kb")|[.spec.ports[].port]|join(",")')" 8080
+PG='.[]|select(.kind=="StatefulSet" and .metadata.name=="kb-postgres")'
+PC="$PG|.spec.template.spec.containers[0]"
+eq "postgres image pinned by tag and digest"           "$(q "$D" "$PC|.image|test(\"^pgvector/pgvector:pg17@sha256:[0-9a-f]{64}\$\")")" true
+eq "postgres password from a Secret, no literal"       "$(q "$D" "$PC|.env[]|select(.name==\"POSTGRES_PASSWORD\")|(.valueFrom.secretKeyRef.name+\"/\"+.valueFrom.secretKeyRef.key)+\" literal=\"+(has(\"value\")|tostring)")" "kb-postgres/POSTGRES_PASSWORD literal=false"
+eq "postgres has a volumeClaimTemplate"                "$(q "$D" "$PG|.spec.volumeClaimTemplates|length")" 1
+eq "postgres non-root with fsGroup"                    "$(q "$D" "$PG|.spec.template.spec.securityContext|(.runAsNonRoot|tostring)+\" \"+(.fsGroup|tostring)")" "true 999"
+eq "postgres drops all capabilities"                   "$(q "$D" "$PC|.securityContext.capabilities.drop|join(\",\")")" ALL
+eq "postgres readiness uses pg_isready"                "$(q "$D" "$PC|.readinessProbe.exec.command|join(\" \")|test(\"pg_isready\")")" true
+eq "postgres has requests and limits"                  "$(q "$D" "$PC|.resources|(.requests.memory!=null) and (.limits.memory!=null)")" true
+eq "postgres Service on 5432"                          "$(q "$D" '.[]|select(.kind=="Service" and .metadata.name=="kb-postgres")|.spec.ports[0].port')" 5432
+EM='.[]|select(.kind=="Deployment" and .metadata.name=="kb-embeddings")'
+EC="$EM|.spec.template.spec.containers[0]"
+eq "embedding server image pinned by tag and digest"   "$(q "$D" "$EC|.image|test(\"^ghcr.io/ggml-org/llama.cpp:server-b[0-9]+@sha256:[0-9a-f]{64}\$\")")" true
+eq "embedding server serves the default model (bge-small)" "$(q "$D" "$EC|.args|join(\" \")|test(\"bge-small-en-v1.5\")")" true
+eq "embedding server runs in embeddings mode with cls pooling" "$(q "$D" "$EC|.args|join(\" \")|test(\"--embeddings\") and test(\"--pooling cls\")")" true
+eq "embedding readiness is /health (200 only once the model is loaded)" "$(q "$D" "$EC|.readinessProbe.httpGet.path")" /health
+eq "embedding server has a startup probe (model download)" "$(q "$D" "$EC|.startupProbe.httpGet.path")" /health
+eq "embedding model cache is a PVC"                    "$(q "$D" "$EM|.spec.template.spec.volumes[]|select(.name==\"models\")|.persistentVolumeClaim.claimName")" kb-embeddings-models
+eq "embedding server non-root, no capabilities"        "$(q "$D" "$EM|.spec.template.spec|[.securityContext.runAsNonRoot,(.containers[0].securityContext.capabilities.drop|join(\",\"))]|map(tostring)|join(\" \")")" "true ALL"
+eq "embedding server has requests and limits"          "$(q "$D" "$EC|.resources|(.requests.memory!=null) and (.limits.memory!=null)")" true
+eq "embedding strategy Recreate (RWO volume)"          "$(q "$D" "$EM|.spec.strategy.type")" Recreate
+EG='.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="embed-default")'
+eq "gateway model embed-default exists in the gateway ns" "$(q "$D" "$EG|.metadata.namespace")" agentgateway-system
+eq "embed-default is an OpenAI-compatible provider at the embedding Service" "$(q "$D" "$EG|.spec.provider+\" \"+.spec.baseURL")" "OpenAI http://kb-embeddings.openagentix-knowledge.svc.cluster.local:8080/v1"
+eq "embed-default attaches to the model gateway"       "$(q "$D" "$EG|.spec.parentRefs[0].name")" model-gateway
+eq "embed-default carries no provider credential"      "$(q "$D" "$EG|.spec|has(\"policies\")")" false
+eq "still exactly ONE AgentgatewayPolicy"              "$(count "$D" '.kind=="AgentgatewayPolicy"')" 1
+ME='.[]|select(.kind=="MCPServerEntry")'
+eq "kb is one more backend of the vMCP group"          "$(q "$D" "$ME|.spec.groupRef.name+\" \"+.metadata.namespace")" "tools mcp-tools"
+eq "MCPServerEntry points at the kb /mcp endpoint"     "$(q "$D" "$ME|.spec.remoteUrl")" http://kb.openagentix-knowledge.svc.cluster.local:8080/mcp
+eq "MCPServerEntry transport streamable-http"          "$(q "$D" "$ME|.spec.transport")" streamable-http
+eq "MCPServerEntry allows the in-cluster endpoint"     "$(q "$D" "$ME|.spec.allowPrivateEndpoint")" true
+eq "MCPServerEntry references an unauthenticated outgoing config" "$(q "$D" "[$ME|.spec.externalAuthConfigRef.name]|join(\"\")")" "$(q "$D" '.[]|select(.kind=="MCPExternalAuthConfig")|.metadata.name')"
+eq "outgoing auth config type is unauthenticated"      "$(q "$D" '.[]|select(.kind=="MCPExternalAuthConfig")|.spec.type')" unauthenticated
+eq "MCPServers are unchanged (still 2)"                "$(count "$D" '.kind=="MCPServer"')" 2
+KP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-ingress")'
+eq "kb policy selects the kb pod"                      "$(q "$D" "$KP|.spec.podSelector.matchLabels.app")" kb
+eq "kb policy is ingress-only on 8080"                 "$(q "$D" "$KP|(.spec.policyTypes|join(\",\"))+\" \"+([.spec.ingress[].ports[].port]|unique|map(tostring)|join(\",\"))")" "Ingress 8080"
+eq "kb MCP source is the vMCP pod in mcp-tools (pod-scoped)" "$(q "$D" "[$KP|.spec.ingress[].from[]|select(.podSelector.matchLabels.\"toolhive-name\"==\"tools\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]+\"/\"+.podSelector.matchLabels.app]|join(\",\")")" mcp-tools/virtualmcpserver
+eq "kb policy: no namespace-wide or any-pod source by default" "$(q "$D" "[$KP|.spec.ingress[].from[]|select((.podSelector.matchLabels==null) or (.namespaceSelector==null))]|length")" 0
+eq "kb policy: exactly one source by default (ingest is by port-forward)" "$(q "$D" "$KP|[.spec.ingress[].from[]]|length")" 1
+PP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-postgres-ingress")'
+eq "postgres accepts only the kb pod on 5432"          "$(q "$D" "$PP|([.spec.ingress[].from[]|.podSelector.matchLabels.app]|join(\",\"))+\" \"+([.spec.ingress[].ports[].port]|map(tostring)|join(\",\"))")" "kb 5432"
+EP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-embeddings-ingress")'
+eq "embeddings accept only the model gateway proxy pod" "$(q "$D" "[$EP|.spec.ingress[].from[]|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]+\"/\"+.podSelector.matchLabels[\"gateway.networking.k8s.io/gateway-name\"]]|join(\",\")")" agentgateway-system/model-gateway
+eq "embeddings policy only on 8080"                    "$(q "$D" "$EP|[.spec.ingress[].ports[].port]|map(tostring)|join(\",\")")" 8080
+echo "# knowledge base: agent wiring"
+AT='.[]|select(.kind=="AgentTemplate" and .metadata.name=="assistant-template")'
+eq "assistant gets the kb tools next to the existing ones" "$(q "$D" "$AT|.spec.tools[0].mcp.tools|length")" 8
+eq "assistant kb tool names (prefix + kb tool)"        "$(q "$D" "$AT|[.spec.tools[0].mcp.tools[]|select(test(\"kb_\"))]|sort|join(\",\")")" knowledge_kb_get_document,knowledge_kb_list_collections,knowledge_kb_search
+eq "assistant keeps the original tools"                "$(q "$D" "$AT|[.spec.tools[0].mcp.tools[]|select(test(\"^(execute_tool_script|fetch_fetch|osv_)\"))]|length")" 5
+eq "system prompt tells it to search the knowledge base and cite titles" "$(q "$D" "$AT|.spec.systemPrompt|test(\"knowledge base\") and test(\"knowledge_kb_search\") and test(\"title\")")" true
+eq "original prompt text is kept"                      "$(q "$D" "$AT|.spec.systemPrompt|test(\"say when you used one\")")" true
+cat > "$(dirname "$0")/.noknow-agent.yaml" <<'YAML'
+agents:
+  - name: plain
+    model: claude-haiku
+    systemPrompt: "You are plain."
+    tools: [{tools: [fetch_fetch]}]
+YAML
+D2=$(docs -f "$(dirname "$0")/.noknow-agent.yaml"); rm -f "$(dirname "$0")/.noknow-agent.yaml"
+eq "agent without knowledge:true is not given kb tools" "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|join(",")')" fetch_fetch
+eq "agent without knowledge:true keeps its prompt"     "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt')" "You are plain."
+echo "# knowledge base: switches"
+D=$(docs --set knowledge.enabled=false)
+eq "knowledge.enabled=false renders nothing in the knowledge ns" "$(count "$D" '.metadata.namespace=="openagentix-knowledge"')" 0
+eq "knowledge.enabled=false: no embed-default, no MCPServerEntry, no MCPExternalAuthConfig" "$(count "$D" '.kind=="MCPServerEntry" or .kind=="MCPExternalAuthConfig" or (.kind=="AgentgatewayModel" and .metadata.name=="embed-default")')" 0
+eq "knowledge.enabled=false: assistant keeps its original 5 tools" "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 5
+eq "knowledge.enabled=false: prompt has no knowledge text" "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("knowledge")')" false
+eq "knowledge.enabled=false: platform NetworkPolicies unchanged (3)" "$(count "$D" '.kind=="NetworkPolicy"')" 3
+eq "knowledge.enabled=false: one model, one policy, 2 MCPServers" "$(count "$D" '.kind=="AgentgatewayModel" or .kind=="AgentgatewayPolicy" or .kind=="MCPServer"')" 4
+eq "knowledge.enabled=false: no Deployment but the bridge" "$(count "$D" '.kind=="Deployment" or .kind=="StatefulSet"')" 1
+D=$(docs --set mcp.enabled=false)
+eq "mcp.enabled=false: no MCPServerEntry, kb still deployed" "$(q "$D" '[(.[]|select(.kind=="MCPServerEntry")),(.[]|select(.kind=="Deployment" and .metadata.name=="kb"))]|map(.kind)|join(",")')" Deployment
+eq "mcp.enabled=false: agent keeps its 5 tools"      "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 5
+eq "mcp.enabled=false: kb policy has no tool-gateway source" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-ingress")|.spec.ingress[].from[]?]|length')" 0
+D=$(docs --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no knowledge policies" "$(inns "$D" '.kind=="NetworkPolicy"')" 0
+D=$(docs --set gateway.enabled=false)
+eq "gateway.enabled=false: no embed-default model"     "$(count "$D" '.kind=="AgentgatewayModel"')" 0
+D=$(docs --set knowledge.embeddings.viaGateway=false)
+eq "direct mode: kb calls the embedding Service"       "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_URL\")|.value")" http://kb-embeddings.openagentix-knowledge.svc.cluster.local:8080/v1
+eq "direct mode: model is the served model name"       "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_MODEL\")|.value")" bge-small-en-v1.5
+eq "direct mode: no API key env, no gateway model"     "$(q "$D" "[$KE|select(.name==\"KB_EMBEDDINGS_API_KEY\")]|length")/$(count "$D" '.kind=="AgentgatewayModel" and .metadata.name=="embed-default"')" 0/0
+eq "direct mode: embeddings accept only the kb pod"    "$(q "$D" "[$EP|.spec.ingress[].from[]|.podSelector.matchLabels.app]|join(\",\")")" kb
+eq "direct mode: kb has no virtual-key annotation"     "$(q "$D" "$KB|.metadata.annotations|has(\"openagentix.io/gateway-user\")")" false
+D=$(docs --set knowledge.embeddings.enabled=false)
+eq "embeddings.enabled=false: lexical-only, no embedding objects" "$(q "$D" "[$KE|select(.name|test(\"^KB_EMBEDDINGS\"))]|length")/$(inns "$D" '.metadata.name|test("embeddings")')/$(count "$D" '.kind=="AgentgatewayModel" and .metadata.name=="embed-default"')" 0/0/0
+D=$(docs --set knowledge.embeddings.enabled=false --set knowledge.kb.embeddings.url=https://api.example.com/v1 --set knowledge.kb.embeddings.model=text-embedding-3-small --set knowledge.kb.embeddings.dim=1536 --set knowledge.kb.embeddings.apiKeySecret.name=hosted-key --set knowledge.kb.embeddings.apiKeySecret.key=KEY)
+eq "hosted embedder: url, model, dim from values"      "$(q "$D" "[$KE|select(.name==\"KB_EMBEDDINGS_URL\" or .name==\"KB_EMBEDDINGS_MODEL\" or .name==\"KB_EMBEDDINGS_DIM\")|.value]|join(\" \")")" "https://api.example.com/v1 text-embedding-3-small 1536"
+eq "hosted embedder: key from the named Secret"        "$(q "$D" "$KE|select(.name==\"KB_EMBEDDINGS_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" hosted-key/KEY
+D=$(docs --set knowledge.postgres.enabled=false)
+eq "external database: no StatefulSet/Service/policy for postgres" "$(inns "$D" '.metadata.name|test("postgres")')" 0
+eq "external database: no wait-for-postgres initContainer" "$(q "$D" "$KB|.spec.template.spec|has(\"initContainers\")")" false
+eq "external database: kb still reads the URL from its Secret" "$(q "$D" "$KE|select(.name==\"KB_DATABASE_URL\")|.valueFrom.secretKeyRef.name")" kb-database
+D=$(docs --set 'knowledge.kb.ingestFrom[0].namespace=ci' --set 'knowledge.kb.ingestFrom[0].podLabels.app=ingest')
+eq "ingestFrom adds a pod-scoped source for in-cluster ingestion" "$(q "$D" "[$KP|.spec.ingress[].from[]|select(.podSelector.matchLabels.app==\"ingest\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" ci
+eq "dimension above pgvector's HNSW limit (2000) fails the render" "$([ -n "$(render_err --set knowledge.embeddings.model.dim=4096)" ] && echo failed || echo rendered)" failed
+eq "embeddings url without model fails the render"     "$([ -n "$(render_err --set knowledge.kb.embeddings.url=http://x/v1 --set knowledge.embeddings.enabled=false)" ] && echo failed || echo rendered)" failed
 
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)

@@ -207,6 +207,8 @@ Package layout:
 
 ## Deploy
 
+The OpenAgentix chart (`charts/openagentix`, block `knowledge`) deploys this service with PostgreSQL, a local embedding server, NetworkPolicies and the vMCP wiring; see the repository README, "Knowledge base". The manifests in `deploy/` are a standalone reference for use without the chart (memory store, no embeddings). Every tool call, like every request, is bounded by `KB_REQUEST_TIMEOUT`.
+
 `deploy/` has a namespace and a Deployment plus Service (`openagentix-knowledge`). Secrets are created with
 `kubectl create secret` as described at the top of `deploy/deployment.yaml`; nothing secret is in git.
 The default manifest runs `KB_STORE=memory` with one replica; switch to `postgres` for durable, scalable use.

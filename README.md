@@ -19,11 +19,14 @@ kagent controller --> Agent "assistant" in a gVisor sandbox  ns kagent
                           | + per-agent           v
                           |   virtual key     ToolHive vMCP (code mode)   ns mcp-tools
                           v                       |-- fetch MCP server
-                     agentgateway                 `-- OSV MCP server
-                     (model-gateway)              ns agentgateway-system
-                          |
-                          v
-                     Anthropic (claude-haiku)
+                     agentgateway                 |-- OSV MCP server
+                     (model-gateway)              `-- knowledge base (MCPServerEntry)
+                     ns agentgateway-system           |
+                       |            |                 v
+                       v            | /v1/embeddings  kb (Go)  --> PostgreSQL + pgvector
+              Anthropic             |  (own virtual    ns openagentix-knowledge
+              (claude-haiku)        |   key "kb")         |
+                                    +--------------> kb-embeddings (llama.cpp, bge-small, CPU)
 ```
 
 Agents never hold a provider key. Each agent holds one gateway virtual key, so the gateway can budget and log usage per agent. Skills (Agent Skills format) are mounted into the sandbox from digest-pinned OCI images.
@@ -37,7 +40,7 @@ Upstream constraints make a single Helm chart impossible today: kagent and Subst
 | Installer | Creates the kind cluster (`hack/kind-config.yaml`), installs the upstream releases at pinned versions, creates Secrets from your environment, builds images, runs Helm | `install.sh`, `uninstall.sh` |
 | Chart | Our own resources only, all driven by values | `charts/openagentix/` |
 
-The chart owns: the Telegram bridge Deployment, the model gateway (Gateway, one AgentgatewayModel per entry in `gateway.models`, one AgentgatewayPolicy), the MCP layer (MCPGroup, MCPServers, VirtualMCPServer), and the kagent wiring (RemoteMCPServer, plus a ModelConfig, Harness, AgentTemplate and Agent for every entry in `agents`). Each block has an `enabled` flag. The chart never contains a secret value. It only references Secrets by name.
+The chart owns: the Telegram bridge Deployment, the model gateway (Gateway, one AgentgatewayModel per entry in `gateway.models`, one AgentgatewayPolicy), the MCP layer (MCPGroup, MCPServers, VirtualMCPServer), the knowledge base (`knowledge` block: kb, PostgreSQL with pgvector, a CPU embedding server, an MCPServerEntry that makes the kb a backend of the vMCP, an `embed-default` gateway model, NetworkPolicies), and the kagent wiring (RemoteMCPServer, plus a ModelConfig, Harness, AgentTemplate and Agent for every entry in `agents`). Each block has an `enabled` flag. The chart never contains a secret value. It only references Secrets by name.
 
 Pinned upstream versions: kagent and Agent Substrate 1.0.1, Gateway API CRDs 1.6.3, agentgateway v1.7.0, ToolHive 0.67.1.
 
@@ -45,7 +48,7 @@ Pinned upstream versions: kagent and Agent Substrate 1.0.1, Gateway API CRDs 1.6
 
 - Kubernetes 1.37 or newer. The installer creates a kind cluster with `kindest/node:v1.37.0`. The pod-certificate APIs that Substrate uses are only GA from 1.37.
 - On your machine: `docker`, `kind` 0.33+, `kubectl` 1.37+, `helm` 3, `jq`, `yq` (the Python jq wrapper, not mikefarah's), `openssl`, `shasum`, and `curl` (the first install downloads the `kubectl-ate` plugin from the public Agent Substrate release and verifies its SHA-256; no GitHub login is needed).
-- Docker needs about 7.5 GB of memory or more (tested with a 7.7 GiB VM). The full stack idles at roughly 2.3 GiB in the node; each agent sandbox adds more.
+- Docker needs about 7.5 GB of memory or more (tested with a 7.7 GiB VM). The full stack idles at roughly 2.3 GiB in the node; each agent sandbox adds more. The knowledge base adds about 0.2 GiB working set when idle (see "Knowledge base"); `knowledge.enabled=false` leaves it out.
 - An Anthropic API key, and a Telegram bot token from @BotFather.
 
 ## Quickstart
@@ -59,7 +62,7 @@ export TELEGRAM_ALLOWED_CHAT_IDS=111111111       # required: the bridge refuses 
 
 A cold install from an empty cluster (images already in the local Docker cache) took about 10 minutes (604 s) on a 5 CPU / 7.7 GiB VM; allow longer when every image has to be pulled. If a required variable is missing the script says which one and changes nothing. Re-running is safe.
 
-Useful switches: `CREATE_CLUSTER=0`, `SKIP_PREREQS=1`, `FORCE_PREREQS=1`, `SKIP_SKILL=1`, `SKIP_BRIDGE_IMAGE=1`, `VALUES_FILE="my-values.yaml"`. They are documented at the top of `install.sh`.
+Useful switches: `CREATE_CLUSTER=0`, `SKIP_PREREQS=1`, `FORCE_PREREQS=1`, `SKIP_SKILL=1`, `SKIP_BRIDGE_IMAGE=1`, `SKIP_KB_IMAGE=1`, `SKIP_KB_INGEST=1`, `VALUES_FILE="my-values.yaml"`. They are documented at the top of `install.sh`.
 
 Check it works from inside the cluster:
 
@@ -73,11 +76,46 @@ kubectl run a2a-test --rm -i --restart=Never -n openagentix-gateway --image=curl
 
 Expect `TASK_STATE_COMPLETED` and an answer that says 4. Then message your bot on Telegram.
 
-To remove OpenAgentix: `./uninstall.sh`. It removes only the `openagentix` Helm release. kind, kagent, Substrate, agentgateway, ToolHive, namespaces and all Secrets stay. `PURGE_SECRETS=1` also deletes the Secrets and the key ConfigMap that `install.sh` created.
+To remove OpenAgentix: `./uninstall.sh`. It removes only the `openagentix` Helm release. kind, kagent, Substrate, agentgateway, ToolHive, namespaces and all Secrets stay. `PURGE_SECRETS=1` also deletes the Secrets and the key ConfigMap that `install.sh` created (the knowledge base's database credentials stay); `PURGE_DATA=1` deletes the knowledge base volumes and database credentials.
+
+## Knowledge base
+
+The `knowledge` block (default on) deploys a small document store with hybrid search into the namespace `openagentix-knowledge`, and gives agents three read-only MCP tools for it. Nothing in it needs an external account: the embedding model runs in the cluster.
+
+| Piece | What | Notes |
+|---|---|---|
+| `kb` | Go service from `services/kb` (image `openagentix/kb:dev`, built and loaded by `install.sh`) | MCP at `/mcp`, admin ingest API under `/v1` (bearer token) |
+| `kb-postgres` | `pgvector/pgvector:pg17` (tag and digest pinned), StatefulSet, 2 Gi PVC | chunks, a `tsvector` index and a 384-dim HNSW vector index |
+| `kb-embeddings` | llama.cpp server b10088 (digest pinned), model `BAAI/bge-small-en-v1.5` as GGUF (Q8_0, 384 dimensions) | OpenAI-compatible `/v1/embeddings`, CPU only, weights cached on a 1 Gi PVC |
+| `embed-default` | an `AgentgatewayModel` on the model gateway that routes to `kb-embeddings` | the kb calls the gateway with its own virtual key (`user_id="kb"` in the gateway log); later consumers can share the endpoint |
+| `knowledge` | an `MCPServerEntry` in the vMCP's group | no extra pods: the vMCP itself connects to the kb |
+
+Agents that set `knowledge: true` (the demo `assistant` does) get the tools `knowledge_kb_search`, `knowledge_kb_get_document` and `knowledge_kb_list_collections` and a short addition to their system prompt: search the knowledge base for questions about OpenAgentix itself and cite document titles. The name is the entry name plus the vMCP prefix (`mcp.virtual.prefixFormat` with `{workload}` = `knowledge.mcp.entryName`) plus the kb's own tool name.
+
+`install.sh` creates four Secrets in `openagentix-knowledge` only when they are absent, so re-runs never rotate them: `kb-admin` (ingest token), `kb-postgres` (database password), `kb-database` (connection URL built from it) and `kb-virtual-key` (the kb's gateway key; its hash is added to `llm-api-keys`). It then ingests `components/knowledge/sample/` into the collection `openagentix`. Try it with the A2A command from the quickstart and the question "What is the OpenAgentix knowledge base canary code?". Expect `HERON-4412-KB-RETRIEVED` and a `knowledge_kb_search` call in the task's tool-call records.
+
+**Ingest your own documents.** Put markdown files in a directory and run:
+
+```sh
+hack/kb-ingest.sh ./my-docs my-collection        # collection defaults to "openagentix"
+```
+
+Each file becomes one document: id from the path (`adr/0001-x.md` becomes `adr:0001-x`), title from the first `# ` heading, one idempotent `PUT` per file, so re-running replaces rather than duplicates. The script reads the token from the `kb-admin` Secret into a variable (never printed, not in argv) and talks to the kb through `kubectl port-forward`, which needs no NetworkPolicy entry. For an in-cluster job set `KB_URL` and `KB_ADMIN_TOKEN` and list the job's pods in `knowledge.kb.ingestFrom`. Agents see every collection; to restrict a search the agent passes `collection`.
+
+**Swap the embedding model.**
+
+- *Another local model:* set `knowledge.embeddings.model.hf` (a `<HuggingFace GGUF repo>:<quantisation>`), `.name`, `.dim` (at most 2000, the pgvector HNSW limit) and `.pooling` (`cls` for bge, often `mean` for others). Leave the image alone unless the model needs a newer llama.cpp.
+- *A hosted endpoint:* set `knowledge.embeddings.enabled=false`, `knowledge.kb.embeddings.url` (an OpenAI-compatible base URL), `.model`, `.dim`, and `.apiKeySecret` (`{name, key}` of a Secret you create in `openagentix-knowledge`). The local server and the `embed-default` route are then not rendered.
+- *No embeddings:* `knowledge.embeddings.enabled=false` alone gives lexical-only search.
+- *Direct instead of through the gateway:* `knowledge.embeddings.viaGateway=false` (the kb calls the Service; NetworkPolicy then allows only the kb pod).
+
+**Changing the model or its dimension means re-ingesting.** Vectors from different models are not comparable and the stored column has a fixed dimension. The kb refuses to start on a dimension mismatch; use a new `knowledge.kb.schema` (or drop the old one) and run `hack/kb-ingest.sh` again for every collection. Turning embeddings on for an existing database does not back-fill old chunks either. Changing `chunkMaxChars` needs a re-ingest too.
+
+**Measured footprint** (kind, 1 arm64 node, 5 CPU / 7.7 GiB VM; working sets from the container runtime): idle, `kb` 6 MiB, `kb-embeddings` 110 MiB, `kb-postgres` 64 MiB. While ingesting 17 markdown files (160 KB, 25 s) `kb-embeddings` peaked at 155 MiB and used about 1.1 cores on average (2 threads, limit 2 CPU), `kb` 9 MiB, PostgreSQL 33 to 64 MiB. Requests: 100 m CPU, 304 MiB in total; limits: 384 MiB for the embedding server and for PostgreSQL, 192 MiB for the kb. The node's memory requests went from 3410 Mi to 3714 Mi.
 
 ## Add an agent
 
-Create a values file and pass it to the installer:
+Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt):
 
 ```yaml
 # my-values.yaml
@@ -124,6 +162,7 @@ What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy)
 - **Network, `mcp-tools` (chart, `networkPolicy.enabled`, default on).** MCP backends and their proxies accept connections only from their own namespace and from the ToolHive operator. The vMCP (port 4483) additionally accepts the Substrate egress proxy (`atenet-egress` in `ate-system`) and the kagent controller pod. A pod in `default` or in another namespace times out.
 - **Network, kagent controller port 8083.** A2A, the REST API and the sandboxes' task-store gRPC share this port. It accepts the Telegram bridge pod (selected by pod label `app=telegram-bridge` in `openagentix-gateway`, not the whole namespace), every pod in the `kagent` namespace (UI, tools, worker pool) and `atenet-egress`. Other pods time out. Ports other than 8083 are left open, as before (the controller listens on no other).
 - **Tool identity (chart, `mcp.virtual.incomingAuth.type: oidc`, default).** The vMCP rejects requests without a valid Substrate actor JWT (HTTP 401, also for a malformed token). The RemoteMCPServer asks Substrate for a token with the dedicated audience `openagentix-vmcp`, and the egress proxy adds it to every tool call. The vMCP verifies issuer, signature (explicit JWKS URL, TLS checked against the Substrate service CA, which `install.sh` copies into a ConfigMap), audience and expiry. No `insecure*` flag is set; `jwksAllowPrivateIP` is on because the IdP's ClusterIP is a private address.
+- **Network, `openagentix-knowledge` (chart, same switch).** The kb pod accepts port 8080 only from the vMCP pod (selected by namespace and pod labels); the kb port carries both `/mcp` (no authentication, by design) and the admin API (bearer token), so the policy and the token together are the control. PostgreSQL accepts only the kb pod. The embedding server accepts only the model gateway proxy pod (the kb pod in direct mode). Checked with a pod in `default` (all three time out), another pod in the knowledge namespace (all three time out) and a non-vMCP pod in `mcp-tools` (kb times out). A request to `/v1/embeddings` on the gateway without a key or with a wrong key gets 401.
 - **Tool authorization (optional).** `mcp.virtual.incomingAuth.toolAccess` turns into Cedar `permit` rules keyed on the token's `atespace` claim and the tool name; with it set, a tool not listed is refused (and hidden from the agent's tool list). Verified: with `osv_query_vulnerability` left out, Cedar logged deny for it and allow for the others, and the agent answered through `osv_query_vulnerabilities_batch` instead.
 
 **Not protected**
@@ -146,6 +185,7 @@ These are the gaps found while building the components. Most are acceptable for 
 - **Provider key:** one Anthropic key is shared by every agent behind the gateway. Per-agent attribution is by virtual key only.
 - **Telegram bridge** long-polls from a single replica (strategy Recreate). The bridge refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS`; if you open it explicitly (`bridge.allowlist.enabled=false`), anyone who finds the bot can use your agent and your API budget.
 - **Skills** need a registry the node can pull from over plain HTTP. On kind the installer runs its own `registry:2` container (`openagentix-registry`) on the `kind` docker network, pushes the skill there and passes the registry's current IP and the digest to Helm (the chart default is an unpullable placeholder). The registry survives cluster deletion, but its IP can change, so re-run `./install.sh` after recreating the cluster. Model-driven skill selection has only been exercised lightly.
+- **Knowledge base.** One replica of each piece, no database backups, and the embedding model is downloaded from HuggingFace on first start (the node needs internet once; later starts use the PVC). The kb and its database have no egress policy. Ingest is by token; there is no per-collection authorization and the vMCP's permit-all Cedar policy applies to the kb tools like any other. The kb's lexical half ORs every query word, so common words add noise on a tiny corpus; the vector half still ranks well (checked with queries that share no word with the target chunk, see CHANGELOG). Tool names carry the entry name twice (`knowledge_kb_search`).
 - **Sandbox DNS** does not apply search domains, so every in-cluster URL an agent uses must be a full `*.svc.cluster.local` name.
 - **Agent changes roll slowly.** Editing a ModelConfig re-snapshots the agent (15 to 20 seconds); calls in that window still use the old configuration. Agents share one Substrate worker pool, so a busy agent can starve another.
 - **Gemini** has not produced a real completion in this project (the test key had no credits). The Gemini and failover model entries are examples only.
@@ -159,6 +199,9 @@ These are the gaps found while building the components. Most are acceptable for 
 install.sh, uninstall.sh        installer and release-only uninstaller
 charts/openagentix/             the Helm chart (values.yaml, templates/, tests/run.sh)
 bridges/telegram/               Go Telegram -> A2A bridge, Dockerfile, deploy/ reference manifests
+services/kb/                    Go knowledge base service (tests, Dockerfile, reference manifests in deploy/)
+components/knowledge/sample/    sample corpus install.sh ingests
+hack/kb-ingest.sh               ingest a directory of markdown into a kb collection
 components/model-gateway/       agentgateway install script, original manifests and NOTES
 components/tools/               ToolHive install script, original manifests, example skill, verify/ clients, NOTES
 components/agents/              the original hand-applied assistant agent (now rendered by the chart)

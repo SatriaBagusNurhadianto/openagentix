@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # OpenAgentix installer: one command, idempotent, ordered.
-#   1. kind cluster (optional)            4. build/load the bridge image, build/push the example skill
+#   1. kind cluster (optional)            4. build/load the bridge and kb images, build/push the example skill
 #   2. prerequisites (upstream Helm)      5. helm upgrade --install openagentix charts/openagentix
-#   3. Secrets from the environment
+#   3. Secrets from the environment       6. ingest the sample knowledge corpus (when knowledge.enabled)
 #
 # Required env (unless the Secret already exists in the cluster):
 #   ANTHROPIC_API_KEY       provider key for the claude-haiku model (-> agentgateway-system/anthropic-api-key)
@@ -17,8 +17,12 @@
 #                        spikes/kagent/values/substrate.yaml and DROPS any Substrate additions made by spikes/ax)
 #   SKIP_SKILL=1         do not build/push the example skill; use the digest in values.yaml
 #   SKIP_BRIDGE_IMAGE=1  do not build/load the bridge image
+#   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
+#   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents)
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
+# The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
+# kb-admin, kb-postgres, kb-database and, for gateway-routed embeddings, kb-virtual-key in openagentix-knowledge.
 # Secret values are never echoed, never put in argv or written to disk.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -98,6 +102,10 @@ RENDERED=$(render) || die "chart does not render; run: helm template $RELEASE $C
 AGENT_KEYS=$(jq -r 'select(.kind=="ModelConfig")|[.metadata.annotations["openagentix.io/agent"],.spec.apiKeySecret,.metadata.namespace]|@tsv' <<<"$RENDERED")
 NAMESPACES=$(jq -r 'select(.metadata.namespace!=null)|.metadata.namespace' <<<"$RENDERED" | sort -u)
 BRIDGE_IMAGE=$(jq -r 'select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].image' <<<"$RENDERED")
+KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDERED")   # empty when knowledge.enabled=false
+# Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
+KB_KEY=$(jq -r 'select(.kind=="Deployment" and (.metadata.annotations["openagentix.io/gateway-user"]//"")!="")|[.metadata.annotations["openagentix.io/gateway-user"],.metadata.annotations["openagentix.io/gateway-key-secret"],.metadata.namespace]|@tsv' <<<"$RENDERED")
+[ -z "$KB_KEY" ] || AGENT_KEYS=$(printf '%s\n%s' "$AGENT_KEYS" "$KB_KEY")
 
 for ns in $RELEASE_NS $NAMESPACES; do
   $K get namespace "$ns" >/dev/null 2>&1 || $K create namespace "$ns" >/dev/null
@@ -119,7 +127,36 @@ put_secret $GW_NS gemini-api-key Authorization GOOGLE_API_KEY
 put_secret $BRIDGE_NS $BRIDGE_SECRET TELEGRAM_BOT_TOKEN TELEGRAM_BOT_TOKEN
 put_secret $BRIDGE_NS $BRIDGE_SECRET TELEGRAM_ALLOWED_CHAT_IDS TELEGRAM_ALLOWED_CHAT_IDS
 
-# One virtual key per agent, so gateway logs/metrics/budgets are attributed per agent. The raw key lives only in
+# Knowledge base Secrets: each is created only if absent (so re-runs never rotate a password or token), values come
+# from openssl and are never printed. kb-database is built from the kb-postgres password.
+if [ -n "$KB_DEP" ]; then
+  KB_NS=$(jq -r '.metadata.namespace' <<<"$KB_DEP")
+  kb_secret_ref(){ jq -r --arg v "$1" '.spec.template.spec.containers[0].env[]|select(.name==$v)|.valueFrom.secretKeyRef|[.name,.key]|@tsv' <<<"$KB_DEP"; }
+  mk_random_secret(){  # ns name key
+    $K get secret -n "$1" "$2" >/dev/null 2>&1 && { echo "secret $1/$2: kept"; return 0; }
+    $K create secret generic "$2" -n "$1" --from-file="$3"=<(printf '%s' "$(openssl rand -hex 24)") >/dev/null && echo "secret $1/$2 key $3: generated"
+  }
+  IFS=$'\t' read -r ADM_S ADM_K <<<"$(kb_secret_ref KB_ADMIN_TOKEN)"
+  IFS=$'\t' read -r DB_S DB_K <<<"$(kb_secret_ref KB_DATABASE_URL)"
+  mk_random_secret "$KB_NS" "$ADM_S" "$ADM_K"
+  PG_SS=$(jq -c 'select(.kind=="StatefulSet" and .metadata.name=="kb-postgres")' <<<"$RENDERED")
+  if [ -n "$PG_SS" ]; then
+    PG_S=$(jq -r '.spec.template.spec.containers[0].env[]|select(.name=="POSTGRES_PASSWORD")|.valueFrom.secretKeyRef.name' <<<"$PG_SS")
+    PG_K=$(jq -r '.spec.template.spec.containers[0].env[]|select(.name=="POSTGRES_PASSWORD")|.valueFrom.secretKeyRef.key' <<<"$PG_SS")
+    PG_U=$(jq -r '.spec.template.spec.containers[0].env[]|select(.name=="POSTGRES_USER")|.value' <<<"$PG_SS")
+    PG_D=$(jq -r '.spec.template.spec.containers[0].env[]|select(.name=="POSTGRES_DB")|.value' <<<"$PG_SS")
+    mk_random_secret "$KB_NS" "$PG_S" "$PG_K"
+    if $K get secret -n "$KB_NS" "$DB_S" >/dev/null 2>&1; then echo "secret $KB_NS/$DB_S: kept"; else
+      PGPW=$($K get secret -n "$KB_NS" "$PG_S" -o jsonpath="{.data.$PG_K}" | base64 -d)
+      $K create secret generic "$DB_S" -n "$KB_NS" --from-file="$DB_K"=<(printf 'postgres://%s:%s@kb-postgres.%s.svc.cluster.local:5432/%s?sslmode=disable' "$PG_U" "$PGPW" "$KB_NS" "$PG_D") >/dev/null
+      unset PGPW; echo "secret $KB_NS/$DB_S key $DB_K: generated"
+    fi
+  else
+    $K get secret -n "$KB_NS" "$DB_S" >/dev/null 2>&1 || echo "WARN: knowledge.postgres.enabled=false and Secret $KB_NS/$DB_S does not exist: create it with the URL of your PostgreSQL (pgvector)"
+  fi
+fi
+
+# One virtual key per agent (and per other gateway consumer, the kb), so gateway logs/metrics/budgets are attributed per agent. The raw key lives only in
 # Secret <ns>/<agent>-virtual-key; the gateway ConfigMap llm-api-keys holds SHA-256 hashes.
 CM_ARGS=()
 while IFS=$'\t' read -r agent secret ns; do
@@ -157,6 +194,18 @@ if [ "${SKIP_BRIDGE_IMAGE:-0}" != 1 ] && [[ "$BRIDGE_IMAGE" == openagentix/teleg
   log "bridge image $BRIDGE_IMAGE"
   docker build -q -t "$BRIDGE_IMAGE" bridges/telegram >/dev/null
   kind load docker-image "$BRIDGE_IMAGE" --name "$CLUSTER"
+fi
+KB_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${KB_DEP:-null}" 2>/dev/null || true)
+if [ "${SKIP_KB_IMAGE:-0}" != 1 ] && [[ "$KB_IMAGE" == openagentix/kb:* ]]; then
+  log "kb image $KB_IMAGE"
+  docker build -q -t "$KB_IMAGE" services/kb >/dev/null
+  kind load docker-image "$KB_IMAGE" --name "$CLUSTER"
+fi
+if [ -n "$KB_DEP" ]; then
+  # The image tag is "dev" and image ids change with every build, so key the rollout on the source content instead:
+  # unchanged code = identical pod template = no restart; changed code = new hash = the pod is replaced.
+  KB_HASH=$(cd services/kb && find . -type f ! -path './bin/*' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "knowledge.kb.sourceHash=$KB_HASH")
 fi
 if [ "${SKIP_SKILL:-0}" != 1 ] && jq -e 'select(.kind=="AgentTemplate")|.spec.skills[]?|select(.source.oci|test("/skills/openagentix-canary@"))' <<<"$RENDERED" >/dev/null; then
   log "example skill openagentix-canary"
@@ -207,6 +256,17 @@ helm upgrade --install $RELEASE $CHART -n "$RELEASE_NS" --create-namespace ${VAL
 # server-side apply (no-op for objects Helm just created).
 helm get manifest $RELEASE -n "$RELEASE_NS" | $K apply --server-side --force-conflicts --field-manager=openagentix-install -f - >/dev/null
 [ "$adopted" -eq 0 ] || echo "reconciled $adopted adopted object(s) to the chart's desired state"
+
+# --- 6b. knowledge base: wait, then ingest the sample corpus (idempotent PUTs, token read from the Secret) -------
+if [ -n "$KB_DEP" ]; then
+  log "knowledge base"
+  for w in $(jq -r 'select((.kind=="Deployment" or .kind=="StatefulSet") and .metadata.namespace=="'"$KB_NS"'")|.kind+"/"+.metadata.name' <<<"$RENDERED"); do
+    $K rollout status "$w" -n "$KB_NS" --timeout=600s
+  done
+  if [ "${SKIP_KB_INGEST:-0}" != 1 ]; then
+    KUBECTL=$K KUBE_CONTEXT=$CTX KB_NAMESPACE=$KB_NS KB_ADMIN_SECRET=$ADM_S KB_ADMIN_KEY=$ADM_K bash hack/kb-ingest.sh components/knowledge/sample openagentix
+  fi
+fi
 
 # --- 7. wait for the agents ---------------------------------------------------------------------------------
 log "waiting for agents (first start builds a golden snapshot, ~1-2 min each)"

@@ -1,0 +1,459 @@
+{{- if .Values.knowledge.enabled }}
+{{- $k := .Values.knowledge }}
+{{- $ns := $k.namespace }}
+{{- $emb := $k.embeddings }}
+{{- $pg := $k.postgres }}
+{{- $kb := $k.kb }}
+{{- /* Which embedder does the kb use? explicit url > local server via the gateway > local server direct > none */ -}}
+{{- $viaGw := and $emb.enabled $emb.viaGateway .Values.gateway.enabled }}
+{{- $embURL := "" }}{{ $embModel := "" }}{{ $embDim := 0 }}{{ $embKey := dict }}
+{{- if $kb.embeddings.url }}
+{{- $embURL = $kb.embeddings.url }}
+{{- $embModel = required "knowledge.kb.embeddings.model is required with knowledge.kb.embeddings.url" $kb.embeddings.model }}
+{{- $embDim = int (required "knowledge.kb.embeddings.dim is required with knowledge.kb.embeddings.url" $kb.embeddings.dim) }}
+{{- if $kb.embeddings.apiKeySecret.name }}{{ $embKey = dict "name" $kb.embeddings.apiKeySecret.name "key" $kb.embeddings.apiKeySecret.key }}{{ end }}
+{{- else if $emb.enabled }}
+{{- $embDim = int $emb.model.dim }}
+{{- if $viaGw }}
+{{- $embURL = include "oa.gatewayBaseUrl" . }}
+{{- $embModel = $emb.gatewayModel }}
+{{- $embKey = dict "name" "kb-virtual-key" "key" "OPENAI_API_KEY" }}
+{{- else }}
+{{- $embURL = printf "http://kb-embeddings.%s.svc.cluster.local:8080/v1" $ns }}
+{{- $embModel = $emb.model.name }}
+{{- end }}
+{{- end }}
+{{- if $embURL }}{{ if or (lt $embDim 1) (gt $embDim 2000) }}{{ fail (printf "embedding dimension must be 1..2000 (pgvector HNSW limit), got %d" $embDim) }}{{ end }}{{ end }}
+{{- $kbGwKey := and $viaGw (not $kb.embeddings.url) }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kb
+  namespace: {{ $ns }}
+  labels:
+    app: kb
+    {{- include "oa.labels" . | nindent 4 }}
+  {{- if $kbGwKey }}
+  annotations:
+    # install.sh reads these to create the kb's own gateway virtual key (Secret kb-virtual-key) and register its hash
+    openagentix.io/gateway-user: kb
+    openagentix.io/gateway-key-secret: kb-virtual-key
+  {{- end }}
+spec:
+  replicas: {{ $kb.replicas }}
+  selector:
+    matchLabels: {app: kb}
+  template:
+    metadata:
+      labels:
+        app: kb
+        {{- include "oa.labels" . | nindent 8 }}
+      {{- if $kb.sourceHash }}
+      annotations:
+        # set by install.sh from the content of services/kb: a code change rolls the pod although the image tag stays "dev"
+        openagentix.io/source-hash: {{ $kb.sourceHash | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      {{- if $pg.enabled }}
+      initContainers:
+        # The kb exits when its database is unreachable. Waiting here avoids a restart on every first start.
+        - name: wait-for-postgres
+          image: {{ $pg.image | quote }}
+          command: [sh, -c, 'until pg_isready -q -h kb-postgres.{{ $ns }}.svc.cluster.local -p 5432 -U {{ $pg.user }} -d {{ $pg.database }}; do sleep 2; done']
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 5m, memory: 8Mi}
+            limits: {cpu: 50m, memory: 32Mi}
+      {{- end }}
+      containers:
+        - name: kb
+          image: {{ printf "%s:%s" $kb.image.repository (toString $kb.image.tag) | quote }}
+          imagePullPolicy: {{ $kb.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: KB_ADDR, value: ":8080"}
+            - {name: KB_STORE, value: postgres}
+            - {name: KB_DB_SCHEMA, value: {{ $kb.schema | quote }}}
+            - {name: KB_REQUEST_TIMEOUT, value: {{ $kb.requestTimeout | quote }}}
+            - {name: KB_INGEST_TIMEOUT, value: {{ $kb.ingestTimeout | quote }}}
+            - {name: KB_CHUNK_MAX_CHARS, value: {{ $kb.chunkMaxChars | quote }}}
+            - {name: KB_CHUNK_OVERLAP, value: {{ $kb.chunkOverlap | quote }}}
+            - name: KB_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ $kb.adminSecret.name | quote }}, key: {{ $kb.adminSecret.key | quote }}}
+            - name: KB_DATABASE_URL
+              valueFrom:
+                secretKeyRef: {name: {{ $kb.databaseSecret.name | quote }}, key: {{ $kb.databaseSecret.key | quote }}}
+            {{- if $embURL }}
+            - {name: KB_EMBEDDINGS_URL, value: {{ $embURL | quote }}}
+            - {name: KB_EMBEDDINGS_MODEL, value: {{ $embModel | quote }}}
+            - {name: KB_EMBEDDINGS_DIM, value: {{ $embDim | quote }}}
+            - {name: KB_QUERY_EMBED_TIMEOUT, value: {{ $kb.queryEmbedTimeout | quote }}}
+            {{- if $embKey }}
+            - name: KB_EMBEDDINGS_API_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ $embKey.name | quote }}, key: {{ $embKey.key | quote }}}
+            {{- end }}
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml $kb.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kb
+  namespace: {{ $ns }}
+  labels:
+    app: kb
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: kb}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- if $pg.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kb-postgres
+  namespace: {{ $ns }}
+  labels:
+    app: kb-postgres
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: kb-postgres}
+  ports:
+    - {name: postgres, port: 5432, targetPort: postgres}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kb-postgres
+  namespace: {{ $ns }}
+  labels:
+    app: kb-postgres
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  serviceName: kb-postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: kb-postgres}
+  template:
+    metadata:
+      labels:
+        app: kb-postgres
+        {{- include "oa.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: {{ $pg.image | quote }}
+          args: {{ toJson $pg.args }}
+          ports:
+            - {name: postgres, containerPort: 5432}
+          env:
+            - {name: POSTGRES_USER, value: {{ $pg.user | quote }}}
+            - {name: POSTGRES_DB, value: {{ $pg.database | quote }}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: {name: {{ $pg.passwordSecret.name | quote }}, key: {{ $pg.passwordSecret.key | quote }}}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            exec: {command: [pg_isready, -U, {{ $pg.user | quote }}, -d, {{ $pg.database | quote }}]}
+            periodSeconds: 3
+            failureThreshold: 40
+          readinessProbe:
+            exec: {command: [pg_isready, -U, {{ $pg.user | quote }}, -d, {{ $pg.database | quote }}]}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec: {command: [pg_isready, -U, {{ $pg.user | quote }}, -d, {{ $pg.database | quote }}]}
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 6
+          resources: {{- toYaml $pg.resources | nindent 12 }}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: run, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if $pg.storage.storageClassName }}
+        storageClassName: {{ $pg.storage.storageClassName }}
+        {{- end }}
+        resources:
+          requests: {storage: {{ $pg.storage.size }}}
+{{- end }}
+{{- if $emb.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: kb-embeddings-models
+  namespace: {{ $ns }}
+  labels:
+    app: kb-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if $emb.storage.storageClassName }}
+  storageClassName: {{ $emb.storage.storageClassName }}
+  {{- end }}
+  resources:
+    requests: {storage: {{ $emb.storage.size }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kb-embeddings
+  namespace: {{ $ns }}
+  labels:
+    app: kb-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: kb-embeddings}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# OpenAI-compatible /v1/embeddings on CPU. The model is downloaded from HuggingFace on the first start into the PVC;
+# later starts load it from there. /health answers 200 only after the model is loaded, so the Pod is not Ready before.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kb-embeddings
+  namespace: {{ $ns }}
+  labels:
+    app: kb-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # the model cache volume is ReadWriteOnce
+  selector:
+    matchLabels: {app: kb-embeddings}
+  template:
+    metadata:
+      labels:
+        app: kb-embeddings
+        {{- include "oa.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: embeddings
+          image: {{ $emb.image | quote }}
+          args:
+            - -hf
+            - {{ $emb.model.hf | quote }}
+            - --alias
+            - {{ $emb.model.name | quote }}
+            - --embeddings
+            - --pooling
+            - {{ $emb.model.pooling | quote }}
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - -c
+            - {{ $emb.contextSize | quote }}
+            - --parallel
+            - {{ $emb.parallel | quote }}
+            - -t
+            - {{ $emb.threads | quote }}
+          env:
+            - {name: LLAMA_CACHE, value: /models}
+            - {name: HOME, value: /tmp}
+          ports:
+            - {name: http, containerPort: 8080}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 120   # up to 10 minutes for the first download
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources: {{- toYaml $emb.resources | nindent 12 }}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: kb-embeddings-models}
+        - {name: tmp, emptyDir: {}}
+{{- if and $viaGw (not $kb.embeddings.url) }}
+---
+# One more model on the gateway: the same virtual-key auth and per-key attribution as the chat models apply. The
+# provider is OpenAI-compatible with baseURL pointing at the in-cluster server; no provider credential is involved.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: {{ $emb.gatewayModel }}
+  namespace: {{ .Values.gateway.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: {{ .Values.gateway.name }}, sectionName: http}
+  provider: OpenAI
+  baseURL: {{ printf "http://kb-embeddings.%s.svc.cluster.local:8080/v1" $ns }}
+{{- end }}
+{{- end }}
+{{- if .Values.mcp.enabled }}
+---
+# The kb is one more backend of the vMCP group. MCPServerEntry creates no pods: the vMCP itself connects to the
+# remote URL (so the kb pod's only MCP client is the vMCP pod). `unauthenticated` must be stated explicitly, because
+# with outgoingAuth.source=discovered an entry without an auth reference is dropped from the registry.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPExternalAuthConfig
+metadata:
+  name: {{ $k.mcp.entryName }}-noauth
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  type: unauthenticated
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServerEntry
+metadata:
+  name: {{ $k.mcp.entryName }}
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  groupRef: {name: {{ .Values.mcp.groupName }}}
+  remoteUrl: {{ printf "http://kb.%s.svc.cluster.local:8080/mcp" $ns }}
+  transport: streamable-http
+  allowPrivateEndpoint: true
+  externalAuthConfigRef: {name: {{ $k.mcp.entryName }}-noauth}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# /mcp has no authentication, so it must be reachable only from the ToolHive component that proxies it: the vMCP pod
+# (the MCPServerEntry has no proxy of its own). The admin API shares the port and is protected by its bearer token.
+# Kubelet probes come from the node and are not affected by ingress policy on kindnet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kb-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: kb}
+  policyTypes: [Ingress]
+  ingress:
+    {{- if or .Values.mcp.enabled $kb.ingestFrom }}
+    - ports: [{protocol: TCP, port: 8080}]
+      from:
+        {{- if .Values.mcp.enabled }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mcp.namespace }}}}
+          podSelector:
+            matchLabels: {app: virtualmcpserver, toolhive-name: {{ .Values.mcp.virtual.name | quote }}}
+        {{- end }}
+        {{- range $kb.ingestFrom }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml .podLabels | nindent 14 }}
+        {{- end }}
+    {{- else }} []
+    {{- end }}
+{{- if $pg.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kb-postgres-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: kb-postgres}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 5432}]
+      from:
+        - podSelector: {matchLabels: {app: kb}}
+{{- end }}
+{{- if $emb.enabled }}
+---
+# The embedding server has no authentication. Its only legitimate caller is the model gateway proxy (or, in direct
+# mode, the kb pod).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kb-embeddings-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: kb-embeddings}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 8080}]
+      from:
+        {{- if and $viaGw (not $kb.embeddings.url) }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.gateway.namespace }}}}
+          podSelector:
+            matchLabels: {gateway.networking.k8s.io/gateway-name: {{ .Values.gateway.name | quote }}}
+        {{- else }}
+        - podSelector: {matchLabels: {app: kb}}
+        {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

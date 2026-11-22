@@ -22,6 +22,9 @@ type Options struct {
 	// lets any replica answer any request. Recommended behind a load balancer.
 	Stateless bool
 	Version   string
+	// Timeout bounds every tool call. The SDK does not hand the HTTP request's deadline to tool handlers, so the
+	// server-wide request timeout has to be applied here too; zero means no bound.
+	Timeout time.Duration
 }
 
 // SearchInput is the kb_search argument object.
@@ -87,7 +90,7 @@ func New(svc *kb.Service, log *slog.Logger, opts Options) http.Handler {
 	if opts.Version == "" {
 		opts.Version = "dev"
 	}
-	h := &handlers{svc: svc, log: log}
+	h := &handlers{svc: svc, log: log, timeout: opts.Timeout}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "openagentix-kb", Title: "OpenAgentix Knowledge Base", Version: opts.Version}, &mcp.ServerOptions{
 		Instructions: "Search the organisation's knowledge base. Use kb_search to find relevant passages, then kb_get_document for the full text of a document. Cite the source URI when you use a passage.",
 	})
@@ -115,8 +118,17 @@ func New(svc *kb.Service, log *slog.Logger, opts Options) http.Handler {
 }
 
 type handlers struct {
-	svc *kb.Service
-	log *slog.Logger
+	svc     *kb.Service
+	log     *slog.Logger
+	timeout time.Duration
+}
+
+// bound derives the context of one tool call.
+func (h *handlers) bound(ctx context.Context) (context.Context, context.CancelFunc) {
+	if h.timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, h.timeout)
 }
 
 // done logs one tool call (name, outcome, timing, result count only: never
@@ -134,6 +146,9 @@ func (h *handlers) done(tool string, start time.Time, n int, err error) error {
 		return errors.New("document not found: check the document_id and collection (kb_search returns both)")
 	case errors.Is(err, store.ErrAmbiguous):
 		return errors.New("document_id exists in more than one collection: pass the collection argument (kb_search results include it)")
+	case errors.Is(err, context.DeadlineExceeded):
+		h.log.Error("tool timed out", "tool", tool, "err", err)
+		return errors.New("the knowledge base timed out; try again later")
 	default:
 		h.log.Error("tool failed", "tool", tool, "err", err)
 		return errors.New("the knowledge base backend failed; try again later")
@@ -145,6 +160,8 @@ func textResult(s string) *mcp.CallToolResult {
 }
 
 func (h *handlers) search(ctx context.Context, _ *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
+	ctx, cancel := h.bound(ctx)
+	defer cancel()
 	start := time.Now()
 	hits, err := h.svc.Search(ctx, in.Query, in.Collection, in.TopK)
 	if err != nil {
@@ -179,6 +196,8 @@ func (h *handlers) search(ctx context.Context, _ *mcp.CallToolRequest, in Search
 }
 
 func (h *handlers) get(ctx context.Context, _ *mcp.CallToolRequest, in GetInput) (*mcp.CallToolResult, GetOutput, error) {
+	ctx, cancel := h.bound(ctx)
+	defer cancel()
 	start := time.Now()
 	v, err := h.svc.Get(ctx, in.Collection, in.DocumentID)
 	if err != nil {
@@ -205,6 +224,8 @@ func (h *handlers) get(ctx context.Context, _ *mcp.CallToolRequest, in GetInput)
 }
 
 func (h *handlers) list(ctx context.Context, _ *mcp.CallToolRequest, _ ListInput) (*mcp.CallToolResult, ListOutput, error) {
+	ctx, cancel := h.bound(ctx)
+	defer cancel()
 	start := time.Now()
 	cols, err := h.svc.Collections(ctx)
 	if err != nil {

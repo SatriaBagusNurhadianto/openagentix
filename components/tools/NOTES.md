@@ -68,3 +68,9 @@ Tool layer: operator 47 MiB, vMCP 21 MiB, fetch proxy 15 + fetch 6 MiB, osv prox
 - RemoteMCPServer behaviour if vMCP is down at creation (retry/backoff).
 - Skill from a private/HTTPS registry; git/bucket sources; plugins.
 - Memory of sandboxes while executing tool calls.
+
+## Attaching an already-running MCP service (knowledge base), 2026-11-22
+- Options in the installed CRDs (ToolHive 0.67.1): `MCPServer` (runs the image under a proxy), `MCPRemoteProxy` (a proxy pod in front of a URL) and `MCPServerEntry` ("zero-infrastructure catalog entry": no pods, the vMCP connects itself; `groupRef` required; `allowPrivateEndpoint` needed for `*.cluster.local`). The kb is already a Deployment, so the chart uses `MCPServerEntry`.
+- Gotcha: with `outgoingAuth.source: discovered` an entry without `externalAuthConfigRef` is dropped ("Backend conversion returned nil (auth failure or no URL)", "Removing backend from registry"). A `MCPExternalAuthConfig` of `type: unauthenticated` fixes it.
+- The vMCP aggregates backends lazily: the new backend's tools appear on the next session, not in the pod log at start. Checked with a temporary anonymous VirtualMCPServer: tools were `fetch_fetch`, `kb_kb_get_document`, `kb_kb_list_collections`, `kb_kb_search`, `osv_*` for an entry named `kb`; the chart names the entry `knowledge`, so the agent sees `knowledge_kb_search`, `knowledge_kb_get_document`, `knowledge_kb_list_collections` (prefix is `{workload}_`, the workload is the entry name).
+- Network consequence: the only MCP client of the kb is the vMCP pod, which is what the kb NetworkPolicy allows.

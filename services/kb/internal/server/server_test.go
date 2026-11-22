@@ -303,3 +303,39 @@ func TestIngestRouteHasItsOwnLongerTimeout(t *testing.T) {
 		t.Fatalf("ingest: code=%d body=%s (the general request timeout applied)", rec.Code, rec.Body)
 	}
 }
+
+// hangListStore blocks ListCollections until the caller's context ends (like a database driver waiting on a
+// stalled server) or, as a test safety net, for 4 seconds.
+type hangListStore struct{ *memory.Store }
+
+func (hangListStore) ListCollections(ctx context.Context) ([]store.CollectionInfo, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(4 * time.Second):
+		return nil, nil
+	}
+}
+
+// An MCP tool call must end at KB_REQUEST_TIMEOUT even when the backend hangs: found on a cluster where a call
+// with a stalled PostgreSQL did not return until the client gave up.
+func TestMCPToolCallHonoursRequestDeadline(t *testing.T) {
+	d := deps(hangListStore{memory.New(0)}, config.Config{MCPStateless: true, RequestTimeout: 300 * time.Millisecond}, io.Discard)
+	srv := httptest.NewServer(Handler(d))
+	t.Cleanup(srv.Close)
+	client := mcp.NewClient(&mcp.Implementation{Name: "c", Version: "0"}, nil)
+	sess, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: srv.URL + "/mcp"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+	start := time.Now()
+	res, err := sess.CallTool(t.Context(), &mcp.CallToolParams{Name: "kb_list_collections"})
+	elapsed := time.Since(start)
+	if elapsed > time.Second {
+		t.Fatalf("tool call took %v with a 300ms request deadline", elapsed)
+	}
+	if err == nil && !res.IsError {
+		t.Fatalf("expected an error result, got %+v", res)
+	}
+}

@@ -88,3 +88,7 @@ With virtual keys on:
 - That two separate policies on one Gateway really overwrite each other (docs claim; I avoided it).
 - Enterprise-only feature list (no comparison against the paid product).
 - Cold install on a cluster with no `kagent` namespace (script has the branch, not exercised) and on a fresh cluster generally; only the idempotent re-run was run.
+
+## Embeddings route (2026-11-22)
+- `AgentgatewayModel` v1alpha1 in v1.7.0 serves `/v1/embeddings` for an OpenAI-compatible backend: `provider: OpenAI` + `baseURL: http://kb-embeddings.openagentix-knowledge.svc.cluster.local:8080/v1`, no `policies.auth`. The access log shows `gen_ai.operation.name=embeddings`, `agw.ai.original_model=embed-default` and `user_id="kb"`. Without a virtual key or with a wrong one: 401. (`provider: Custom` with `custom.backendRef` is the alternative, but it may only reference a Service in the model's own namespace.)
+- A request sent before the upstream had finished loading its model returned 503 "Connection refused"; the embedding Pod's readiness probe now waits for the model.

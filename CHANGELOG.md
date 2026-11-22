@@ -11,6 +11,19 @@ All notable changes to OpenAgentix are documented here. The format follows [Keep
 - README "Security" section stating what is and is not protected.
 - `services/kb`: knowledge base service (MCP tools `kb_search`, `kb_get_document`, `kb_list_collections`; token-protected ingest API; in-memory and PostgreSQL stores with optional pgvector hybrid search; optional OpenAI-compatible embedder). Not deployed by `install.sh` yet.
 
+- Knowledge base deployment (chart block `knowledge`, default on; `knowledge.enabled=false` renders byte-identical output to the chart before this change):
+  - `openagentix-knowledge` namespace with the kb (`KB_STORE=postgres`, hybrid search on), PostgreSQL with pgvector (`pgvector/pgvector:pg17` pinned by tag and digest, StatefulSet and PVC) and a CPU embedding server (llama.cpp `server-b10088` pinned by digest, `bge-small-en-v1.5` GGUF Q8_0, 384 dimensions, model cache on a PVC, readiness on `/health`). Hardened: non-root, read-only root filesystem, all capabilities dropped. Hugging Face text-embeddings-inference was not used: its CPU images (`cpu-1.8`, `cpu-1.9`, `cpu-latest`) have no arm64 manifest.
+  - The model gateway routes `/v1/embeddings` to that server as the model `embed-default` (an `AgentgatewayModel`, provider `OpenAI` with `baseURL`), behind the same virtual-key auth; the kb has its own key (`user_id="kb"`). `viaGateway=false` calls the Service directly.
+  - The kb is one more backend of the vMCP group through an `MCPServerEntry` (no extra pods) plus an `unauthenticated` `MCPExternalAuthConfig` (without it the vMCP drops the entry). Agent-visible tool names: `knowledge_kb_search`, `knowledge_kb_get_document`, `knowledge_kb_list_collections`.
+  - NetworkPolicies: the kb takes 8080 only from the vMCP pod, PostgreSQL only from the kb, the embedding server only from the gateway proxy.
+  - Agents opt in with `knowledge: true`; the demo `assistant` searches the knowledge base for questions about OpenAgentix and cites document titles.
+  - `hack/kb-ingest.sh` (idempotent markdown ingest through `kubectl port-forward`), sample corpus `components/knowledge/sample/` (includes the canary fact), ingested by `install.sh`.
+  - `install.sh`: builds and loads `openagentix/kb:dev`, creates `kb-admin`, `kb-postgres`, `kb-database`, `kb-virtual-key` only when absent, rolls the kb pod when `services/kb` changes (pod annotation `openagentix.io/source-hash`), switches `SKIP_KB_IMAGE` and `SKIP_KB_INGEST`. `uninstall.sh`: `PURGE_DATA=1` for the knowledge volumes.
+  - Verified on kind: semantic hits for queries that share no word with the chunk (PostgreSQL full-text match count 0): "Could a hijacked worker exfiltrate our language engine supplier passphrase" returned the "Security model" credentials chunk first, "Nobody outside an approved roster can talk to the messenger relay" returned the Telegram allowlist chunk first; a third paraphrase ranked a neighbouring chunk first. Score margins with bge-small are small (0.613 vs 0.612, 0.605 vs 0.592).
+
+### Fixed
+- `services/kb`: an MCP tool call no longer outlives `KB_REQUEST_TIMEOUT`. The MCP SDK does not pass the HTTP request deadline to tool handlers, so with a stalled PostgreSQL a call hung until the client gave up (observed: 100 s client timeout hit); each tool call now runs under the request timeout and a timeout is reported as a tool error. Test: `TestMCPToolCallHonoursRequestDeadline`.
+
 ### Changed
 - The vMCP no longer accepts anonymous callers by default (HTTP 401 without a valid actor JWT). Set `mcp.virtual.incomingAuth.type=anonymous` for the old behaviour. The RemoteMCPServer reports `DiscoveryDisabled` because tools are listed at run time inside the agent.
 - `components/tools/NOTES.md`: corrected the claim that RemoteMCPServer has no `headersFrom` or `tokenPassthrough`.

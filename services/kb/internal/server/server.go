@@ -28,7 +28,7 @@ type Deps struct {
 // Handler builds the full handler: /mcp, /v1/*, /healthz, /readyz.
 func Handler(d Deps) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version}))
+	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version, Timeout: d.Cfg.RequestTimeout}))
 	mux.Handle("/v1/", api.New(d.Svc, api.Config{
 		AdminToken: d.Cfg.AdminToken, AllowAnonymous: d.Cfg.AdminAllowAnonymous, MaxBodyBytes: d.Cfg.MaxBodyBytes,
 	}, d.Log))

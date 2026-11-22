@@ -115,12 +115,32 @@ helm lint charts/openagentix
 
 If the cluster already holds hand-applied copies of the objects this chart renders, `install.sh` labels and annotates them for Helm (`app.kubernetes.io/managed-by=Helm`, `meta.helm.sh/release-*`), runs `helm upgrade --install`, then converges them with a server-side apply. Nothing is deleted or recreated. Helm alone would leave adopted custom resources unchanged. Objects the chart does not render (old stub models, test agents, a second policy) are left alone; remove them yourself.
 
+## Security
+
+What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy) with kagent 1.0.1, Substrate 1.0.1 and ToolHive 0.67.1.
+
+**Protected**
+
+- **Network, `mcp-tools` (chart, `networkPolicy.enabled`, default on).** MCP backends and their proxies accept connections only from their own namespace and from the ToolHive operator. The vMCP (port 4483) additionally accepts the Substrate egress proxy (`atenet-egress` in `ate-system`) and the kagent controller pod. A pod in `default` or in another namespace times out.
+- **Network, kagent controller port 8083.** A2A, the REST API and the sandboxes' task-store gRPC share this port. It accepts the Telegram bridge pod (selected by pod label `app=telegram-bridge` in `openagentix-gateway`, not the whole namespace), every pod in the `kagent` namespace (UI, tools, worker pool) and `atenet-egress`. Other pods time out. Ports other than 8083 are left open, as before (the controller listens on no other).
+- **Tool identity (chart, `mcp.virtual.incomingAuth.type: oidc`, default).** The vMCP rejects requests without a valid Substrate actor JWT (HTTP 401, also for a malformed token). The RemoteMCPServer asks Substrate for a token with the dedicated audience `openagentix-vmcp`, and the egress proxy adds it to every tool call. The vMCP verifies issuer, signature (explicit JWKS URL, TLS checked against the Substrate service CA, which `install.sh` copies into a ConfigMap), audience and expiry. No `insecure*` flag is set; `jwksAllowPrivateIP` is on because the IdP's ClusterIP is a private address.
+- **Tool authorization (optional).** `mcp.virtual.incomingAuth.toolAccess` turns into Cedar `permit` rules keyed on the token's `atespace` claim and the tool name; with it set, a tool not listed is refused (and hidden from the agent's tool list). Verified: with `osv_query_vulnerability` left out, Cedar logged deny for it and allow for the others, and the agent answered through `osv_query_vulnerabilities_batch` instead.
+
+**Not protected**
+
+- **The kagent controller does not authenticate callers.** `server.auth.mode` is `insecure`. Enabling `config.server.auth.serviceAccount.authority: kubernetes` was tried and does not help: requests with no token and with a garbage token were still answered (HTTP 200); only a valid Kubernetes token with the wrong audience was refused (401). Any pod the NetworkPolicy lets through can call any agent. The policy is the only control, and it allows all of the `kagent` namespace and all sandboxes (their traffic leaves through `atenet-egress`, which therefore cannot be told apart from one agent to the next).
+- **No per-agent tool authorization.** kagent creates one Substrate actor per session (`actor/kagent/session-<uuid>`) in the atespace `kagent`, for every agent. Cedar can tell sessions and atespaces apart, not agents. The default Cedar policy is permit-all for any authenticated caller. Only the agent's tool allowlist in its AgentTemplate limits which tools an agent offers to its model. Whether code running in a sandbox (for example through the `bash` tool) could call the vMCP directly, with the token the egress proxy injects for that destination, was not tested; assume it can.
+- Anything with an actor JWT can present it to the vMCP until it expires (up to `tokenExpirationSeconds`, 3600). There is no revocation.
+- **Global tool discovery is off.** With `actorJwt` the RemoteMCPServer shows `Accepted` with reason `DiscoveryDisabled`; agents list the tools at run time inside their sandbox. Set `incomingAuth.type=anonymous` to get the controller-side discovery back.
+- The `fetch` tool can still reach any URL the pod network allows (no egress policy on `mcp-tools`). The Telegram bridge pod and the `kagent`/`ate-system` namespaces are not restricted at all. The Substrate CA copied into `mcp-tools` is read once at install time; re-run `./install.sh` if the CA is rotated.
+- The Telegram allowlist and the model gateway virtual keys are separate controls described above.
+
 ## Known limitations
 
 These are the gaps found while building the components. Most are acceptable for a laptop demo and not for anything else.
 
 - **Single node, dev databases.** Substrate uses a bundled dev PostgreSQL with mTLS. kagent uses a plain pgvector PostgreSQL with password auth and `sslmode=disable`. RustFS credentials are `rustfsadmin/rustfsadmin`. The identity CA and JWT keys are minted once by `kubectl ate` and live in Secrets.
-- **Tool layer has no authentication.** The vMCP accepts anonymous callers with a permit-all Cedar policy. Anyone who can reach `vmcp-tools:4483` can call any tool, including `fetch_fetch` against arbitrary URLs, which is a path into the cluster network. No NetworkPolicy restricts `mcp-tools`. The agent's identity is not forwarded to the tools. Production needs OIDC on the vMCP, per-tool Cedar rules, NetworkPolicies and egress limits for `fetch`.
+- **Tool layer authorization is coarse.** The vMCP authenticates callers (see Security) but its Cedar policy is permit-all by default, and the identity Substrate gives an agent is per session, not per agent. See Security for the exact grain, and for the NetworkPolicy and `fetch` egress caveats.
 - **Code mode** runs Starlark with no `json` module, so processing JSON tool output is awkward. Per-call authorization of inner tool calls is not verified.
 - **Gateway budgets** are token-based and per proxy replica; there are no USD caps. Cross-replica limits need an external rate-limit service. Virtual keys are static, with no rotation or expiry. The gateway serves plain HTTP inside the cluster.
 - **Provider key:** one Anthropic key is shared by every agent behind the gateway. Per-agent attribution is by virtual key only.

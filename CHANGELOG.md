@@ -4,6 +4,20 @@ All notable changes to OpenAgentix are documented here. The format follows [Keep
 
 ## [Unreleased]
 
+### Added
+- Chart `networkPolicy` (default on): ingress NetworkPolicies for `mcp-tools` (backends from their own namespace and the ToolHive operator; the vMCP also from `atenet-egress` and the kagent controller) and for the kagent controller port 8083 (the bridge pod by label, the `kagent` namespace, `atenet-egress`; other ports untouched).
+- Tool-layer identity: `mcp.virtual.incomingAuth.type: oidc` is now the default. The chart renders an `MCPOIDCConfig` for the Substrate IdP (explicit JWKS URL, CA from a ConfigMap) and the RemoteMCPServer requests an actor JWT (`actorJwt`, audience `openagentix-vmcp`). `install.sh` copies the Substrate service CA from its ClusterTrustBundle into that ConfigMap.
+- `mcp.virtual.incomingAuth.toolAccess`: per-atespace tool allowlist rendered as Cedar rules (replaces the permit-all policy when set).
+- README "Security" section stating what is and is not protected.
+- `services/kb`: knowledge base service (MCP tools `kb_search`, `kb_get_document`, `kb_list_collections`; token-protected ingest API; in-memory and PostgreSQL stores with optional pgvector hybrid search; optional OpenAI-compatible embedder). Not deployed by `install.sh` yet.
+
+### Changed
+- The vMCP no longer accepts anonymous callers by default (HTTP 401 without a valid actor JWT). Set `mcp.virtual.incomingAuth.type=anonymous` for the old behaviour. The RemoteMCPServer reports `DiscoveryDisabled` because tools are listed at run time inside the agent.
+- `components/tools/NOTES.md`: corrected the claim that RemoteMCPServer has no `headersFrom` or `tokenPassthrough`.
+
+### Tried, not adopted
+- kagent `config.server.auth.serviceAccount.authority: kubernetes` for the A2A endpoint: with `mode: insecure` the controller still answered requests with no token or a garbage token (200), so it adds no protection. Reverted; the bridge keeps the NetworkPolicy as its only control (`A2A_TOKEN_FILE` was not added).
+
 ## [0.1.0] - 2026-11-22
 
 ### Added

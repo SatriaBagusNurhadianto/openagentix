@@ -136,6 +136,21 @@ if [ ${#CM_ARGS[@]} -gt 0 ]; then
   echo "ConfigMap $GW_NS/llm-api-keys: ${#CM_ARGS[@]} hashed key(s)"
 fi
 
+# --- 4b. trust anchor for the vMCP's OIDC validation -------------------------------------------------------------
+# The vMCP verifies Substrate actor JWTs against https://idp.ate-system.svc, whose TLS certificate is signed by
+# Substrate's service-dns CA. Copy that CA (public certificate, not a key) into the ConfigMap the chart references.
+CA_REF=$(jq -r 'select(.kind=="MCPOIDCConfig")|.spec.inline.caBundleRef.configMapRef|[.name,.key]|@tsv' <<<"$RENDERED" | head -1)
+if [ -n "$CA_REF" ]; then
+  log "IdP CA bundle for the vMCP"
+  IFS=$'\t' read -r CA_CM CA_KEY <<<"$CA_REF"
+  CA_NS=$(jq -r 'select(.kind=="MCPOIDCConfig")|.metadata.namespace' <<<"$RENDERED" | head -1)
+  CTB=${IDP_CTB:-servicedns.podcert.ate.dev:identity:primary-bundle}
+  CA_PEM=$($K get clustertrustbundle "$CTB" -o jsonpath='{.spec.trustBundle}' 2>/dev/null) || CA_PEM=""
+  [ -n "$CA_PEM" ] || die "ClusterTrustBundle $CTB not found or empty (is Substrate installed?). Set mcp.virtual.incomingAuth.type=anonymous to skip OIDC."
+  $K create configmap "$CA_CM" -n "$CA_NS" --from-file="$CA_KEY"=<(printf '%s\n' "$CA_PEM") --dry-run=client -o yaml | $K apply -f - >/dev/null
+  echo "ConfigMap $CA_NS/$CA_CM key $CA_KEY from ClusterTrustBundle $CTB"
+fi
+
 # --- 5. images ----------------------------------------------------------------------------------------------
 SET=()
 if [ "${SKIP_BRIDGE_IMAGE:-0}" != 1 ] && [[ "$BRIDGE_IMAGE" == openagentix/telegram-bridge:* ]]; then

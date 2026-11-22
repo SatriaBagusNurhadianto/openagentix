@@ -16,6 +16,12 @@ spec:
   url: http://vmcp-{{ .Values.mcp.virtual.name }}.{{ .Values.mcp.namespace }}.svc.cluster.local:{{ .Values.mcp.virtual.port }}/mcp
   protocol: STREAMABLE_HTTP
   timeout: {{ $k.remoteMCPServer.timeout }}
+  {{- if and .Values.mcp.enabled (eq .Values.mcp.virtual.incomingAuth.type "oidc") }}
+  # Substrate's egress gateway attaches "Authorization: Bearer <JWT of the calling actor>" with this audience.
+  actorJwt:
+    audiences: [{{ .Values.mcp.virtual.incomingAuth.oidc.audience | quote }}]
+    expirationSeconds: {{ .Values.mcp.virtual.incomingAuth.oidc.tokenExpirationSeconds }}
+  {{- end }}
 {{- end }}
 {{- range $a := .Values.agents }}
 {{- if not (has $a.model $modelNames) }}

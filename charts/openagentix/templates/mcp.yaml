@@ -24,8 +24,39 @@ spec:
   mcpPort: {{ default 8080 $s.port }}
   resources: {{- toYaml (default $m.serverResources $s.resources) | nindent 4 }}
 {{- end }}
+{{- $ia := $m.virtual.incomingAuth }}
+{{- if not (has $ia.type (list "anonymous" "oidc")) }}{{ fail (printf "mcp.virtual.incomingAuth.type must be anonymous or oidc, got %q" $ia.type) }}{{ end }}
+{{- $policies := $ia.policies }}
+{{- if $ia.toolAccess }}
+{{- if ne $ia.type "oidc" }}{{ fail "mcp.virtual.incomingAuth.toolAccess needs type oidc: an anonymous caller has no identity to key on" }}{{ end }}
+{{- $policies = list }}
+{{- range $r := $ia.toolAccess }}{{ range $t := $r.tools }}
+{{- $policies = append $policies (printf "permit(principal, action == Action::\"call_tool\", resource == Tool::%s) when { context[\"claim_actor.ate.dev\"].atespace == %s };" (quote $t) (quote $r.atespace)) }}
+{{- end }}{{ end }}
+{{- end }}
+{{- if eq $ia.type "oidc" }}
 ---
-# MVP ONLY: anonymous incoming auth with a permit-all Cedar policy.
+# Validates the per-actor JWT that Substrate injects (RemoteMCPServer.spec.actorJwt). Issuer, keys and CA come
+# from values; nothing is fetched insecurely.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPOIDCConfig
+metadata:
+  name: {{ $ia.oidc.name }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  type: inline
+  inline:
+    issuer: {{ $ia.oidc.issuer | quote }}
+    jwksUrl: {{ $ia.oidc.jwksUrl | quote }}
+    {{- if $ia.oidc.jwksAllowPrivateIP }}
+    jwksAllowPrivateIP: true
+    {{- end }}
+    caBundleRef:
+      configMapRef: {name: {{ $ia.oidc.caBundle.configMap | quote }}, key: {{ $ia.oidc.caBundle.key | quote }}}
+{{- end }}
+---
+# incomingAuth is oidc (Substrate actor JWT) by default; Cedar then authorizes the authenticated caller.
 apiVersion: toolhive.stacklok.dev/v1beta1
 kind: VirtualMCPServer
 metadata:
@@ -46,10 +77,13 @@ spec:
       toolCallTimeout: {{ $m.virtual.codeMode.toolCallTimeout }}
     {{- end }}
   incomingAuth:
-    type: {{ $m.virtual.incomingAuth.type }}
+    type: {{ $ia.type }}
+    {{- if eq $ia.type "oidc" }}
+    oidcConfigRef: {name: {{ $ia.oidc.name }}, audience: {{ $ia.oidc.audience | quote }}}
+    {{- end }}
     authzConfig:
       type: inline
       inline:
-        policies: {{ toJson $m.virtual.incomingAuth.policies }}
+        policies: {{ toJson $policies }}
   outgoingAuth: {source: discovered}
 {{- end }}

@@ -22,7 +22,7 @@ Date 2026-11-22, cluster `kind-openagentix` (arm64, k8s v1.37.0), kagent 1.0.1 /
 3. Tool names after aggregation are prefixed by workload (`fetch_fetch`, `osv_query_vulnerability`) because `conflictResolution: prefix`, `prefixFormat: "{workload}_"`.
 4. OSV tool args are `package_name`, `ecosystem`, `version` (not `package`).
 5. A first `install.sh` run hit a transient API-server TLS timeout (cluster busy with the other agent's work); rerun was clean.
-6. Substrate/network: NO allowance needed. The only NetworkPolicy on the worker pool is ingress-only; the sandbox reached `vmcp-tools.mcp-tools.svc.cluster.local:4483` with the default egress path, and discovery (controller side) worked too. Not tested: a restrictive EgressPolicy on the Agent.
+6. Substrate/network (at the time, before the chart added NetworkPolicies to `mcp-tools`): NO allowance was needed. The only NetworkPolicy on the worker pool is ingress-only; the sandbox reached `vmcp-tools.mcp-tools.svc.cluster.local:4483` with the default egress path, and discovery (controller side) worked too. Not tested: a restrictive EgressPolicy on the Agent.
 
 ## What code mode really does (observed)
 - With `codeMode.enabled`, `tools/list` returns the 4 backend tools PLUS `execute_tool_script` (5 total). Backend tools stay directly callable (code mode adds, it does not replace).
@@ -42,11 +42,12 @@ Date 2026-11-22, cluster `kind-openagentix` (arm64, k8s v1.37.0), kagent 1.0.1 /
 - Only `oci` sources tested (docs say git/bucket leave the agent not-Ready).
 - The skill is only proven mounted and loadable by tool call; the stub does not "decide" to use a skill, so model-driven skill selection is not tested.
 
-## Auth gaps (MVP)
-- vMCP `incomingAuth: anonymous` + Cedar `permit(principal, action, resource)`: anyone in the cluster who can reach `vmcp-tools:4483` can call any tool, including arbitrary-URL `fetch_fetch` (SSRF into the cluster network from the fetch pod; no NetworkPolicy restricts `mcp-tools` egress or ingress).
-- RemoteMCPServer has no `headersFrom`/`tokenPassthrough`; the agent's identity is not propagated. Production: OIDC incoming auth on vMCP (MCPOIDCConfig), per-tool Cedar authz, NetworkPolicy allowing only the worker pool/kagent-controller to reach vMCP, egress restrictions on `fetch`.
-- OSV/fetch call the public internet; no secrets involved. Backends with credentials need MCPExternalAuthConfig (untested).
-- `mock-llm-tools` has a fake API key Secret and no auth.
+## Auth (updated 2026-11-22; the original MVP had none)
+- Now done in the chart: NetworkPolicies on `mcp-tools` (sources found from the atenet-egress and controller logs), vMCP `incomingAuth: oidc` against the Substrate IdP, and RemoteMCPServer `actorJwt` with audience `openagentix-vmcp`. See README "Security" for the proof and the limits. `verify/run-mcp-check.sh` and `mcp_check.py` call the vMCP without a token, so they now get 401 (and, from outside `mcp-tools`, a timeout); use them with `mcp.virtual.incomingAuth.type=anonymous` or exercise tools through an agent.
+- Correction: RemoteMCPServer v1alpha3 in kagent 1.0.1 DOES have `headersFrom`, `tokenPassthrough` and `actorJwt {audiences, expirationSeconds}`. The older note here that it had none was wrong. With `actorJwt`, the controller no longer discovers tools globally (status reason `DiscoveryDisabled`); the agent lists tools at run time.
+- Findings: the sandbox's calls reach the vMCP through `atenet-egress` (the vMCP and the controller see that pod's IP, not the agent). The token's `sub` is `actor/kagent/session-<uuid>` and the atespace is `kagent` for every agent, so Cedar cannot tell agents apart. ToolHive's Cedar context exposes the claims as `context["claim_..."]` and the principal as `Client::"<sub>"`; tools are `Tool::"<name>"`, action `Action::"call_tool"`. Tool listing is filtered by the same checks. `execute_tool_script` did not appear in the Cedar log; inner calls from code mode were checked as normal tool calls (4 checks for `osv_query_vulnerability` in one code-mode turn).
+- The first JWKS fetch failed with "context deadline exceeded" until `jwksAllowPrivateIP: true` was set (the IdP Service has a private ClusterIP).
+- Still true: OSV/fetch call the public internet; no secrets involved. Backends with credentials need MCPExternalAuthConfig (untested). `mock-llm-tools` has a fake API key Secret and no auth.
 
 ## Umbrella Helm chart must handle
 - Two ToolHive charts (CRDs first, then operator), pinned together; CRDs must be a separate release or `crds/` dir since the CRs depend on them.

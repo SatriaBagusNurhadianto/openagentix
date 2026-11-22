@@ -163,6 +163,82 @@ rm -f "$(dirname "$0")/.two-agents.yaml"
 E=$(render_err --set 'agents[0].model=nope')
 eq "agent referencing an unknown gateway model fails"  "$([ -n "$E" ] && echo failed || echo rendered)" failed
 
+echo "# network policies (stage 1)"
+D=$(docs)
+VP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress")'
+CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
+BP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-mcp-tools-default")'
+eq "3 NetworkPolicies by default"                      "$(count "$D" '.kind=="NetworkPolicy"')" 3
+eq "mcp-tools default policy lives in mcp-tools"       "$(q "$D" "$BP|.metadata.namespace")" mcp-tools
+eq "mcp-tools default policy selects every pod"        "$(q "$D" "$BP|.spec.podSelector|length")" 0
+eq "mcp-tools default policy is ingress-only"          "$(q "$D" "$BP|.spec.policyTypes|join(\",\")")" Ingress
+eq "backends: allowed from own namespace and operator ns" "$(q "$D" "$BP|[.spec.ingress[].from[]|(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]//\"same-ns\")]|sort|join(\",\")")" same-ns,toolhive-system
+eq "vMCP policy selects the vMCP pod"                  "$(q "$D" "$VP|.spec.podSelector.matchLabels|\"\\(.app)/\\(.[\"toolhive-name\"])\"")" virtualmcpserver/tools
+eq "vMCP policy only on the vMCP port"                 "$(q "$D" "$VP|[.spec.ingress[].ports[].port]|unique|join(\",\")")" 4483
+eq "vMCP: sources are egress proxy and kagent controller" "$(q "$D" "$VP|[.spec.ingress[].from[]|.podSelector.matchLabels|to_entries[0].value]|sort|join(\",\")")" atenet-egress,controller
+eq "vMCP: egress source scoped to ate-system namespace" "$(q "$D" "$VP|[.spec.ingress[].from[]|select(.podSelector.matchLabels.app==\"atenet-egress\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" ate-system
+eq "controller policy lives in kagent"                 "$(q "$D" "$CP|.metadata.namespace")" kagent
+eq "controller policy selects the controller pod"      "$(q "$D" "$CP|.spec.podSelector.matchLabels[\"app.kubernetes.io/component\"]")" controller
+eq "controller: 8083 sources are bridge pod, kagent ns, egress proxy" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|(.podSelector.matchLabels|if .==null then \"any-pod\" else to_entries[0].value end)]|sort|join(\",\")")" any-pod,atenet-egress,telegram-bridge
+eq "controller: bridge source is pod-scoped (ns AND pod label in one entry)" "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" openagentix-gateway
+eq "controller: ports other than 8083 stay open"       "$(q "$D" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
+D=$(docs --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false renders none"          "$(count "$D" '.kind=="NetworkPolicy"')" 0
+D=$(docs --set mcp.enabled=false)
+eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy")|.metadata.name]|join(",")')" openagentix-kagent-controller
+D=$(docs --set bridge.enabled=false)
+eq "bridge.enabled=false drops the bridge source"      "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")]|length")" 0
+D=$(docs --set kagent.enabled=false)
+eq "kagent.enabled=false: no controller policy, vMCP policy keeps ns sources" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy")|.metadata.name]|sort|join(",")')" openagentix-mcp-tools-default,openagentix-vmcp-ingress
+
+echo "# tool-layer identity (stage 2)"
+D=$(docs)
+V='.[]|select(.kind=="VirtualMCPServer")'
+O='.[]|select(.kind=="MCPOIDCConfig")'
+eq "vMCP incoming auth is oidc by default"             "$(q "$D" "$V|.spec.incomingAuth.type")" oidc
+eq "vMCP references the MCPOIDCConfig"                 "$(q "$D" "$V|.spec.incomingAuth.oidcConfigRef.name")" substrate-actor-jwt
+eq "vMCP expects the dedicated audience"               "$(q "$D" "$V|.spec.incomingAuth.oidcConfigRef.audience")" openagentix-vmcp
+eq "Cedar policy is still rendered for authenticated callers" "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies|length")" 1
+eq "one MCPOIDCConfig in mcp-tools"                    "$(q "$D" "[$O|select(.metadata.namespace==\"mcp-tools\")]|length")" 1
+eq "MCPOIDCConfig is inline"                           "$(q "$D" "$O|.spec.type")" inline
+eq "issuer is the Substrate IdP"                       "$(q "$D" "$O|.spec.inline.issuer")" https://idp.ate-system.svc
+eq "explicit jwksUrl (no reliance on discovery)"       "$(q "$D" "$O|.spec.inline.jwksUrl")" https://idp.ate-system.svc/openid/v1/jwks
+eq "CA bundle from a ConfigMap"                        "$(q "$D" "$O|.spec.inline.caBundleRef.configMapRef|.name+\"/\"+.key")" substrate-idp-ca/ca.crt
+eq "jwksAllowPrivateIP is on by default (the in-cluster IdP is a ClusterIP)" "$(q "$D" "$O|.spec.inline.jwksAllowPrivateIP")" true
+eq "no insecure flags on the OIDC config"              "$(q "$D" "$O|.spec.inline|has(\"insecureAllowHTTP\")")" false
+eq "RemoteMCPServer asks for an actor JWT with the audience" "$(q "$D" '.[]|select(.kind=="RemoteMCPServer")|.spec.actorJwt.audiences|join(",")')" openagentix-vmcp
+eq "actor JWT lifetime is set"                         "$(q "$D" '.[]|select(.kind=="RemoteMCPServer")|.spec.actorJwt.expirationSeconds')" 3600
+D=$(docs --set mcp.virtual.incomingAuth.type=anonymous)
+eq "anonymous: no MCPOIDCConfig"                       "$(count "$D" '.kind=="MCPOIDCConfig"')" 0
+eq "anonymous: no oidcConfigRef"                       "$(q "$D" "$V|.spec.incomingAuth|has(\"oidcConfigRef\")")" false
+eq "anonymous: no actorJwt on the RemoteMCPServer"     "$(q "$D" '.[]|select(.kind=="RemoteMCPServer")|.spec|has("actorJwt")')" false
+E=$(render_err --set mcp.virtual.incomingAuth.type=bogus)
+eq "unknown incomingAuth.type fails the render"        "$([ -n "$E" ] && echo failed || echo rendered)" failed
+D=$(docs --set mcp.virtual.incomingAuth.oidc.audience=other-aud --set mcp.virtual.incomingAuth.oidc.jwksAllowPrivateIP=false)
+eq "audience value is shared by vMCP and RemoteMCPServer" "$(q "$D" "[($V|.spec.incomingAuth.oidcConfigRef.audience), (.[]|select(.kind==\"RemoteMCPServer\")|.spec.actorJwt.audiences[0])]|unique|join(\",\")")" other-aud
+eq "jwksAllowPrivateIP follows values (false omits it)" "$(q "$D" "$O|.spec.inline|has(\"jwksAllowPrivateIP\")")" false
+
+echo "# tool authorization keyed on the actor identity"
+D=$(docs)
+eq "default: Cedar stays permit-all (one policy)"      "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies|join(\"|\")")" 'permit(principal, action, resource);'
+cat > "$(dirname "$0")/.toolaccess.yaml" <<'YAML'
+mcp:
+  virtual:
+    incomingAuth:
+      toolAccess:
+        - atespace: kagent
+          tools: [fetch_fetch, osv_get_vulnerability]
+        - atespace: other
+          tools: [fetch_fetch]
+YAML
+D=$(docs -f "$(dirname "$0")/.toolaccess.yaml"); rm -f "$(dirname "$0")/.toolaccess.yaml"
+eq "toolAccess renders one permit per atespace+tool (3)" "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies|length")" 3
+eq "toolAccess replaces the permit-all policy"         "$(q "$D" "$V|[.spec.incomingAuth.authzConfig.inline.policies[]|select(.==\"permit(principal, action, resource);\")]|length")" 0
+eq "permit is keyed on the atespace claim and the tool" "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies[0]")" 'permit(principal, action == Action::"call_tool", resource == Tool::"fetch_fetch") when { context["claim_actor.ate.dev"].atespace == "kagent" };'
+eq "second atespace is rendered too"                   "$(q "$D" "$V|.spec.incomingAuth.authzConfig.inline.policies[2]|test(\"atespace == \\\"other\\\"\")")" true
+E=$(render_err --set mcp.virtual.incomingAuth.type=anonymous --set 'mcp.virtual.incomingAuth.toolAccess[0].atespace=x' --set 'mcp.virtual.incomingAuth.toolAccess[0].tools[0]=fetch_fetch')
+eq "toolAccess without oidc fails (anonymous has no identity)" "$([ -n "$E" ] && echo failed || echo rendered)" failed
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

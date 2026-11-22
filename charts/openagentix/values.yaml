@@ -2,6 +2,23 @@
 # Secrets are created by ../../install.sh from environment variables (or by you, see README).
 # Namespaces are NOT created by the chart: they must exist (install.sh creates them).
 
+# ---- NetworkPolicies ---------------------------------------------------------------------------
+# Ingress-only policies for the two services that were open to every pod in the cluster. They need a CNI that
+# enforces NetworkPolicy (kindnet on kind 1.37 does; verify yours). Sources were found by reading the logs of the
+# live callers, see README "Security".
+networkPolicy:
+  enabled: true
+  toolhiveNamespace: toolhive-system     # the ToolHive operator checks and manages the MCP servers
+  substrate:
+    namespace: ate-system
+    # Agent sandboxes do not call services themselves: their traffic leaves through this proxy, so the proxy
+    # is the source address vMCP and the kagent controller see for every agent.
+    egressPodLabels: {app: atenet-egress}
+  controllerPodLabels:                   # the kagent controller (labels set by the kagent chart)
+    app.kubernetes.io/component: controller
+    app.kubernetes.io/name: kagent
+  controllerPort: 8083                   # A2A, REST API and the sandbox task-store gRPC share this port
+
 # ---- Telegram -> A2A bridge --------------------------------------------------------------------
 bridge:
   enabled: true
@@ -85,10 +102,29 @@ mcp:
       stepLimit: 100000
       parallelMaxConcurrency: 10
       toolCallTimeout: 30s
-    # MVP ONLY: anonymous + permit-all. See README "Known limitations".
+    # incomingAuth.type: oidc (default) makes the vMCP accept only requests that carry a Substrate actor JWT with
+    # the audience below; anonymous accepts anyone who can reach it. Cedar `policies` then run for authenticated
+    # callers only. Today they are permit-all: see README "Security" for what the actor identity can and cannot express.
     incomingAuth:
-      type: anonymous
-      policies: ['permit(principal, action, resource);']
+      type: oidc
+      policies: ['permit(principal, action, resource);']   # used when toolAccess is empty
+      # Per-atespace tool allowlist; when set it REPLACES `policies`. Cedar sees the caller as
+      # Client::"actor/<atespace>/<actorName>" and the token claims as context["claim_..."]. kagent gives every
+      # agent session its own actor (actorName session-<uuid>) in the atespace named after the agent's namespace
+      # (here: kagent), so the finest grain Substrate's identity gives you is the atespace, not the agent.
+      #   toolAccess:
+      #     - {atespace: kagent, tools: [fetch_fetch, osv_query_vulnerability]}
+      toolAccess: []
+      oidc:
+        name: substrate-actor-jwt          # MCPOIDCConfig rendered in mcp.namespace
+        issuer: https://idp.ate-system.svc
+        jwksUrl: https://idp.ate-system.svc/openid/v1/jwks
+        audience: openagentix-vmcp         # dedicated audience; the RemoteMCPServer asks Substrate for exactly this
+        tokenExpirationSeconds: 3600       # 300..3600
+        jwksAllowPrivateIP: true           # ToolHive refuses to fetch keys from private addresses unless true; the in-cluster IdP is one
+        # The IdP's TLS certificate is signed by Substrate's service-dns CA. install.sh copies that (public) CA into
+        # this ConfigMap in mcp.namespace from the ClusterTrustBundle servicedns.podcert.ate.dev:identity:primary-bundle.
+        caBundle: {configMap: substrate-idp-ca, key: ca.crt}
 
 # ---- kagent wiring and agents ------------------------------------------------------------------
 kagent:

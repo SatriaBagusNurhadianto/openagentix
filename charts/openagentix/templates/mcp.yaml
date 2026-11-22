@@ -1,0 +1,55 @@
+{{- if .Values.mcp.enabled }}
+{{- $m := .Values.mcp }}
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPGroup
+metadata:
+  name: {{ $m.groupName }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  description: Backend MCP servers aggregated by the vMCP
+{{- range $s := $m.servers }}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata:
+  name: {{ $s.name }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  groupRef: {name: {{ $m.groupName }}}
+  image: {{ $s.image }}
+  transport: {{ default "streamable-http" $s.transport }}
+  proxyPort: {{ default 8080 $s.proxyPort }}
+  mcpPort: {{ default 8080 $s.port }}
+  resources: {{- toYaml (default $m.serverResources $s.resources) | nindent 4 }}
+{{- end }}
+---
+# MVP ONLY: anonymous incoming auth with a permit-all Cedar policy.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: {{ $m.virtual.name }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  groupRef: {name: {{ $m.groupName }}}
+  config:
+    aggregation:
+      conflictResolution: prefix
+      conflictResolutionConfig: {prefixFormat: {{ $m.virtual.prefixFormat | quote }}}
+    {{- if $m.virtual.codeMode.enabled }}
+    codeMode:
+      enabled: true
+      stepLimit: {{ $m.virtual.codeMode.stepLimit }}
+      parallelMaxConcurrency: {{ $m.virtual.codeMode.parallelMaxConcurrency }}
+      toolCallTimeout: {{ $m.virtual.codeMode.toolCallTimeout }}
+    {{- end }}
+  incomingAuth:
+    type: {{ $m.virtual.incomingAuth.type }}
+    authzConfig:
+      type: inline
+      inline:
+        policies: {{ toJson $m.virtual.incomingAuth.policies }}
+  outgoingAuth: {source: discovered}
+{{- end }}

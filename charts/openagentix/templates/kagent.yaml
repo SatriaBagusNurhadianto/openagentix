@@ -1,0 +1,100 @@
+{{- if .Values.kagent.enabled }}
+{{- $k := .Values.kagent }}
+{{- $modelNames := list }}
+{{- range .Values.gateway.models }}{{ $modelNames = append $modelNames .name }}{{ end }}
+{{- if $k.remoteMCPServer.enabled }}
+---
+# Agents reach the vMCP through this object. The URL is the Service the ToolHive operator creates (vmcp-<name>).
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata:
+  name: {{ $k.remoteMCPServer.name }}
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  description: ToolHive VirtualMCPServer ({{ .Values.mcp.virtual.name }})
+  url: http://vmcp-{{ .Values.mcp.virtual.name }}.{{ .Values.mcp.namespace }}.svc.cluster.local:{{ .Values.mcp.virtual.port }}/mcp
+  protocol: STREAMABLE_HTTP
+  timeout: {{ $k.remoteMCPServer.timeout }}
+{{- end }}
+{{- range $a := .Values.agents }}
+{{- if not (has $a.model $modelNames) }}
+{{- fail (printf "agent %q uses model %q which is not in gateway.models (%s)" $a.name $a.model (join ", " $modelNames)) }}
+{{- end }}
+---
+# Holds only the agent's own gateway virtual key (Secret created by install.sh), never a provider key.
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata:
+  name: {{ include "oa.modelConfigName" $a }}
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+  annotations:
+    openagentix.io/agent: {{ $a.name }}
+spec:
+  provider: OpenAI
+  model: {{ $a.model }}
+  apiKeySecret: {{ include "oa.virtualKeySecret" $a }}
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI: {baseUrl: {{ include "oa.gatewayBaseUrl" $ | quote }}}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata:
+  name: {{ $a.name }}-harness
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  kagent: {}
+  workload:
+    image: {{ default $k.harnessImage $a.harnessImage }}
+  substrate:
+    workerPoolRef: {name: {{ $k.workerPool }}}
+    snapshotPolicy:
+      location: {{ $k.snapshotLocation }}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata:
+  name: {{ $a.name }}-template
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  {{- if $a.description }}
+  description: {{ $a.description | quote }}
+  {{- end }}
+  modelConfig: {name: {{ include "oa.modelConfigName" $a }}}
+  systemPrompt: {{ required (printf "agents[%s].systemPrompt is required" $a.name) $a.systemPrompt | toJson }}
+  {{- if $a.tools }}
+  tools:
+    {{- range $t := $a.tools }}
+    # no apiGroup: the kagent admission webhook rejects it for kind RemoteMCPServer
+    - mcp:
+        server: {kind: RemoteMCPServer, name: {{ default $k.remoteMCPServer.name $t.server }}}
+        tools: {{ toJson $t.tools }}
+    {{- end }}
+  {{- end }}
+  {{- if $a.skills }}
+  skills:
+    {{- range $sn := $a.skills }}
+    {{- $sk := get $.Values.skills $sn }}
+    {{- if not $sk }}{{ fail (printf "agent %q references skill %q which is not in .Values.skills" $a.name $sn) }}{{ end }}
+    {{- if not (regexMatch "@sha256:[0-9a-f]{64}$" (toString $sk.oci)) }}{{ fail (printf "skill %q must be a digest-pinned OCI ref (...@sha256:<64 hex>), got %q" $sn $sk.oci) }}{{ end }}
+    - name: {{ $sn }}
+      source:
+        oci: {{ $sk.oci }}
+    {{- end }}
+  {{- end }}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata:
+  name: {{ $a.name }}
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  template: {ref: {name: {{ $a.name }}-template}}
+  harnessRef: {name: {{ $a.name }}-harness}
+{{- end }}
+{{- end }}

@@ -1,0 +1,28 @@
+# ONE policy on the Gateway for retry + virtual-key auth + per-key token budget.
+# (Docs warn: separate AgentgatewayPolicy objects targeting the same Gateway can overwrite each other.)
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: model-gateway-policy
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway}
+  traffic:
+    # Virtual keys: clients send "Authorization: Bearer <vk>"; hashes live in ConfigMaps labelled
+    # agentgateway.dev/apikey=true (created by install.sh, never the raw key).
+    apiKeyAuthentication:
+      mode: Strict
+      configMapSelector:
+        matchLabels:
+          agentgateway.dev/apikey: "true"
+    # Per-virtual-key token budget (local = per proxy replica).
+    rateLimit:
+      local:
+      - tokens: 100000
+        unit: Hours
+        key: apiKey.user_id
+    # Re-send the FIRST request to the next failover priority group when the primary returns 402/429/5xx.
+    retry:
+      attempts: 2
+      codes: [402, 429, 500, 502, 503, 504]

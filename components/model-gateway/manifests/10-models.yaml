@@ -1,0 +1,67 @@
+# Client-facing models: stub, gemini, auto (gemini -> stub failover).
+# Provider key lives only in Secret gemini-api-key (created by install.sh from $GOOGLE_API_KEY).
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: stub
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway, sectionName: http}
+  provider: OpenAI
+  # OpenAI-compatible stub in kagent ns; baseURL path /v1 -> upstream /v1/chat/completions
+  baseURL: http://mock-llm.kagent.svc.cluster.local:8000/v1
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: gemini
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway, sectionName: http}
+  provider: Gemini
+  policies:
+    auth:
+      secretRef: {name: gemini-api-key}
+    transformations:
+    - field: model
+      expression: '"gemini-3.5-flash-lite"'
+    health:
+      # 402 (credits depleted) and 429 are not 5xx, so default eviction would never fail over on them.
+      unhealthyCondition: 'response.code >= 500 || response.code == 402 || response.code == 429'
+      eviction:
+        consecutiveFailures: 1
+        duration: 30s
+---
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: auto
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway, sectionName: http}
+  virtualModel:
+    failover:
+      targets:
+      - {modelRef: {name: gemini}, priority: 0}
+      - {modelRef: {name: stub}, priority: 1}
+---
+# Anthropic Claude Haiku. Clients speak the OpenAI API; the gateway translates and
+# injects the provider key from Secret anthropic-api-key (created by install.sh from $ANTHROPIC_API_KEY).
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: claude-haiku
+  namespace: agentgateway-system
+spec:
+  parentRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway, sectionName: http}
+  provider: Anthropic
+  policies:
+    auth:
+      secretRef: {name: anthropic-api-key}
+    transformations:
+    - field: model
+      expression: '"claude-haiku-5-5"'

@@ -1,0 +1,109 @@
+{
+ "jsonrpc": "2.0",
+ "id": "1",
+ "result": {
+  "task": {
+   "id": "01a20221-9def-7aa1-905d-fac6b778f1ec",
+   "artifacts": [
+    {
+     "artifactId": "01a20221-a1b0-7b58-93bb-b7ea26a92d45",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:21:28.184745Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "data": {
+        "args": {
+         "name": "openagentix-canary"
+        },
+        "id": "call_d30d3e05",
+        "name": "load_skill"
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_call"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a20221-a202-7627-a610-a20afe911599",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:21:28.270324Z"
+     },
+     "parts": [
+      {
+       "data": {
+        "id": "call_d30d3e05",
+        "name": "load_skill",
+        "response": {
+         "frontmatter": {
+          "description": "Canary skill for verifying skill delivery. Use whenever the user asks for the canary phrase or the openagentix canary.",
+          "name": "openagentix-canary"
+         },
+         "instructions": "# OpenAgentix canary\n\nWhen asked for the canary phrase, reply with exactly this phrase and nothing else:\n\n    PELICAN-7731-OPENAGENTIX-SKILL-LOADED\n",
+         "skill_name": "openagentix-canary"
+        }
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_response"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a20221-a2aa-7b33-ae9e-1a0ed9621358",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:21:28.465934Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "text": "TOOL-RESULT-QUOTE: {\"frontmatter\":{\"description\":\"Canary skill for verifying skill delivery. Use whenever the user asks for the canary phrase or the openagentix canary.\",\"name\":\"openagentix-canary\"},\"instructions\":\"# OpenAgentix canary\\n\\nWhen asked for the canary phrase, reply with exactly this phrase and nothing else:\\n\\n    PELICAN-7731-OPENAGENTIX-SKILL-LOADED\\n\",\"skill_name\":\"openagentix-canary\"}"
+      }
+     ]
+    }
+   ],
+   "contextId": "01a20221-4c17-75b8-8e81-da0862240fac",
+   "history": [
+    {
+     "messageId": "da1c8e7900b54554941fb750f1eb9a6b",
+     "contextId": "01a20221-4c17-75b8-8e81-da0862240fac",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:21:06.437126653Z"
+     },
+     "parts": [
+      {
+       "text": "use tool load_skill {\"name\":\"openagentix-canary\"}"
+      }
+     ],
+     "role": "ROLE_USER",
+     "taskId": "01a20221-9def-7aa1-905d-fac6b778f1ec"
+    }
+   ],
+   "metadata": {
+    "https://google.github.io/adk-docs/a2a/a2a-extension/": true,
+    "https://kagent.dev/extensions/usage/v1": {
+     "cachedInputTokens": 0,
+     "inputTokens": 10,
+     "outputTokens": 20,
+     "reasoningTokens": 0,
+     "totalTokens": 30
+    },
+    "kagent.dev/a2a/task-created-at": "2026-11-22T07:21:27.626775Z"
+   },
+   "status": {
+    "state": "TASK_STATE_COMPLETED",
+    "timestamp": "2026-11-22T07:21:28.491Z"
+   }
+  }
+ }
+}

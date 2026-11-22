@@ -1,0 +1,104 @@
+{
+ "jsonrpc": "2.0",
+ "id": "1",
+ "result": {
+  "task": {
+   "id": "01a2021f-8f9c-7731-a6a2-a7381eb91e3a",
+   "artifacts": [
+    {
+     "artifactId": "01a2021f-9712-7ada-b9a9-a154181a7f1e",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:19:14.431302Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "data": {
+        "args": {
+         "script": "# No json module in the sandbox: results are {\"text\": \"<raw JSON string>\"}; parse with string ops.\nq = osv_query_vulnerability(package_name=\"lodash\", ecosystem=\"npm\", version=\"4.17.20\")[\"text\"]\nfirst_id = q.split('\"id\": \"')[1].split('\"')[0]\nd = osv_get_vulnerability(id=first_id)[\"text\"]\nsummary = d.split('\"summary\": \"')[1].split('\"')[0]\nreturn {\"first_id\": first_id, \"summary\": summary, \"n_ids\": q.count('\"id\": \"GHSA')}\n"
+        },
+        "id": "call_f049ec37",
+        "name": "execute_tool_script"
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_call"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a2021f-9af9-78fb-acc8-0c5f0612221e",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:19:15.348388Z"
+     },
+     "parts": [
+      {
+       "data": {
+        "id": "call_f049ec37",
+        "name": "execute_tool_script",
+        "response": {
+         "output": "{\"first_id\":\"GHSA-29mw-wpgm-hmr9\",\"n_ids\":4,\"summary\":\"Regular Expression Denial of Service (ReDoS) in lodash\"}"
+        }
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_response"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a2021f-a150-77c4-91b1-4dbc3b9c682e",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:19:16.976415Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "text": "TOOL-RESULT-QUOTE: {\"output\":\"{\\\"first_id\\\":\\\"GHSA-29mw-wpgm-hmr9\\\",\\\"n_ids\\\":4,\\\"summary\\\":\\\"Regular Expression Denial of Service (ReDoS) in lodash\\\"}\"}"
+      }
+     ]
+    }
+   ],
+   "contextId": "01a2021f-7c62-7a88-816a-9ec75a90df53",
+   "history": [
+    {
+     "messageId": "5894415d58c940569af391bd6d95dbcd",
+     "contextId": "01a2021f-7c62-7a88-816a-9ec75a90df53",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:19:07.998093888Z"
+     },
+     "parts": [
+      {
+       "text": "use tool execute_tool_script {\"script\":\"# No json module in the sandbox: results are {\\\"text\\\": \\\"<raw JSON string>\\\"}; parse with string ops.\\nq = osv_query_vulnerability(package_name=\\\"lodash\\\", ecosystem=\\\"npm\\\", version=\\\"4.17.20\\\")[\\\"text\\\"]\\nfirst_id = q.split('\\\"id\\\": \\\"')[1].split('\\\"')[0]\\nd = osv_get_vulnerability(id=first_id)[\\\"text\\\"]\\nsummary = d.split('\\\"summary\\\": \\\"')[1].split('\\\"')[0]\\nreturn {\\\"first_id\\\": first_id, \\\"summary\\\": summary, \\\"n_ids\\\": q.count('\\\"id\\\": \\\"GHSA')}\\n\"}"
+      }
+     ],
+     "role": "ROLE_USER",
+     "taskId": "01a2021f-8f9c-7731-a6a2-a7381eb91e3a"
+    }
+   ],
+   "metadata": {
+    "https://google.github.io/adk-docs/a2a/a2a-extension/": true,
+    "https://kagent.dev/extensions/usage/v1": {
+     "cachedInputTokens": 0,
+     "inputTokens": 10,
+     "outputTokens": 20,
+     "reasoningTokens": 0,
+     "totalTokens": 30
+    },
+    "kagent.dev/a2a/task-created-at": "2026-11-22T07:19:12.711554Z"
+   },
+   "status": {
+    "state": "TASK_STATE_COMPLETED",
+    "timestamp": "2026-11-22T07:19:17.073Z"
+   }
+  }
+ }
+}

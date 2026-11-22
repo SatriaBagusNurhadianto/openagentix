@@ -1,0 +1,30 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: Harness
+metadata: {name: tools-harness, namespace: kagent}
+spec:
+  kagent: {}
+  workload:
+    image: ghcr.io/kagent-dev/kagent/golang-adk@sha256:d3b1151d39c529a6f921a58a995ff699963012001d2e5075f69bf613abebc24d
+  substrate:
+    workerPoolRef: {name: kagent-default}
+    snapshotPolicy:
+      location: s3://ate-snapshots/kagent/
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: tools-template, namespace: kagent}
+spec:
+  description: Agent with ToolHive vMCP tools, backed by the deterministic tool-calling stub
+  modelConfig: {name: tools-stub}
+  systemPrompt: You are a concise assistant. Use the provided tools when asked.
+  tools:
+  - mcp:
+      server: {kind: RemoteMCPServer, name: toolhive-vmcp}
+      tools: [execute_tool_script, fetch_fetch, osv_get_vulnerability, osv_query_vulnerabilities_batch, osv_query_vulnerability]
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: tools-agent, namespace: kagent}
+spec:
+  template: {ref: {name: tools-template}}
+  harnessRef: {name: tools-harness}

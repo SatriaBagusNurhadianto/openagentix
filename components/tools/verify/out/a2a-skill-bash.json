@@ -1,0 +1,104 @@
+{
+ "jsonrpc": "2.0",
+ "id": "1",
+ "result": {
+  "task": {
+   "id": "01a20221-247e-7799-8207-ac0ae8868c89",
+   "artifacts": [
+    {
+     "artifactId": "01a20221-27a7-7915-8ad9-aae5a3a91f78",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:20:56.938258Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "data": {
+        "args": {
+         "command": "ls -la /skills /skills/openagentix-canary; cat /skills/openagentix-canary/SKILL.md; mount | grep -i skills"
+        },
+        "id": "call_82295e7e",
+        "name": "bash"
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_call"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a20221-28b2-7113-84fe-18429f35f569",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:20:57.237305Z"
+     },
+     "parts": [
+      {
+       "data": {
+        "id": "call_82295e7e",
+        "name": "bash",
+        "response": {
+         "result": "Error: command failed with exit code 1: exit status 1\n/skills:\ntotal 0\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 .\ndrwxr-xr-x    1 root     root           100 Nov 22 07:20 ..\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 openagentix-canary\n\n/skills/openagentix-canary:\ntotal 1\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 .\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 ..\n-rw-r--r--    1 kagent   kagent         313 Nov 22 07:20 SKILL.md\n---\nname: openagentix-canary\ndescription: Canary skill for verifying skill delivery. Use whenever the user asks for the canary phrase or the openagentix canary.\n---\n# OpenAgentix canary\n\nWhen asked for the canary phrase, reply with exactly this phrase and nothing else:\n\n    PELICAN-7731-OPENAGENTIX-SKILL-LOADED"
+        }
+       },
+       "metadata": {
+        "kagent.dev/a2a/part-type": "function_response"
+       }
+      }
+     ]
+    },
+    {
+     "artifactId": "01a20221-28fe-7b8c-adfa-4b47f1397ea4",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:20:57.316807Z",
+      "kagent.dev/a2a/usage": {
+       "candidatesTokenCount": 10,
+       "promptTokenCount": 5,
+       "totalTokenCount": 15
+      }
+     },
+     "parts": [
+      {
+       "text": "TOOL-RESULT-QUOTE: Error: command failed with exit code 1: exit status 1\n/skills:\ntotal 0\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 .\ndrwxr-xr-x    1 root     root           100 Nov 22 07:20 ..\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 openagentix-canary\n\n/skills/openagentix-canary:\ntotal 1\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 .\ndrwxr-xr-x    1 kagent   kagent          60 Nov 22 07:20 ..\n-rw-r--r--    1 kagent   kagent         313 Nov 22 07:20 SKILL.md\n---\nname: openagentix-canary\ndescription: Canary skill for verifying skill delivery. Use whenever the user asks for the canary phrase or the openagentix canary.\n---\n# OpenAgentix canary\n\nWhen asked for the canary phrase, reply with exactly this phrase and nothing else:\n\n    PELICAN-7731-OPENAGENTIX-SKILL-LOADED"
+      }
+     ]
+    }
+   ],
+   "contextId": "01a20221-0573-7177-b7f7-a4f1c2082d78",
+   "history": [
+    {
+     "messageId": "a33efbebee9c4758960be3bf901d3c0b",
+     "contextId": "01a20221-0573-7177-b7f7-a4f1c2082d78",
+     "metadata": {
+      "kagent.dev/a2a/timeline-position": "2026-11-22T07:20:48.346853602Z"
+     },
+     "parts": [
+      {
+       "text": "use tool bash {\"command\":\"ls -la /skills /skills/openagentix-canary; cat /skills/openagentix-canary/SKILL.md; mount | grep -i skills\"}"
+      }
+     ],
+     "role": "ROLE_USER",
+     "taskId": "01a20221-247e-7799-8207-ac0ae8868c89"
+    }
+   ],
+   "metadata": {
+    "https://google.github.io/adk-docs/a2a/a2a-extension/": true,
+    "https://kagent.dev/extensions/usage/v1": {
+     "cachedInputTokens": 0,
+     "inputTokens": 10,
+     "outputTokens": 20,
+     "reasoningTokens": 0,
+     "totalTokens": 30
+    },
+    "kagent.dev/a2a/task-created-at": "2026-11-22T07:20:56.37523Z"
+   },
+   "status": {
+    "state": "TASK_STATE_COMPLETED",
+    "timestamp": "2026-11-22T07:20:57.342Z"
+   }
+  }
+ }
+}

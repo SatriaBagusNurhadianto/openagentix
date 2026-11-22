@@ -1,0 +1,128 @@
+# OpenAgentix chart values. The chart owns only first-party resources; it never contains secret values.
+# Secrets are created by ../../install.sh from environment variables (or by you, see README).
+# Namespaces are NOT created by the chart: they must exist (install.sh creates them).
+
+# ---- Telegram -> A2A bridge --------------------------------------------------------------------
+bridge:
+  enabled: true
+  namespace: openagentix-gateway
+  image:
+    repository: openagentix/telegram-bridge
+    tag: dev                      # loaded into kind by install.sh; push to a registry for real clusters
+    pullPolicy: IfNotPresent
+  # Which kagent agent receives messages. a2aUrl wins when set.
+  agent: assistant
+  agentNamespace: kagent
+  a2aUrl: ""
+  agentTimeout: ""                # e.g. "170s"; empty = bridge default
+  existingSecret: telegram-bridge # Secret in bridge.namespace, created by install.sh
+  tokenKey: TELEGRAM_BOT_TOKEN
+  allowlist:
+    enabled: true                 # read TELEGRAM_ALLOWED_CHAT_IDS from the Secret; false = open to anyone
+    secretKey: TELEGRAM_ALLOWED_CHAT_IDS
+  resources:
+    requests: {cpu: 10m, memory: 16Mi}
+    limits: {cpu: 200m, memory: 64Mi}
+
+# ---- Model gateway (agentgateway) --------------------------------------------------------------
+# Needs the Gateway API CRDs and the agentgateway release (installed by install.sh).
+gateway:
+  enabled: true
+  namespace: agentgateway-system
+  name: model-gateway
+  className: agentgateway
+  port: 80
+  # Models clients can name in the OpenAI "model" field. Fields per entry:
+  #   name, provider (Anthropic|Gemini|OpenAI|...), authSecret (Secret in gateway.namespace, key
+  #   "Authorization"), upstreamModel (rewrites the model sent upstream), baseURL, health {...},
+  #   failover: [model names in priority order] (makes it a virtual model).
+  models:
+    - name: claude-haiku
+      provider: Anthropic
+      authSecret: anthropic-api-key
+      upstreamModel: claude-haiku-5-5
+  # Example (needs Secret gemini-api-key; install.sh creates it when GOOGLE_API_KEY is set):
+  #   - name: gemini
+  #     provider: Gemini
+  #     authSecret: gemini-api-key
+  #     upstreamModel: gemini-3.5-flash-lite
+  #     health:
+  #       unhealthyCondition: "response.code >= 500 || response.code == 402 || response.code == 429"
+  #       eviction: {consecutiveFailures: 1, duration: 30s}
+  #   - name: auto
+  #     failover: [gemini, claude-haiku]
+  policy:
+    name: model-gateway-policy    # the ONE AgentgatewayPolicy (docs warn that several can overwrite each other)
+    apiKeyLabel: agentgateway.dev/apikey   # ConfigMaps with this label hold virtual-key hashes (install.sh)
+    tokenBudget: {tokens: 1000000, unit: Hours}   # per virtual key, per proxy replica
+    retry:
+      attempts: 2
+      codes: [402, 429, 500, 502, 503, 504]
+    attributeUserId: true         # tag access log + metrics with the virtual key's user_id
+
+# ---- MCP tool layer (ToolHive) -----------------------------------------------------------------
+# Needs the ToolHive operator (installed by install.sh).
+mcp:
+  enabled: true
+  namespace: mcp-tools
+  groupName: tools
+  servers:
+    - name: fetch
+      image: ghcr.io/stackloklabs/gofetch/server:2.0.1
+      port: 8080
+    - name: osv
+      image: ghcr.io/stackloklabs/osv-mcp/server:0.2.1
+      port: 8080
+  serverResources:
+    limits: {cpu: 100m, memory: 128Mi}
+    requests: {cpu: 20m, memory: 32Mi}
+  virtual:
+    name: tools                   # the operator serves it as Service vmcp-<name>:4483
+    port: 4483
+    prefixFormat: "{workload}_"   # tool names become fetch_fetch, osv_query_vulnerability, ...
+    codeMode:
+      enabled: true               # adds execute_tool_script (Starlark) on top of the backend tools
+      stepLimit: 100000
+      parallelMaxConcurrency: 10
+      toolCallTimeout: 30s
+    # MVP ONLY: anonymous + permit-all. See README "Known limitations".
+    incomingAuth:
+      type: anonymous
+      policies: ['permit(principal, action, resource);']
+
+# ---- kagent wiring and agents ------------------------------------------------------------------
+kagent:
+  enabled: true
+  namespace: kagent
+  gatewayBaseUrl: ""              # default: http://<gateway.name>.<gateway.namespace>.svc.cluster.local/v1
+  workerPool: kagent-default
+  snapshotLocation: s3://ate-snapshots/kagent/
+  harnessImage: ghcr.io/kagent-dev/kagent/golang-adk@sha256:d3b1151d39c529a6f921a58a995ff699963012001d2e5075f69bf613abebc24d
+  remoteMCPServer:
+    enabled: true
+    name: toolhive-vmcp
+    timeout: 60s
+
+# Skills are delivered as digest-pinned OCI artifacts (name -> ref). The ref must end in @sha256:<64 hex>.
+# The default below is a PLACEHOLDER that cannot be pulled (registry.invalid, all-zero digest). install.sh builds
+# the example skill, pushes it to a registry on the kind network and overrides this value with the registry's
+# address and the digest it got. Outside install.sh, set skills.openagentix-canary.oci yourself.
+skills:
+  openagentix-canary:
+    oci: registry.invalid:5000/skills/openagentix-canary@sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# Each entry renders a Harness, an AgentTemplate, an Agent and a ModelConfig that uses the agent's own
+# gateway virtual key (Secret <name>-virtual-key in the kagent namespace, created by install.sh).
+agents:
+  - name: assistant
+    description: General assistant reachable from messaging channels
+    model: claude-haiku                 # must be a gateway.models name
+    modelConfigName: gateway-claude-haiku   # optional; default gateway-<name>
+    # virtualKeySecret: assistant-virtual-key   # optional; default <name>-virtual-key
+    systemPrompt: |
+      You are a concise, helpful assistant running on a Kubernetes-native agent
+      platform. Answers are read in a chat app, so keep them short and use plain text.
+      Use the available tools when they help; say when you used one.
+    tools:                               # server defaults to kagent.remoteMCPServer.name
+      - tools: [execute_tool_script, fetch_fetch, osv_get_vulnerability, osv_query_vulnerabilities_batch, osv_query_vulnerability]
+    skills: [openagentix-canary]         # names from the top-level skills map

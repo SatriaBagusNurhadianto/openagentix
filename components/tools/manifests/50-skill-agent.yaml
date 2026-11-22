@@ -1,0 +1,20 @@
+# Copy of tools-agent with an OCI skill attached. Registry address/digest are environment specific:
+# 172.18.0.2:5000 is the kind node IP; plain HTTP works because it is RFC1918 (see NOTES.md).
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: tools-skill-template, namespace: kagent}
+spec:
+  description: tools-agent plus the openagentix-canary OCI skill
+  modelConfig: {name: tools-stub}
+  systemPrompt: You are a concise assistant. Use the provided tools and skills when asked.
+  skills:
+  - name: openagentix-canary
+    source:
+      oci: 172.18.0.2:5000/skills/openagentix-canary@sha256:d9ce280e02bd6a36c31fb498bdcc3d4234dd0d2aae23b10275bd770b56bce2f8
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: tools-skill-agent, namespace: kagent}
+spec:
+  template: {ref: {name: tools-skill-template}}
+  harnessRef: {name: tools-harness}

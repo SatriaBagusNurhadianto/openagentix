@@ -1,0 +1,47 @@
+# The Secret "telegram-bridge" is created imperatively (never stored in git):
+#   kubectl -n openagentix-gateway create secret generic telegram-bridge \
+#     --from-literal=TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-bridge
+  namespace: openagentix-gateway
+  labels: {app: telegram-bridge}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # only one poller may use a bot token at a time
+  selector:
+    matchLabels: {app: telegram-bridge}
+  template:
+    metadata:
+      labels: {app: telegram-bridge}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: bridge
+          image: openagentix/telegram-bridge:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: A2A_URL
+              value: http://kagent-controller.kagent.svc.cluster.local:8083/agents/kagent/assistant
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: telegram-bridge, key: TELEGRAM_BOT_TOKEN}
+            # Comma-separated chat ids allowed to talk to the agent. Kept in the
+            # Secret so personal ids stay out of the repo. Unset = open to anyone.
+            - name: TELEGRAM_ALLOWED_CHAT_IDS
+              valueFrom:
+                secretKeyRef: {name: telegram-bridge, key: TELEGRAM_ALLOWED_CHAT_IDS, optional: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 16Mi}
+            limits: {cpu: 200m, memory: 64Mi}

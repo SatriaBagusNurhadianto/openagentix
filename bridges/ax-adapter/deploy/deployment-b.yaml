@@ -1,0 +1,67 @@
+# Variant B (default ax-runner + Messages-API launcher): same adapter image, different Workspace. Service ax-adapter-b.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ax-adapter-b
+  namespace: openagentix-gateway
+  labels: {app: ax-adapter-b}
+spec:
+  replicas: 1   # conversation history is in memory; keep a single replica
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: ax-adapter-b}
+  template:
+    metadata:
+      labels: {app: ax-adapter-b}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: adapter
+          image: openagentix/ax-adapter:dev   # IMAGE: replace with your registry/digest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: LISTEN_ADDR, value: ":8080"}
+            - {name: AX_SERVER, value: "ax-server.ax-system.svc.cluster.local:8080"}
+            - {name: ATESPACE, value: "default"}
+            - {name: AX_WORKSPACE, value: "assistant-ws-api"}
+            - {name: AX_GATEWAY, value: "anthropic-gw"}
+            - {name: TURN_TIMEOUT, value: "170s"}
+            - {name: POLL_INTERVAL, value: "500ms"}
+            - {name: KEEP_TASKS, value: "false"}
+            - {name: MAX_HISTORY_TURNS, value: "8"}
+            - {name: CONFIG_BUDGET_BYTES, value: "12288"}
+            - {name: MAX_MESSAGE_BYTES, value: "8192"}
+            - {name: MAX_CONCURRENT_TASKS, value: "2"}
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 10m, memory: 24Mi}
+            limits: {cpu: 200m, memory: 96Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ax-adapter-b
+  namespace: openagentix-gateway
+  labels: {app: ax-adapter-b}
+spec:
+  selector: {app: ax-adapter-b}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

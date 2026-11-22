@@ -1,0 +1,40 @@
+# kagent wiring. Agents hold only a gateway virtual key (Secret gateway-virtual-key, created by install.sh),
+# never a provider key. baseUrl must be an FQDN: sandboxes do not apply cluster search domains.
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: gateway-stub, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: stub
+  apiKeySecret: gateway-virtual-key
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI: {baseUrl: "http://model-gateway.agentgateway-system.svc.cluster.local/v1"}
+---
+# Ready for when the Gemini key is funded. No agent uses it yet.
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: gateway-gemini, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: gemini
+  apiKeySecret: gateway-virtual-key
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI: {baseUrl: "http://model-gateway.agentgateway-system.svc.cluster.local/v1"}
+---
+# Same shape as mock-agent: shares the existing Harness (my-first-harness) rather than creating another sandbox image/snapshot.
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: gateway-template, namespace: kagent}
+spec:
+  description: Agent whose LLM calls go through the agentgateway model gateway
+  modelConfig: {name: gateway-stub}
+  systemPrompt: You are a concise, helpful assistant.
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: gateway-agent, namespace: kagent}
+spec:
+  template: {ref: {name: gateway-template}}
+  harnessRef: {name: my-first-harness}

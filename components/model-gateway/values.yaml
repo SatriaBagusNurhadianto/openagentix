@@ -1,0 +1,14 @@
+# Values for oci://cr.agentgateway.dev/charts/agentgateway (v1.7.0). Everything else is chart default.
+# The data plane (Deployment/Service "model-gateway") is created by the controller from the Gateway
+# resource in manifests/00-gateway.yaml, not by this chart, so its sizing is set via AgentgatewayParameters
+# (not used here; proxy runs at its default 100m CPU / 128Mi requests).
+controller:
+  replicaCount: 1
+  logLevel: info
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+# AgentgatewayModel API (stub / gemini / auto models). Enabled by default in 1.7.0; pinned here on purpose.
+agentgatewayModels:
+  enabled: true

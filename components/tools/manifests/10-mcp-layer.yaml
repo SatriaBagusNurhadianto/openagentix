@@ -1,0 +1,59 @@
+# ToolHive MCP layer: 2 keyless MCP servers (fetch, osv) -> MCPGroup -> VirtualMCPServer with code mode.
+# MVP ONLY: incomingAuth is anonymous with permit-all Cedar policy.
+apiVersion: v1
+kind: Namespace
+metadata: {name: mcp-tools}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPGroup
+metadata: {name: tools, namespace: mcp-tools}
+spec:
+  description: Keyless backend MCP servers aggregated by the vMCP
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata: {name: fetch, namespace: mcp-tools}
+spec:
+  groupRef: {name: tools}
+  image: ghcr.io/stackloklabs/gofetch/server:2.0.1
+  transport: streamable-http
+  proxyPort: 8080
+  mcpPort: 8080
+  resources:
+    limits: {cpu: 100m, memory: 128Mi}
+    requests: {cpu: 20m, memory: 32Mi}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServer
+metadata: {name: osv, namespace: mcp-tools}
+spec:
+  groupRef: {name: tools}
+  image: ghcr.io/stackloklabs/osv-mcp/server:0.2.1
+  transport: streamable-http
+  proxyPort: 8080
+  mcpPort: 8080
+  resources:
+    limits: {cpu: 100m, memory: 128Mi}
+    requests: {cpu: 20m, memory: 32Mi}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata: {name: tools, namespace: mcp-tools}
+spec:
+  groupRef: {name: tools}
+  config:
+    aggregation:
+      conflictResolution: prefix
+      conflictResolutionConfig: {prefixFormat: "{workload}_"}
+    codeMode:
+      enabled: true
+      stepLimit: 100000
+      parallelMaxConcurrency: 10
+      toolCallTimeout: 30s
+  incomingAuth:
+    type: anonymous
+    authzConfig:
+      type: inline
+      inline:
+        policies: ['permit(principal, action, resource);']
+  outgoingAuth: {source: discovered}

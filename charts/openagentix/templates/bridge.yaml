@@ -1,0 +1,69 @@
+{{- if .Values.bridge.enabled }}
+{{- $b := .Values.bridge }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: telegram-bridge
+  namespace: {{ $b.namespace }}
+  labels:
+    app: telegram-bridge
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # only one poller may use a bot token at a time
+  selector:
+    matchLabels: {app: telegram-bridge}
+  template:
+    metadata:
+      labels:
+        app: telegram-bridge
+        {{- include "oa.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: bridge
+          image: {{ printf "%s:%s" $b.image.repository (toString $b.image.tag) | quote }}
+          imagePullPolicy: {{ $b.image.pullPolicy }}
+          env:
+            - name: A2A_URL
+              value: {{ default (printf "http://kagent-controller.%s.svc.cluster.local:8083/agents/%s/%s" $b.agentNamespace $b.agentNamespace $b.agent) $b.a2aUrl | quote }}
+            - name: TELEGRAM_BOT_TOKEN
+              valueFrom:
+                secretKeyRef: {name: {{ $b.existingSecret | quote }}, key: {{ $b.tokenKey | quote }}}
+            {{- if $b.allowlist.enabled }}
+            # Comma-separated chat ids allowed to talk to the agent. The bridge refuses to
+            # start when this is empty, so a missing key cannot silently open the bot.
+            - name: TELEGRAM_ALLOWED_CHAT_IDS
+              valueFrom:
+                secretKeyRef: {name: {{ $b.existingSecret | quote }}, key: {{ $b.allowlist.secretKey | quote }}, optional: true}
+            {{- else }}
+            # Explicit opt-in: anyone who finds the bot can talk to the agent.
+            - name: TELEGRAM_ALLOW_ALL
+              value: "true"
+            {{- end }}
+            {{- if $b.agentTimeout }}
+            - name: AGENT_TIMEOUT
+              value: {{ $b.agentTimeout | quote }}
+            {{- end }}
+          ports:
+            - {name: health, containerPort: 8080}
+          # /healthz turns 503 when no Telegram poll has succeeded recently, so a
+          # stalled poller gets restarted.
+          livenessProbe:
+            httpGet: {path: /healthz, port: health}
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          resources:
+            {{- toYaml $b.resources | nindent 12 }}
+{{- end }}

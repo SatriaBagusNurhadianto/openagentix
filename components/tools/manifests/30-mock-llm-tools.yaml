@@ -1,0 +1,40 @@
+# The ConfigMap `mock-llm-tools` (server.py) is created by install.sh from stub/mock_llm_tools.py.
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mock-llm-tools, namespace: kagent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mock-llm-tools}}
+  template:
+    metadata: {labels: {app: mock-llm-tools}}
+    spec:
+      containers:
+      - name: py
+        image: python:3.12-alpine
+        command: [python, /app/server.py]
+        volumeMounts: [{name: code, mountPath: /app}]
+        resources: {requests: {cpu: 10m, memory: 24Mi}, limits: {memory: 96Mi}}
+      volumes: [{name: code, configMap: {name: mock-llm-tools}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mock-llm-tools, namespace: kagent}
+spec:
+  selector: {app: mock-llm-tools}
+  ports: [{port: 8000}]
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: mock-llm-tools-key, namespace: kagent}
+stringData: {OPENAI_API_KEY: not-a-real-key}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: tools-stub, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: mock
+  apiKeySecret: mock-llm-tools-key
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI: {baseUrl: "http://mock-llm-tools.kagent.svc.cluster.local:8000/v1"}

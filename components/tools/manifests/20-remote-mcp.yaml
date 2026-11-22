@@ -1,0 +1,8 @@
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata: {name: toolhive-vmcp, namespace: kagent}
+spec:
+  description: ToolHive VirtualMCPServer (fetch + osv aggregated, code mode enabled)
+  url: http://vmcp-tools.mcp-tools.svc.cluster.local:4483/mcp
+  protocol: STREAMABLE_HTTP
+  timeout: 60s

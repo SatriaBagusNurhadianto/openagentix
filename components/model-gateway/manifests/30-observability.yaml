@@ -1,0 +1,19 @@
+# Attribute every access-log line and Prometheus metric to the calling virtual key (apiKey.user_id).
+# Separate policy: it only sets spec.frontend, so it does not collide with spec.traffic in model-gateway-policy.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayPolicy
+metadata:
+  name: model-gateway-observability
+  namespace: agentgateway-system
+spec:
+  targetRefs:
+  - {group: gateway.networking.k8s.io, kind: Gateway, name: model-gateway}
+  frontend:
+    accessLog:
+      attributes:
+        add:
+        - {name: user_id, expression: 'apiKey.user_id'}
+    metrics:
+      attributes:
+        add:
+        - {name: user_id, expression: 'apiKey.user_id'}

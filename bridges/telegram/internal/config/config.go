@@ -13,6 +13,7 @@ type Config struct {
 	BotToken           string
 	A2AURL             string
 	A2AToken           string
+	UserIDPrefix       string // A2A_USER_ID_PREFIX; the agent-side user id is this prefix + the Telegram chat id
 	APIBase            string
 	AgentTimeout       time.Duration
 	AllowedChatIDs     map[int64]bool
@@ -34,6 +35,13 @@ func Load(getenv func(string) string) (Config, error) {
 		MaxConcurrentTurns: 8,
 		ShutdownGrace:      25 * time.Second,
 		HealthAddr:         getenv("HEALTH_ADDR"),
+	}
+	c.UserIDPrefix = "telegram:"
+	if v, set := lookup(getenv, "A2A_USER_ID_PREFIX"); set {
+		if err := validPrefix(v); err != nil {
+			return c, fmt.Errorf("A2A_USER_ID_PREFIX: %w", err)
+		}
+		c.UserIDPrefix = v
 	}
 	if c.BotToken == "" {
 		return c, errors.New("TELEGRAM_BOT_TOKEN is required")
@@ -88,4 +96,20 @@ func Load(getenv func(string) string) (Config, error) {
 		return c, errors.New("access control: set TELEGRAM_ALLOWED_CHAT_IDS to a comma-separated list of chat ids, or TELEGRAM_ALLOW_ALL=true to accept every chat")
 	}
 	return c, nil
+}
+
+// lookup treats an empty value as unset (the chart passes an empty string when nothing is configured).
+func lookup(getenv func(string) string, k string) (string, bool) { v := getenv(k); return v, v != "" }
+
+// validPrefix keeps the prefix safe as an HTTP header value and a database key: printable ASCII without spaces, at most 64 bytes.
+func validPrefix(v string) error {
+	if len(v) > 64 {
+		return errors.New("longer than 64 characters")
+	}
+	for _, r := range v {
+		if r <= ' ' || r >= 0x7f {
+			return fmt.Errorf("character %q not allowed (printable ASCII without spaces only)", r)
+		}
+	}
+	return nil
 }

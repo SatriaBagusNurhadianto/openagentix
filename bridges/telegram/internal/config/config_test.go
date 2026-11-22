@@ -138,3 +138,32 @@ func TestLoad_HealthAddr(t *testing.T) {
 		t.Fatalf("explicit: %+v %v", c, err)
 	}
 }
+
+func TestLoad_UserIDPrefixDefault(t *testing.T) {
+	c, err := Load(env(map[string]string{"TELEGRAM_BOT_TOKEN": "tok", "A2A_URL": "http://agent", "TELEGRAM_ALLOW_ALL": "true"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UserIDPrefix != "telegram:" {
+		t.Fatalf("UserIDPrefix = %q, want telegram:", c.UserIDPrefix)
+	}
+}
+
+func TestLoad_UserIDPrefixOverride(t *testing.T) {
+	c, err := Load(env(map[string]string{"TELEGRAM_BOT_TOKEN": "tok", "A2A_URL": "http://agent", "TELEGRAM_ALLOW_ALL": "true", "A2A_USER_ID_PREFIX": "team-b:"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.UserIDPrefix != "team-b:" {
+		t.Fatalf("UserIDPrefix = %q", c.UserIDPrefix)
+	}
+}
+
+func TestLoad_UserIDPrefixRejectsUnsafeCharacters(t *testing.T) {
+	for _, bad := range []string{"a b:", "x\r\nY: z", "é:", strings.Repeat("a", 65)} {
+		_, err := Load(env(map[string]string{"TELEGRAM_BOT_TOKEN": "tok", "A2A_URL": "http://agent", "TELEGRAM_ALLOW_ALL": "true", "A2A_USER_ID_PREFIX": bad}))
+		if err == nil || !strings.Contains(err.Error(), "A2A_USER_ID_PREFIX") {
+			t.Fatalf("prefix %q: err = %v", bad, err)
+		}
+	}
+}

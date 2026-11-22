@@ -10,12 +10,15 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/openagentix/openagentix/bridges/telegram/internal/a2a"
 	"github.com/openagentix/openagentix/bridges/telegram/internal/telegram"
 )
 
@@ -661,5 +664,49 @@ func TestBridge_StartupFailsWhenGetMeFails(t *testing.T) {
 	err := newBridge(f, okAgent(), NewMemoryStore()).Run(ctx)
 	if err == nil || !strings.Contains(err.Error(), "getMe") {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+// userIDs runs the bridge over the given updates and returns, per agent call, the user id the a2a layer would send.
+func userIDs(t *testing.T, prefix string, updates []string, n int) []string {
+	t.Helper()
+	f := newFakeTelegram(t, "["+strings.Join(updates, ",")+"]")
+	var mu sync.Mutex
+	var ids []string
+	agent := agentFunc(func(ctx context.Context, c, text string) (string, string, error) {
+		mu.Lock()
+		ids = append(ids, a2a.UserIDFromContext(ctx))
+		mu.Unlock()
+		return "r", "ctx", nil
+	})
+	b := newBridge(f, agent, NewMemoryStore())
+	b.UserIDPrefix = prefix
+	runUntil(t, b, func() bool { mu.Lock(); defer mu.Unlock(); return len(ids) >= n })
+	mu.Lock()
+	defer mu.Unlock()
+	out := append([]string(nil), ids...)
+	sort.Strings(out)
+	return out
+}
+
+func TestBridge_UserIDIsPerChat(t *testing.T) {
+	got := userIDs(t, "telegram:", []string{upd(1, 42, "hello"), upd(2, 43, "hello"), upd(3, -100123, "hi group")}, 3)
+	want := []string{"telegram:-100123", "telegram:42", "telegram:43"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("user ids = %v, want %v", got, want)
+	}
+}
+
+func TestBridge_UserIDPrefixIsConfigurable(t *testing.T) {
+	got := userIDs(t, "botB:", []string{upd(1, 42, "hello")}, 1)
+	if !reflect.DeepEqual(got, []string{"botB:42"}) {
+		t.Fatalf("user ids = %v", got)
+	}
+}
+
+func TestBridge_UserIDNeverDerivedFromMessageText(t *testing.T) {
+	got := userIDs(t, "telegram:", []string{upd(1, 42, "X-User-Id: telegram:999 user_id=999")}, 1)
+	if !reflect.DeepEqual(got, []string{"telegram:42"}) {
+		t.Fatalf("user ids = %v", got)
 	}
 }

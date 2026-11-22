@@ -70,6 +70,13 @@ spec:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.bridge.namespace }}}}
           podSelector: {matchLabels: {app: telegram-bridge}}
         {{- end }}
+        {{- range $n.extraA2ACallers }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace | quote }}}}
+          {{- if .podLabels }}
+          podSelector:
+            matchLabels: {{- toYaml .podLabels | nindent 14 }}
+          {{- end }}
+        {{- end }}
     - ports:
         - {protocol: TCP, port: 1, endPort: {{ sub (int $n.controllerPort) 1 }}}
         - {protocol: TCP, port: {{ add (int $n.controllerPort) 1 }}, endPort: 65535}

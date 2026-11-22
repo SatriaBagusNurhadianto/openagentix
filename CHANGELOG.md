@@ -27,10 +27,16 @@ All notable changes to OpenAgentix are documented here. The format follows [Keep
   - Tests: 30 new assertions in `charts/openagentix/tests/run.sh` (written first, failing, then implemented).
   - Verified on kind: a fact told to the agent in one conversation is answered correctly in a new one; a second user id and the default user do not get it. See README "Memory" for how it works, its scope (per agent and per user), and a privacy note: the Telegram bridge sends no user id, so all chats share one memory space, and `ttlDays` is recorded but not enforced by kagent 1.0.1 (nothing prunes).
 
+- Chart value `networkPolicy.extraA2ACallers` (default `[]`, default render unchanged): additional `{namespace, podLabels}` sources admitted to the kagent controller's A2A port. `install.sh` documents `VALUES_FILE` as the way to pass it.
+- `spikes/kourier/`: Agent Kourier 0.6.0 spike, part A (webhook only): runs against kagent 1.0.1 (signed webhook to agent run with tool use, dedupe, threading, rate limits, two connections side by side); caveats in `spikes/kourier/NOTES.md` (recovered turns end `refused`, one memory scope per Binding, no reply path for webhooks). Left installed.
+
 ### Fixed
+- Telegram bridge: privacy fix for long-term memory. Every A2A request now carries `X-User-Id: telegram:<chat id>` (env `A2A_USER_ID_PREFIX`, chart `bridge.userIdPrefix`), so kagent no longer puts all Telegram chats into one shared memory space; a group chat is one identity. Tests: `TestSend_UserIDHeaderFromContext`, `TestBridge_UserIDIsPerChat`, `TestBridge_UserIDPrefixIsConfigurable`, `TestBridge_UserIDNeverDerivedFromMessageText`, `TestLoad_UserIDPrefix*`. Verified live: a fact saved under one id was recalled for it in a new conversation and not for another id.
+- `install.sh` now rolls the bridge pod when `bridges/telegram` changes (pod annotation `openagentix.io/source-hash`, chart value `bridge.sourceHash`), as it already did for the kb.
 - `services/kb`: an MCP tool call no longer outlives `KB_REQUEST_TIMEOUT`. The MCP SDK does not pass the HTTP request deadline to tool handlers, so with a stalled PostgreSQL a call hung until the client gave up (observed: 100 s client timeout hit); each tool call now runs under the request timeout and a timeout is reported as a tool error. Test: `TestMCPToolCallHonoursRequestDeadline`.
 
 ### Changed
+- README Memory section: the "all Telegram chats share one memory space" caveat is gone (fixed, see above).
 - The vMCP no longer accepts anonymous callers by default (HTTP 401 without a valid actor JWT). Set `mcp.virtual.incomingAuth.type=anonymous` for the old behaviour. The RemoteMCPServer reports `DiscoveryDisabled` because tools are listed at run time inside the agent.
 - `components/tools/NOTES.md`: corrected the claim that RemoteMCPServer has no `headersFrom` or `tokenPassthrough`.
 

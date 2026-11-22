@@ -425,6 +425,37 @@ eq "embedding dimension other than 768 fails the render (kagent stores vector(76
 eq "memory without the gateway fails the render"       "$([ -n "$(render_err --set gateway.enabled=false)" ] && echo failed || echo rendered)" failed
 eq "memory prompt hint is appended for opted-in agents" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("save_memory")')" true
 
+echo "# bridge user identity and rollout"
+D=$(docs)
+BE='.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]'
+eq "bridge: no A2A_USER_ID_PREFIX env by default (the bridge default telegram: applies)" "$(q "$D" "[$BE|select(.name==\"A2A_USER_ID_PREFIX\")]|length")" 0
+D=$(docs --set-string bridge.userIdPrefix=botB:)
+eq "bridge.userIdPrefix becomes A2A_USER_ID_PREFIX"    "$(q "$D" "$BE|select(.name==\"A2A_USER_ID_PREFIX\")|.value")" botB:
+BT='.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.metadata'
+D=$(docs)
+eq "bridge pod template has no source-hash annotation by default" "$(q "$D" "$BT|(.annotations//{})|has(\"openagentix.io/source-hash\")")" false
+D=$(docs --set-string bridge.sourceHash=abc123)
+eq "bridge sourceHash becomes a pod annotation (rolls the pod when bridge code changes, tag stays dev)" "$(q "$D" "$BT|.annotations[\"openagentix.io/source-hash\"]")" abc123
+
+echo "# extra A2A callers of the kagent controller"
+D=$(docs)
+eq "extraA2ACallers defaults to empty"                 "$(yq -c .networkPolicy.extraA2ACallers "$CHART/values.yaml")" '[]'
+EX="$(dirname "$0")/.extra-callers.yaml"
+cat > "$EX" <<'YAML'
+networkPolicy:
+  extraA2ACallers:
+    - namespace: agent-kourier
+      podLabels: {app.kubernetes.io/name: agent-kourier}
+    - namespace: other-ns
+YAML
+D2=$(docs -f "$EX"); rm -f "$EX"
+eq "default render: controller policy has 3 sources on 8083" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]|length")" 3
+eq "extraA2ACallers adds two sources to 8083"          "$(q "$D2" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]|length")" 5
+eq "extra caller is scoped by namespace AND pod labels" "$(q "$D2" "$CP|[.spec.ingress[].from[]?|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"agent-kourier\")|.podSelector.matchLabels[\"app.kubernetes.io/name\"]]|join(\",\")")" agent-kourier
+eq "extra caller without podLabels admits its whole namespace" "$(q "$D2" "$CP|[.spec.ingress[].from[]?|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"other-ns\")|has(\"podSelector\")]|join(\",\")")" false
+eq "extra callers do not open the other ports"         "$(q "$D2" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
+eq "default policy is byte-identical when the list is empty" "$(q "$D" "$CP|.spec.ingress|length")" 2
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

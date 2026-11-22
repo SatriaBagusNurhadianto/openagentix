@@ -19,7 +19,9 @@
 #   SKIP_BRIDGE_IMAGE=1  do not build/load the bridge image
 #   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
-#   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents)
+#   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents, networkPolicy.extraA2ACallers for a
+#                        chat gateway such as spikes/kourier). Helm replaces rather than merges the release values, so pass the
+#                        same files on every run, or the extras disappear.
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
@@ -217,6 +219,11 @@ if [ "${SKIP_KB_IMAGE:-0}" != 1 ] && [[ "$KB_IMAGE" == openagentix/kb:* ]]; then
   log "kb image $KB_IMAGE"
   docker build -q -t "$KB_IMAGE" services/kb >/dev/null
   kind load docker-image "$KB_IMAGE" --name "$CLUSTER"
+fi
+if [ -n "$BRIDGE_IMAGE" ]; then
+  # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
+  BRIDGE_HASH=$(cd bridges/telegram && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "bridge.sourceHash=$BRIDGE_HASH")
 fi
 if [ -n "$KB_DEP" ]; then
   # The image tag is "dev" and image ids change with every build, so key the rollout on the source content instead:

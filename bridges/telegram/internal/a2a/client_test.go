@@ -288,3 +288,28 @@ func TestSend_OversizedBodyIsError(t *testing.T) {
 		t.Fatalf("reply len=%d err=%v", len(reply), err)
 	}
 }
+
+func TestSend_UserIDHeaderFromContext(t *testing.T) {
+	var cap captured
+	srv := fakeAgent(t, 200, `{"jsonrpc":"2.0","id":"1","result":{"message":{"role":"ROLE_AGENT","parts":[{"text":"ok"}]}}}`, &cap)
+	defer srv.Close()
+	ctx := WithUserID(context.Background(), "telegram:42")
+	if _, _, err := NewClient(srv.URL, "", srv.Client()).Send(ctx, "", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cap.header.Get("X-User-Id"); got != "telegram:42" {
+		t.Fatalf("X-User-Id = %q, want telegram:42", got)
+	}
+}
+
+func TestSend_NoUserIDHeaderWithoutContextValue(t *testing.T) {
+	var cap captured
+	srv := fakeAgent(t, 200, `{"jsonrpc":"2.0","id":"1","result":{"message":{"role":"ROLE_AGENT","parts":[{"text":"ok"}]}}}`, &cap)
+	defer srv.Close()
+	if _, _, err := NewClient(srv.URL, "", srv.Client()).Send(context.Background(), "", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := cap.header["X-User-Id"]; present {
+		t.Fatalf("X-User-Id must be absent, got %q", cap.header.Get("X-User-Id"))
+	}
+}

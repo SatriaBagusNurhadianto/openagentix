@@ -50,6 +50,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		Backoff:            3 * time.Second,
 		Allowed:            cfg.AllowedChatIDs,
 		AllowAll:           cfg.AllowAll,
+		UserIDPrefix:       cfg.UserIDPrefix,
 		MaxConcurrentTurns: cfg.MaxConcurrentTurns,
 		ShutdownGrace:      cfg.ShutdownGrace,
 	}

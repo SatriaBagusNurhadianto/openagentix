@@ -7,6 +7,15 @@ connection from the internet. Go, standard library only.
 ## Behaviour
 
 - One A2A conversation (`contextId`) per Telegram chat, kept in memory.
+- **One user identity per chat.** Every A2A request carries the header `X-User-Id: <prefix><chat id>` (default
+  `telegram:<chat id>`, for example `telegram:42`). kagent keys its sessions and its long-term memory by (agent, user
+  id), so one chat never sees what another chat asked the agent to remember. The id comes only from the chat id Telegram
+  puts on the update (a number), never from message text. A **group chat is one identity**, keyed by the group's chat id
+  (a negative number such as `telegram:-1001234567890`): everyone in the group shares the group's sessions and memory,
+  and what one member asks the agent to remember is recalled for all members of that group (and for nobody outside it).
+  `/new` starts a fresh conversation but keeps the identity, so saved memories survive it. Verified against kagent
+  1.0.1 in `insecure` auth mode: the header is honoured and `:` and `-` are accepted. In other auth modes kagent takes
+  the user from the authenticated principal and ignores this header.
 - `/new` (or `/new@<this bot's username>`) starts a fresh conversation. The bot
   resolves its own username once at startup with `getMe`; commands addressed to
   other bots are not treated as `/new`.
@@ -33,6 +42,7 @@ connection from the internet. Go, standard library only.
 | `A2A_TOKEN` | empty | Bearer token for the agent, if it needs one. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Comma-separated chat ids allowed to talk to the agent. |
 | `TELEGRAM_ALLOW_ALL` | `false` | Set `true` to accept every chat. Startup fails unless this or the allowlist is set (fail closed). |
+| `A2A_USER_ID_PREFIX` | `telegram:` | Prefix of the per-chat user id. Give each bot or bridge its own prefix when several share one agent. Printable ASCII, no spaces, at most 64 characters. |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Override for tests. |
 | `AGENT_TIMEOUT` | `120s` | Per-turn deadline for the agent call. |
 | `MAX_CONCURRENT_TURNS` | `8` | Agent turns in flight across all chats. |

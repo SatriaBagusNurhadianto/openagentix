@@ -19,6 +19,11 @@ spec:
       labels:
         app: telegram-bridge
         {{- include "oa.labels" . | nindent 8 }}
+      {{- if $b.sourceHash }}
+      annotations:
+        # set by install.sh from the content of bridges/telegram: a code change rolls the pod although the image tag stays "dev"
+        openagentix.io/source-hash: {{ $b.sourceHash | quote }}
+      {{- end }}
     spec:
       automountServiceAccountToken: false
       securityContext:
@@ -46,6 +51,10 @@ spec:
             # Explicit opt-in: anyone who finds the bot can talk to the agent.
             - name: TELEGRAM_ALLOW_ALL
               value: "true"
+            {{- end }}
+            {{- if $b.userIdPrefix }}
+            - name: A2A_USER_ID_PREFIX
+              value: {{ $b.userIdPrefix | quote }}
             {{- end }}
             {{- if $b.agentTimeout }}
             - name: AGENT_TIMEOUT

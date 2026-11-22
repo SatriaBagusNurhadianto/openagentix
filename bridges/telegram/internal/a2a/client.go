@@ -15,6 +15,20 @@ import (
 	"github.com/openagentix/openagentix/bridges/telegram/internal/httpx"
 )
 
+type userIDKey struct{}
+
+// WithUserID returns a context whose user id Send passes to the agent in the X-User-Id header. kagent scopes
+// sessions and long-term memory by that id (insecure auth mode); without it every caller shares one default user.
+func WithUserID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, userIDKey{}, id)
+}
+
+// UserIDFromContext returns the id set by WithUserID, or "".
+func UserIDFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(userIDKey{}).(string)
+	return id
+}
+
 type Client struct {
 	url   string
 	token string
@@ -49,6 +63,9 @@ func (c *Client) Send(ctx context.Context, contextID, text string) (string, stri
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("A2A-Version", "1.0")
+	if id := UserIDFromContext(ctx); id != "" {
+		req.Header.Set("X-User-Id", id)
+	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}

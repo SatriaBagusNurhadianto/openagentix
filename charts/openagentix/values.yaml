@@ -17,6 +17,9 @@ networkPolicy:
   controllerPodLabels:                   # the kagent controller (labels set by the kagent chart)
     app.kubernetes.io/component: controller
     app.kubernetes.io/name: kagent
+  # Additional callers of the controller's A2A port, e.g. a chat gateway in its own namespace. Each entry:
+  # {namespace: <ns>, podLabels: {k: v}} (podLabels optional; omitted admits every pod of that namespace).
+  extraA2ACallers: []
   controllerPort: 8083                   # A2A, REST API and the sandbox task-store gRPC share this port
 
 # ---- Telegram -> A2A bridge --------------------------------------------------------------------
@@ -32,6 +35,10 @@ bridge:
   agentNamespace: kagent
   a2aUrl: ""
   agentTimeout: ""                # e.g. "170s"; empty = bridge default
+  # Prefix of the per-chat user id the bridge sends to kagent (X-User-Id = prefix + Telegram chat id); kagent keys
+  # sessions and long-term memory by it. Empty = the bridge default "telegram:". Set it to tell several bots apart.
+  userIdPrefix: ""
+  sourceHash: ""                  # install.sh sets it to a hash of bridges/telegram, so a code change rolls the pod (tag stays "dev")
   existingSecret: telegram-bridge # Secret in bridge.namespace, created by install.sh
   tokenKey: TELEGRAM_BOT_TOKEN
   allowlist:

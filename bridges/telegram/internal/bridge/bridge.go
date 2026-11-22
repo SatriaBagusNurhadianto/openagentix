@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/openagentix/openagentix/bridges/telegram/internal/a2a"
 	"github.com/openagentix/openagentix/bridges/telegram/internal/telegram"
 )
 
@@ -44,6 +46,7 @@ type Bridge struct {
 	username           string           // the bot's own username, lowercased; set once by Run
 	lastPoll           atomic.Int64     // unix nanos of the last successful getUpdates
 	AllowAll           bool             // explicit opt-in: accept every chat; otherwise empty Allowed rejects all
+	UserIDPrefix       string           // prepended to the chat id to form the agent-side user id (X-User-Id); empty sends no user id
 }
 
 const defaultMaxTurns = 8
@@ -193,6 +196,11 @@ func (b *Bridge) handle(ctx context.Context, u telegram.Update) {
 	tcancel()
 	actx, cancel := context.WithTimeout(ctx, b.AgentTimeout)
 	defer cancel()
+	// The user id is the chat id (a number from Telegram, never message text), so each chat, and each group, is
+	// its own user for the agent's sessions and long-term memory.
+	if b.UserIDPrefix != "" {
+		actx = a2a.WithUserID(actx, b.UserIDPrefix+strconv.FormatInt(chat, 10))
+	}
 	reply, newCtx, err := b.Agent.Send(actx, b.Store.Get(chat), text)
 	if err != nil {
 		b.Log.Error("agent call failed", "chat_id", chat, "err", err)

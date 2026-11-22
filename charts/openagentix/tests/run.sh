@@ -17,6 +17,8 @@ eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$3" "$2"; }          # eq desc 
 q()    { jq -r "$2" <<<"$1"; }
 count(){ q "$1" "[.[] | select($2)] | length"; }                      # count docs-json 'jq select expr'
 
+# the default agents list with one yq edit applied (lists are replaced, not merged, by helm --set)
+with_agents() { local e=$1; shift; yq -y "{agents: (.agents|$e)}" "$CHART/values.yaml" > "$(dirname "$0")/.agents-variant.yaml"; docs -f "$(dirname "$0")/.agents-variant.yaml" "$@"; rm -f "$(dirname "$0")/.agents-variant.yaml"; }
 echo "# defaults"
 D=$(docs)
 eq "default render is non-empty"                       "$(q "$D" 'length>0')" true
@@ -78,7 +80,7 @@ gateway:
       failover: [gemini, claude-haiku]
 YAML
 D=$(docs -f "$(dirname "$0")/.extra-models.yaml")
-eq "models come from values (3 chat models + embed-default)" "$(count "$D" '.kind=="AgentgatewayModel"')" 4
+eq "models come from values (3 chat models + embed-default + embed-memory)" "$(count "$D" '.kind=="AgentgatewayModel"')" 5
 eq "failover model renders virtualModel targets"       "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="auto")|[.spec.virtualModel.failover.targets[]|.modelRef.name+":"+(.priority|tostring)]|join(",")')" gemini:0,claude-haiku:1
 rm -f "$(dirname "$0")/.extra-models.yaml"
 
@@ -168,7 +170,7 @@ D=$(docs)
 VP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress")'
 CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
 BP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-mcp-tools-default")'
-eq "3 platform NetworkPolicies by default (knowledge ns excluded)" "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge"')" 3
+eq "3 platform NetworkPolicies by default (knowledge ns excluded)" "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory"')" 3
 eq "mcp-tools default policy lives in mcp-tools"       "$(q "$D" "$BP|.metadata.namespace")" mcp-tools
 eq "mcp-tools default policy selects every pod"        "$(q "$D" "$BP|.spec.podSelector|length")" 0
 eq "mcp-tools default policy is ingress-only"          "$(q "$D" "$BP|.spec.policyTypes|join(\",\")")" Ingress
@@ -185,11 +187,11 @@ eq "controller: ports other than 8083 stay open"       "$(q "$D" "$CP|[.spec.ing
 D=$(docs --set networkPolicy.enabled=false)
 eq "networkPolicy.enabled=false renders none (also in the knowledge ns)" "$(count "$D" '.kind=="NetworkPolicy"')" 0
 D=$(docs --set mcp.enabled=false)
-eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge")|.metadata.name]|join(",")')" openagentix-kagent-controller
+eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory")|.metadata.name]|join(",")')" openagentix-kagent-controller
 D=$(docs --set bridge.enabled=false)
 eq "bridge.enabled=false drops the bridge source"      "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")]|length")" 0
 D=$(docs --set kagent.enabled=false)
-eq "kagent.enabled=false: no controller policy, vMCP policy keeps ns sources" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge")|.metadata.name]|sort|join(",")')" openagentix-mcp-tools-default,openagentix-vmcp-ingress
+eq "kagent.enabled=false: no controller policy, vMCP policy keeps ns sources" "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory")|.metadata.name]|sort|join(",")')" openagentix-mcp-tools-default,openagentix-vmcp-ingress
 
 echo "# tool-layer identity (stage 2)"
 D=$(docs)
@@ -331,7 +333,7 @@ D2=$(docs -f "$(dirname "$0")/.noknow-agent.yaml"); rm -f "$(dirname "$0")/.nokn
 eq "agent without knowledge:true is not given kb tools" "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|join(",")')" fetch_fetch
 eq "agent without knowledge:true keeps its prompt"     "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt')" "You are plain."
 echo "# knowledge base: switches"
-D=$(docs --set knowledge.enabled=false)
+D=$(with_agents '.[0].memory.enabled=false' --set knowledge.enabled=false)
 eq "knowledge.enabled=false renders nothing in the knowledge ns" "$(count "$D" '.metadata.namespace=="openagentix-knowledge"')" 0
 eq "knowledge.enabled=false: no embed-default, no MCPServerEntry, no MCPExternalAuthConfig" "$(count "$D" '.kind=="MCPServerEntry" or .kind=="MCPExternalAuthConfig" or (.kind=="AgentgatewayModel" and .metadata.name=="embed-default")')" 0
 eq "knowledge.enabled=false: assistant keeps its original 5 tools" "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 5
@@ -366,6 +368,62 @@ D=$(docs --set 'knowledge.kb.ingestFrom[0].namespace=ci' --set 'knowledge.kb.ing
 eq "ingestFrom adds a pod-scoped source for in-cluster ingestion" "$(q "$D" "[$KP|.spec.ingress[].from[]|select(.podSelector.matchLabels.app==\"ingest\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" ci
 eq "dimension above pgvector's HNSW limit (2000) fails the render" "$([ -n "$(render_err --set knowledge.embeddings.model.dim=4096)" ] && echo failed || echo rendered)" failed
 eq "embeddings url without model fails the render"     "$([ -n "$(render_err --set knowledge.kb.embeddings.url=http://x/v1 --set knowledge.embeddings.enabled=false)" ] && echo failed || echo rendered)" failed
+
+echo "# long-term memory (kagent Harness spec.kagent.memory)"
+D=$(docs)
+HM='.[]|select(.kind=="Harness" and .metadata.name=="assistant-harness")'
+MC='.[]|select(.kind=="ModelConfig" and .metadata.name=="gateway-embed-memory")'
+MD='.[]|select(.kind=="Deployment" and .metadata.name=="memory-embeddings")'
+eq "assistant opts in: harness has memory.modelConfigRef"  "$(q "$D" "$HM|.spec.kagent.memory.modelConfigRef|.name+\"/\"+.namespace")" gateway-embed-memory/kagent
+eq "assistant memory ttlDays from values"              "$(q "$D" "$HM|.spec.kagent.memory.ttlDays")" 30
+eq "embedding ModelConfig rendered exactly once"       "$(count "$D" '.kind=="ModelConfig" and .metadata.name=="gateway-embed-memory"')" 1
+eq "embedding ModelConfig: provider OpenAI, model embed-memory" "$(q "$D" "$MC|.spec.provider+\"/\"+.spec.model")" OpenAI/embed-memory
+eq "embedding ModelConfig has its own virtual key secret" "$(q "$D" "$MC|.spec.apiKeySecret+\"/\"+.spec.apiKeySecretKey")" memory-virtual-key/OPENAI_API_KEY
+eq "embedding ModelConfig annotated so install.sh creates its key (user memory)" "$(q "$D" "$MC|.metadata.annotations[\"openagentix.io/agent\"]")" memory
+eq "embedding baseUrl is a DIFFERENT origin than the chat ModelConfig (kagent binds one credential per origin)" "$(q "$D" "$MC|.spec.openAI.baseUrl")" http://model-gateway-memory.agentgateway-system.svc.cluster.local/v1
+eq "chat ModelConfig origin unchanged"                 "$(q "$D" '.[]|select(.kind=="ModelConfig" and .metadata.name=="gateway-claude-haiku")|.spec.openAI.baseUrl')" http://model-gateway.agentgateway-system.svc.cluster.local/v1
+eq "alias Service is ExternalName to the gateway"      "$(q "$D" '.[]|select(.kind=="Service" and .metadata.name=="model-gateway-memory")|.spec.type+"/"+.spec.externalName')" ExternalName/model-gateway.agentgateway-system.svc.cluster.local
+eq "gateway model embed-memory -> memory-embeddings (OpenAI-compatible)" "$(q "$D" '.[]|select(.kind=="AgentgatewayModel" and .metadata.name=="embed-memory")|.spec.provider+" "+.spec.baseURL')" "OpenAI http://memory-embeddings.openagentix-memory.svc.cluster.local:8080/v1"
+eq "embedding server is a 768-dimension model (kagent fixes 768)" "$(q "$D" "$MD|.spec.template.spec.containers[0].args|index(\"CompendiumLabs/bge-base-en-v1.5-gguf:Q8_0\")!=null")" true
+eq "embedding server image is digest pinned"           "$(q "$D" "$MD|.spec.template.spec.containers[0].image|test(\"@sha256:[0-9a-f]{64}\$\")")" true
+eq "embedding server lives in openagentix-memory"      "$(q "$D" "$MD|.metadata.namespace")" openagentix-memory
+eq "embedding server has resource limits"              "$(q "$D" "$MD|.spec.template.spec.containers[0].resources.limits.memory")" 512Mi
+eq "embedding server ingress only from the gateway proxy" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="memory-embeddings-ingress")|[.spec.ingress[].from[].podSelector.matchLabels["gateway.networking.k8s.io/gateway-name"]]|join(",")')" model-gateway
+eq "memory objects carry no Secret"                    "$(count "$D" '.kind=="Secret"')" 0
+cat > "$(dirname "$0")/.mem-agents.yaml" <<'YAML'
+agents:
+  - name: alpha
+    model: claude-haiku
+    systemPrompt: "You are alpha, a terse assistant for testing."
+    memory: {enabled: true}
+  - name: beta
+    model: claude-haiku
+    systemPrompt: "You are beta, a terse assistant for testing."
+  - name: gamma
+    model: claude-haiku
+    systemPrompt: "You are gamma, a terse assistant for testing."
+    memory: {enabled: false, ttlDays: 5}
+YAML
+D=$(docs -f "$(dirname "$0")/.mem-agents.yaml"); rm -f "$(dirname "$0")/.mem-agents.yaml"
+eq "only the opted-in agent has memory"                "$(q "$D" '[.[]|select(.kind=="Harness" and (.spec.kagent|has("memory")))|.metadata.name]|join(",")')" alpha-harness
+eq "agents without the block render spec.kagent: {}"   "$(q "$D" '[.[]|select(.kind=="Harness" and .metadata.name!="alpha-harness")|.spec.kagent|length]|join(",")')" 0,0
+eq "ttlDays omitted when not set (kagent default)"     "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="alpha-harness")|.spec.kagent.memory|has("ttlDays")')" false
+eq "one embedding stack for any number of agents"      "$(count "$D" '(.kind=="ModelConfig" and .metadata.name=="gateway-embed-memory") or (.kind=="Deployment" and .metadata.name=="memory-embeddings")')" 2
+D=$(with_agents '.[0].memory.enabled=false')
+eq "variant renders (guards the tests below against vacuous passes)" "$(q "$D" 'length>0')" true
+eq "memory disabled on every agent: no memory objects at all" "$(count "$D" '.metadata.namespace=="openagentix-memory" or .metadata.name=="gateway-embed-memory" or .metadata.name=="embed-memory" or .metadata.name=="model-gateway-memory" or (.kind=="Harness" and (.spec.kagent|has("memory")))')" 0
+D=$(with_agents 'map(del(.memory))')
+eq "variant without the block renders"                 "$(q "$D" 'length>0')" true
+eq "no memory block: no memory objects at all"         "$(count "$D" '.metadata.namespace=="openagentix-memory" or .metadata.name=="gateway-embed-memory" or .metadata.name=="embed-memory" or .metadata.name=="model-gateway-memory" or (.kind=="Harness" and (.spec.kagent|has("memory")))')" 0
+D=$(docs --set kagent.enabled=false)
+eq "kagent.enabled=false: no memory objects"           "$(count "$D" '.metadata.namespace=="openagentix-memory" or .metadata.name=="embed-memory"')" 0
+D=$(docs --set knowledge.enabled=false)
+eq "memory is independent of knowledge.enabled"        "$(count "$D" '.kind=="Deployment" and .metadata.name=="memory-embeddings"')" 1
+D=$(docs --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no memory policy"     "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace=="openagentix-memory"')" 0
+eq "embedding dimension other than 768 fails the render (kagent stores vector(768))" "$([ -n "$(render_err --set memory.embeddings.model.dim=384)" ] && echo failed || echo rendered)" failed
+eq "memory without the gateway fails the render"       "$([ -n "$(render_err --set gateway.enabled=false)" ] && echo failed || echo rendered)" failed
+eq "memory prompt hint is appended for opted-in agents" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("save_memory")')" true
 
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)

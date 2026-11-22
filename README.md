@@ -113,9 +113,49 @@ Each file becomes one document: id from the path (`adr/0001-x.md` becomes `adr:0
 
 **Measured footprint** (kind, 1 arm64 node, 5 CPU / 7.7 GiB VM; working sets from the container runtime): idle, `kb` 6 MiB, `kb-embeddings` 110 MiB, `kb-postgres` 64 MiB. While ingesting 17 markdown files (160 KB, 25 s) `kb-embeddings` peaked at 155 MiB and used about 1.1 cores on average (2 threads, limit 2 CPU), `kb` 9 MiB, PostgreSQL 33 to 64 MiB. Requests: 100 m CPU, 304 MiB in total; limits: 384 MiB for the embedding server and for PostgreSQL, 192 MiB for the kb. The node's memory requests went from 3410 Mi to 3714 Mi.
 
+## Memory
+
+An agent with `memory.enabled: true` remembers facts across conversations. The demo `assistant` has it on. This is kagent's own long-term memory (Harness `spec.kagent.memory`); the chart wires it up and keeps its pieces behind the same gateway, virtual keys and NetworkPolicies as everything else.
+
+**What is remembered.** Only what the model decides to save. kagent has no automatic "remember the whole conversation": it adds a `save_memory` tool, and a memory exists only after the model calls it with a short piece of text (a preference, a codename, a standing instruction). The chart appends a short paragraph to the system prompt of memory-enabled agents that tells the model to do that when the user shares something worth keeping or asks it to remember, and never to store secrets. Each saved text is embedded and stored as one row.
+
+**When it is recalled.** Automatically, on every turn: kagent embeds the user's message, takes up to 5 stored memories of the same user and agent with cosine similarity of at least 0.3, and puts them into the model's context before it answers. The model also gets a `load_memory` tool for searching on its own. So a fact saved in conversation A shows up in a brand new conversation B (no `contextId`) when B's question is similar enough.
+
+**For whom.** One memory space per agent AND per user: rows are keyed by the agent (`kagent/assistant`) and the session's user id, and the agent and user are taken from the stored session, never from the request. Another user of the same agent, or the same user on another agent, does not see them. Which user id a request has depends on kagent's auth mode. In the `insecure` mode this installation uses, kagent takes it from `?user_id=` or the `X-User-Id` header on the A2A request and otherwise uses the default admin user `admin@kagent.dev`. The Telegram bridge sends neither, so **every Telegram chat talking to the same agent shares one memory space**; the allowlist (`TELEGRAM_ALLOWED_CHAT_IDS`) is the only separation. Anything that can reach the controller's port 8083 can also claim any user id (the NetworkPolicy limits that to the bridge pod, `kagent` namespace and the egress proxy).
+
+**Turn it on for an agent.**
+
+```yaml
+agents:
+  - name: researcher
+    # ...
+    memory:
+      enabled: true
+      ttlDays: 30      # optional; kagent's default is 15
+```
+
+`install.sh` then (1) installs pgvector into kagent's PostgreSQL (`spikes/kagent/pgvector.sh`, idempotent, no data touched), (2) sets `config.database.vectorEnabled=true` on the kagent release with the one script that always applies `spikes/kagent/values/kagent.yaml` (`spikes/kagent/kagent-helm.sh`; fresh installs get both from `spikes/kagent/up.sh`), (3) creates the gateway key `memory-virtual-key` for the embedding ModelConfig, and (4) renders the shared pieces once: ModelConfig `gateway-embed-memory`, gateway model `embed-memory`, and the embedding server in namespace `openagentix-memory`. An agent without the `memory` block renders exactly as before, and if no agent opts in none of the shared pieces exist. `ttlDays` only sets `expires_at` on each row. In kagent 1.0.1 nothing calls the prune function (`PruneExpiredMemories`) and search ignores `expires_at`, so **memories do not actually expire**; delete them yourself (see "Clear it").
+
+**Why a second embedding model.** kagent stores memory as `vector(768)` and refuses any other size (a 384-dimension model fails with "embedding dimension 384 is less than required 768"; a larger vector is cut to 768 and re-normalised). The knowledge base's `bge-small-en-v1.5` has 384, so memory runs its own llama.cpp server with `bge-base-en-v1.5` (768, same publisher and pooling, 118 MB Q8_0). The chart fails the render if `memory.embeddings.model.dim` is not 768. The knowledge base is untouched, so nothing needs re-ingesting.
+
+**One origin per credential.** kagent injects the gateway key for an agent's model at the sandbox's egress proxy and allows one key per destination origin. The chat ModelConfig already uses `model-gateway.agentgateway-system.svc.cluster.local` with the agent's key, so the embedding ModelConfig reaches the same gateway under a second DNS name (an `ExternalName` Service `model-gateway-memory`). Gateway logs show the embeddings as `user_id="memory"`.
+
+**Look at it.** Memories are in `kagent.memory` of kagent's PostgreSQL (the admin password is in Secret `kagent/kagent-pg-admin`; `kubectl exec` into `kagent-pg-0` uses the local socket and needs none):
+
+```sh
+kubectl exec -n kagent kagent-pg-0 -- psql -U postgres -d kagent -c \
+  "select agent_name, user_id, left(content,80) as content, extensions.vector_dims(embedding) as dims, expires_at, access_count from kagent.memory"
+```
+
+**Clear it.** kagent offers list and delete only over its internal gRPC API, so use SQL. One user on one agent: `delete from kagent.memory where agent_name='kagent/assistant' and user_id='<user>'`. Everything: `truncate kagent.memory`. Turning memory off for an agent (`enabled: false`) stops saving and recall but does not delete rows.
+
+**Privacy.** Memory holds what users said, as plain text, in the database and as vectors, until someone deletes it (`ttlDays` is recorded but not enforced in kagent 1.0.1). The text of every saved memory and of every user message (for recall) is sent to the embedding server in-cluster only; nothing leaves the cluster for embeddings. The model decides what to save, so it can store things you would rather it did not; the prompt tells it not to store secrets, which is advice, not a filter. The database is the development PostgreSQL (password auth, no TLS, no encryption at rest). A turn fails if the memory backend errors (the preload step has no fallback for a failing database), so keep pgvector enabled for as long as an agent has memory on.
+
+**Footprint** (kind, 1 arm64 node): the embedding server idles at 74 MiB and was 133 MiB after a few calls (requests 192 MiB, limit 512 MiB, 1 GiB PVC for the model); kagent's PostgreSQL stayed at 60 to 61 MiB with pgvector on and a few rows; the `memory` table with two rows is 96 kB. The node's memory requests went from 3714 Mi to 3906 Mi.
+
 ## Add an agent
 
-Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt):
+Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt; `memory: {enabled: true}` turns on long-term memory, see "Memory"):
 
 ```yaml
 # my-values.yaml

@@ -1,0 +1,180 @@
+{{- if include "oa.memoryEnabled" . }}
+{{- $m := .Values.memory }}
+{{- $e := $m.embeddings }}
+{{- $g := .Values.gateway }}
+{{- $ns := $m.namespace }}
+{{- if not $g.enabled }}{{ fail "agents[].memory.enabled needs gateway.enabled=true: the embedding model is reached through the model gateway" }}{{ end }}
+{{- if ne (int $e.model.dim) 768 }}{{ fail (printf "memory.embeddings.model.dim must be 768 (kagent stores memories as vector(768) and rejects other sizes), got %v" $e.model.dim) }}{{ end }}
+# The one embedding ModelConfig all memory agents share. The Harness references it by name; kagent resolves it into the
+# agent's runtime (embeddings go from the sandbox through the egress proxy, which injects this key).
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata:
+  name: {{ $m.modelConfig.name }}
+  namespace: {{ .Values.kagent.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+  annotations:
+    # install.sh reads this to create Secret <apiKeySecret> (virtual key for gateway user "memory") and register its hash
+    openagentix.io/agent: memory
+spec:
+  provider: OpenAI
+  model: {{ $m.gatewayModel }}
+  apiKeySecret: {{ $m.modelConfig.virtualKeySecret }}
+  apiKeySecretKey: OPENAI_API_KEY
+  openAI: {baseUrl: {{ include "oa.memoryBaseUrl" . | quote }}}
+---
+# Second DNS name for the same gateway (see values: memory.gatewayAlias). No pods, no ports of its own.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $m.gatewayAlias }}
+  namespace: {{ $g.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: {{ $g.name }}.{{ $g.namespace }}.svc.cluster.local
+---
+# One more model on the gateway: same virtual-key auth and per-key attribution as the chat models. OpenAI-compatible
+# provider with baseURL at the in-cluster server; no provider credential is involved.
+apiVersion: agentgateway.dev/v1alpha1
+kind: AgentgatewayModel
+metadata:
+  name: {{ $m.gatewayModel }}
+  namespace: {{ $g.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - {group: gateway.networking.k8s.io, kind: Gateway, name: {{ $g.name }}, sectionName: http}
+  provider: OpenAI
+  baseURL: {{ printf "http://memory-embeddings.%s.svc.cluster.local:8080/v1" $ns }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: memory-embeddings-models
+  namespace: {{ $ns }}
+  labels:
+    app: memory-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if $e.storage.storageClassName }}
+  storageClassName: {{ $e.storage.storageClassName }}
+  {{- end }}
+  resources:
+    requests: {storage: {{ $e.storage.size }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-embeddings
+  namespace: {{ $ns }}
+  labels:
+    app: memory-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: memory-embeddings}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+---
+# llama.cpp server, OpenAI-compatible /v1/embeddings on CPU, 768-dimension model (see values). The model is downloaded
+# from HuggingFace on first start into the PVC; /health answers 200 only after it is loaded.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-embeddings
+  namespace: {{ $ns }}
+  labels:
+    app: memory-embeddings
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # the model cache volume is ReadWriteOnce
+  selector:
+    matchLabels: {app: memory-embeddings}
+  template:
+    metadata:
+      labels:
+        app: memory-embeddings
+        {{- include "oa.labels" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: embeddings
+          image: {{ $e.image | quote }}
+          args:
+            - -hf
+            - {{ $e.model.hf | quote }}
+            - --alias
+            - {{ $e.model.name | quote }}
+            - --embeddings
+            - --pooling
+            - {{ $e.model.pooling | quote }}
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8080"
+            - -c
+            - {{ $e.contextSize | quote }}
+            - --parallel
+            - {{ $e.parallel | quote }}
+            - -t
+            - {{ $e.threads | quote }}
+          env:
+            - {name: LLAMA_CACHE, value: /models}
+            - {name: HOME, value: /tmp}
+          ports:
+            - {name: http, containerPort: 8080}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            failureThreshold: 120   # up to 10 minutes for the first download
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources: {{- toYaml $e.resources | nindent 12 }}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: models
+          persistentVolumeClaim: {claimName: memory-embeddings-models}
+        - {name: tmp, emptyDir: {}}
+{{- if .Values.networkPolicy.enabled }}
+---
+# The embedding server has no authentication. Its only legitimate caller is the model gateway proxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: memory-embeddings-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: memory-embeddings}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 8080}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $g.namespace }}}}
+          podSelector:
+            matchLabels: {gateway.networking.k8s.io/gateway-name: {{ $g.name | quote }}}
+{{- end }}
+{{- end }}

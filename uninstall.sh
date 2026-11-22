@@ -4,7 +4,7 @@
 # (provider keys, virtual keys, llm-api-keys, telegram-bridge), so a later ./install.sh reuses them.
 # PURGE_SECRETS=1 additionally deletes the Secrets/ConfigMap that install.sh created for this release (except the
 # knowledge base database credentials: they must stay as long as its volume does).
-# PURGE_DATA=1 deletes the knowledge base volumes (database, model cache) and the database credentials.
+# PURGE_DATA=1 deletes the knowledge base volumes (database, model cache), the memory embedding model cache and the database credentials.
 set -euo pipefail
 CLUSTER=${CLUSTER:-openagentix}; CTX=${KUBE_CONTEXT:-kind-$CLUSTER}
 K=${KUBECTL:-kubectl}; RELEASE_NS=${RELEASE_NS:-openagentix-system}
@@ -28,5 +28,6 @@ fi
 if [ "${PURGE_DATA:-0}" = 1 ]; then   # the knowledge base's data: database volume, its credentials, the model cache
   $K delete pvc data-kb-postgres-0 kb-embeddings-models -n openagentix-knowledge --ignore-not-found
   $K delete secret kb-postgres kb-database -n openagentix-knowledge --ignore-not-found
+  $K delete pvc memory-embeddings-models -n openagentix-memory --ignore-not-found   # memory embedding model cache (saved memories live in kagent's PostgreSQL)
 fi
 echo "removed release openagentix. Upstream components and namespaces were left in place."

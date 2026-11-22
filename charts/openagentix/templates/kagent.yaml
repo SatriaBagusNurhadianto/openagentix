@@ -52,7 +52,16 @@ metadata:
   namespace: {{ $k.namespace }}
   labels: {{- include "oa.labels" $ | nindent 4 }}
 spec:
+  {{- if and $a.memory $a.memory.enabled }}
+  kagent:
+    memory:
+      modelConfigRef: {name: {{ $.Values.memory.modelConfig.name }}, namespace: {{ $k.namespace }}}
+      {{- if $a.memory.ttlDays }}
+      ttlDays: {{ int $a.memory.ttlDays }}
+      {{- end }}
+  {{- else }}
   kagent: {}
+  {{- end }}
   workload:
     image: {{ default $k.harnessImage $a.harnessImage }}
   substrate:
@@ -74,6 +83,7 @@ spec:
   {{- $kn := and $.Values.knowledge.enabled $.Values.mcp.enabled $a.knowledge }}
   {{- $prompt := required (printf "agents[%s].systemPrompt is required" $a.name) $a.systemPrompt }}
   {{- if $kn }}{{ $prompt = printf "%s\n%s" (trim $prompt) (include "oa.knowledgeAgentPrompt" $ | trim) }}{{ end }}
+  {{- if and $a.memory $a.memory.enabled }}{{ $prompt = printf "%s\n%s" (trim $prompt) (trim $.Values.memory.agentPrompt) }}{{ end }}
   systemPrompt: {{ $prompt | toJson }}
   {{- $entries := list }}
   {{- $merged := false }}

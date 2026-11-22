@@ -30,3 +30,15 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- $t := include "oa.knowledgeTools" . | fromJsonArray -}}
 {{- .Values.knowledge.agentPrompt | replace "{search}" (index $t 0) | replace "{get}" (index $t 1) -}}
 {{- end -}}
+
+{{/* "true" when at least one agent has long-term memory enabled (and kagent is deployed). */}}
+{{- define "oa.memoryEnabled" -}}
+{{- $on := false -}}
+{{- if .Values.kagent.enabled }}{{ range .Values.agents }}{{ if and .memory .memory.enabled }}{{ $on = true }}{{ end }}{{ end }}{{ end -}}
+{{- if $on -}}true{{- end -}}
+{{- end -}}
+
+{{/* Gateway base URL for the embedding ModelConfig: same gateway, different (alias) Service name, so a different origin. */}}
+{{- define "oa.memoryBaseUrl" -}}
+http://{{ .Values.memory.gatewayAlias }}.{{ .Values.gateway.namespace }}.svc.cluster.local{{ if ne (int .Values.gateway.port) 80 }}:{{ .Values.gateway.port }}{{ end }}/v1
+{{- end -}}

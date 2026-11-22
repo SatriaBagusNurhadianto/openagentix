@@ -21,6 +21,8 @@
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents)
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
+# Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
+# ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
 # The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
 # kb-admin, kb-postgres, kb-database and, for gateway-routed embeddings, kb-virtual-key in openagentix-knowledge.
 # Secret values are never echoed, never put in argv or written to disk.
@@ -106,6 +108,21 @@ KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDE
 # Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
 KB_KEY=$(jq -r 'select(.kind=="Deployment" and (.metadata.annotations["openagentix.io/gateway-user"]//"")!="")|[.metadata.annotations["openagentix.io/gateway-user"],.metadata.annotations["openagentix.io/gateway-key-secret"],.metadata.namespace]|@tsv' <<<"$RENDERED")
 [ -z "$KB_KEY" ] || AGENT_KEYS=$(printf '%s\n%s' "$AGENT_KEYS" "$KB_KEY")
+
+# --- 3b. long-term memory needs pgvector in kagent's PostgreSQL and config.database.vectorEnabled=true ------------------
+# Only when some agent opts in (Harness spec.kagent.memory). Fresh installs get both from spikes/kagent/up.sh; this step
+# brings an existing cluster up to date with the SAME scripts (pgvector.sh is idempotent, kagent-helm.sh is the one
+# helm command that always carries values/kagent.yaml). It never touches kagent data. SKIP_PREREQS=1 skips it.
+if [ "${SKIP_PREREQS:-0}" != 1 ] && jq -e -s 'any(.[]; .kind=="Harness" and (.spec.kagent.memory!=null))' <<<"$RENDERED" >/dev/null; then
+  log "kagent long-term memory prerequisites (pgvector)"
+  bash spikes/kagent/pgvector.sh
+  if [ "$(helm get values kagent -n $KAGENT_NS -a -o json | jq -r '.config.database.vectorEnabled // false')" = true ]; then
+    echo "kagent release: config.database.vectorEnabled already true"
+  else
+    echo "-> enabling config.database.vectorEnabled (spikes/kagent/kagent-helm.sh)"
+    bash spikes/kagent/kagent-helm.sh
+  fi
+fi
 
 for ns in $RELEASE_NS $NAMESPACES; do
   $K get namespace "$ns" >/dev/null 2>&1 || $K create namespace "$ns" >/dev/null

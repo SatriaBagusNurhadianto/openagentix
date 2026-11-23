@@ -259,3 +259,47 @@ func TestSenderUsesConfiguredChatIDAndTokenAgainstTheFakeAPI(t *testing.T) {
 		t.Fatalf("path=%q chat_id=%v", path, body["chat_id"])
 	}
 }
+
+func TestParse_WebhookToLoopbackOrMetadataNeedsExplicitFlag(t *testing.T) {
+	for _, u := range []string{"http://127.0.0.1:9000/hook", "https://169.254.169.254/x", "http://[::1]/x", "http://0.0.0.0/x"} {
+		y := "destinations:\n  - name: h\n    description: d\n    platform: webhook\n    allowInsecureHTTP: true\n    url: " + u + "\n"
+		if _, err := Parse([]byte(y), opts(nil)); err == nil || !strings.Contains(err.Error(), "allowPrivateAddress") || strings.Contains(err.Error(), "169.254") {
+			t.Fatalf("%s: err = %v", u, err)
+		}
+		if _, err := Parse([]byte(y+"    allowPrivateAddress: true\n"), opts(nil)); err != nil {
+			t.Fatalf("%s with the flag: %v", u, err)
+		}
+	}
+}
+
+func TestParse_AllowPrivateAddressOnlyAppliesToWebhooks(t *testing.T) {
+	y := "destinations:\n  - name: s\n    description: d\n    platform: slack\n    channel: C0123456789\n    tokenEnv: SLACK_TOKEN\n    allowPrivateAddress: true\n"
+	if _, err := Parse([]byte(y), opts(goodEnv)); err == nil || !strings.Contains(err.Error(), "allowPrivateAddress") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestParse_MultipleYAMLDocumentsAreRejected(t *testing.T) {
+	y := "destinations:\n  - name: a\n    description: d\n    platform: webhook\n    url: https://hooks.example.com/a\n---\ndestinations:\n  - name: b\n    description: d\n    platform: webhook\n    url: https://hooks.example.com/b\n"
+	_, err := Parse([]byte(y), opts(nil))
+	if err == nil || !strings.Contains(err.Error(), "more than one YAML document") {
+		t.Fatalf("err = %v", err)
+	}
+	// A single document with a leading marker is fine.
+	if _, err := Parse([]byte("---\n"+strings.SplitN(y, "---\n", 2)[0]), opts(nil)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestParse_SecretFileOverTheLimitIsRejectedWithoutReadingItAll(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "big")
+	if err := os.WriteFile(p, []byte(strings.Repeat("a", 70<<10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	y := "destinations:\n  - name: t\n    description: d\n    platform: telegram\n    chatId: \"-100123\"\n    tokenFile: " + p + "\n"
+	_, err := Parse([]byte(y), opts(nil))
+	if err == nil || !strings.Contains(err.Error(), "larger than 64 KiB") || strings.Contains(err.Error(), p) {
+		t.Fatalf("err = %v", err)
+	}
+}

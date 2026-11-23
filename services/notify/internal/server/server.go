@@ -26,7 +26,7 @@ type Deps struct {
 // Handler builds the full handler: /mcp, /healthz, /readyz.
 func Handler(d Deps) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version, Timeout: d.Cfg.RequestTimeout}))
+	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version, Timeout: d.Cfg.RequestTimeout, MaxRequestBytes: d.Cfg.MaxRequestBytes}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ok\n"))
@@ -88,6 +88,9 @@ func recoverer(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if v := recover(); v != nil {
+				if v == http.ErrAbortHandler {
+					panic(v) // net/http's way to abort a response; not a failure to log or answer
+				}
 				log.Error("panic in handler", "method", r.Method, "path", r.URL.Path, "panic", v)
 				http.Error(w, "internal error", http.StatusInternalServerError)
 			}

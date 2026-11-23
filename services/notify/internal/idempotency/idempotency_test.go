@@ -88,3 +88,23 @@ func TestBegin_FullOfInFlightRefusesNewKeys(t *testing.T) {
 		t.Fatalf("got %v, want Full", o)
 	}
 }
+
+func TestMarkUncertain_KeepsKeyHeldUntilWindowEnds(t *testing.T) {
+	c, clk := newCache(10)
+	c.Begin("k", "fp")
+	c.MarkUncertain("k", "partial 1 of 2")
+	if o, v := c.Begin("k", "fp"); o != Uncertain || v != "partial 1 of 2" {
+		t.Fatalf("got %v %q", o, v)
+	}
+	if o, _ := c.Begin("k", "other"); o != Mismatch {
+		t.Fatalf("different content = %v", o)
+	}
+	c.Abort("k") // Abort must not release a finished (uncertain) entry
+	if o, _ := c.Begin("k", "fp"); o != Uncertain {
+		t.Fatalf("after Abort = %v", o)
+	}
+	clk.t = clk.t.Add(11 * time.Minute)
+	if o, _ := c.Begin("k", "fp"); o != Miss {
+		t.Fatalf("after window = %v", o)
+	}
+}

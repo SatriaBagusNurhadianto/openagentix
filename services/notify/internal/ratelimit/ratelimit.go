@@ -20,12 +20,14 @@ func (b *bucket) refill(elapsed time.Duration) {
 	}
 }
 
-// wait is how long until one token is available (0 if one is).
-func (b *bucket) wait() time.Duration {
-	if b.tokens >= 1 {
+// wait is how long until n tokens are available (0 if they are). n is
+// clamped to the capacity, since more could never be available.
+func (b *bucket) wait(n float64) time.Duration {
+	n = min(n, b.capacity)
+	if b.tokens >= n {
 		return 0
 	}
-	need := 1 - b.tokens
+	need := n - b.tokens
 	return time.Duration(need / b.capacity * float64(b.per))
 }
 
@@ -56,7 +58,15 @@ func New(perMinute, perHour int, now func() time.Time) *Limiter {
 
 // Allow consumes one token from each window, or consumes nothing and returns
 // how long to wait before the next call can succeed.
-func (l *Limiter) Allow() (bool, time.Duration) {
+func (l *Limiter) Allow() (bool, time.Duration) { return l.AllowN(1) }
+
+// AllowN consumes n tokens from each window, all or nothing. A request for
+// more than a window's capacity is treated as a request for the whole
+// capacity, so it is admitted by a full bucket rather than refused forever.
+func (l *Limiter) AllowN(n int) (bool, time.Duration) {
+	if n < 1 {
+		n = 1
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	t := l.now()
@@ -67,13 +77,23 @@ func (l *Limiter) Allow() (bool, time.Duration) {
 		if elapsed > 0 {
 			b.refill(elapsed)
 		}
-		retry = max(retry, b.wait())
+		retry = max(retry, b.wait(float64(n)))
 	}
 	if retry > 0 {
 		return false, retry.Round(time.Millisecond)
 	}
 	for _, b := range l.buckets {
-		b.tokens--
+		b.tokens -= min(float64(n), b.capacity)
 	}
 	return true, 0
+}
+
+// Refund gives n tokens back to every window (up to capacity), for a call that
+// consumed them here but was then refused elsewhere.
+func (l *Limiter) Refund(n int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, b := range l.buckets {
+		b.tokens = min(b.capacity, b.tokens+float64(n))
+	}
 }

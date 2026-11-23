@@ -22,6 +22,11 @@ type Limits struct {
 // Ceiling for MaxTextChars (also enforced on per-destination overrides).
 const MaxTextCharsCeiling = 20000
 
+// DefaultMaxRequestBytes bounds one MCP request body: a message is at most a
+// few tens of KB, and the SDK default (4 MiB) would let junk calls pile up in
+// a small pod.
+const DefaultMaxRequestBytes = 64 << 10
+
 // Config holds all settings.
 type Config struct {
 	Addr           string
@@ -39,7 +44,15 @@ type Config struct {
 	IdempotencyWindow     time.Duration
 	IdempotencyMaxEntries int
 
+	// Caps across all destinations together; a multi-part Telegram message
+	// consumes one token per part.
+	GlobalRatePerMinute int
+	GlobalRatePerHour   int
+
 	MCPStateless bool
+
+	// MaxRequestBytes bounds one MCP HTTP request body.
+	MaxRequestBytes int64
 }
 
 // Load reads configuration using getenv (e.g. os.Getenv).
@@ -57,7 +70,10 @@ func Load(getenv func(string) string) (Config, error) {
 		SenderLabel:           "OpenAgentix agent",
 		IdempotencyWindow:     10 * time.Minute,
 		IdempotencyMaxEntries: 1000,
+		GlobalRatePerMinute:   30,
+		GlobalRatePerHour:     300,
 		MCPStateless:          true,
+		MaxRequestBytes:       DefaultMaxRequestBytes,
 	}
 	if v := getenv("NOTIFY_SENDER_LABEL"); v != "" {
 		c.SenderLabel = v
@@ -88,12 +104,19 @@ func Load(getenv func(string) string) (Config, error) {
 		{"NOTIFY_RATE_PER_MINUTE", &c.Limits.RatePerMinute},
 		{"NOTIFY_RATE_PER_HOUR", &c.Limits.RatePerHour},
 		{"NOTIFY_IDEMPOTENCY_MAX_ENTRIES", &c.IdempotencyMaxEntries},
+		{"NOTIFY_GLOBAL_RATE_PER_MINUTE", &c.GlobalRatePerMinute},
+		{"NOTIFY_GLOBAL_RATE_PER_HOUR", &c.GlobalRatePerHour},
 	}
 	for _, i := range ints {
 		if *i.dst, err = positiveInt(getenv, i.name, *i.dst); err != nil {
 			return c, err
 		}
 	}
+	reqBytes := int(c.MaxRequestBytes)
+	if reqBytes, err = positiveInt(getenv, "NOTIFY_MAX_REQUEST_BYTES", reqBytes); err != nil {
+		return c, err
+	}
+	c.MaxRequestBytes = int64(reqBytes)
 	if c.Limits.MaxTextChars > MaxTextCharsCeiling {
 		return c, fmt.Errorf("NOTIFY_MAX_TEXT_CHARS: %d exceeds the maximum of %d", c.Limits.MaxTextChars, MaxTextCharsCeiling)
 	}
@@ -122,8 +145,8 @@ func (c Config) LogAttrs() []any {
 	return []any{
 		"addr", c.Addr, "config_file_set", c.ConfigPath != "", "request_timeout", c.RequestTimeout.String(),
 		"outbound_timeout", c.OutboundTimeout.String(), "max_inflight", c.MaxInFlight,
-		"max_text_chars", c.Limits.MaxTextChars, "rate_per_minute", c.Limits.RatePerMinute, "rate_per_hour", c.Limits.RatePerHour,
-		"sender_label", c.SenderLabel, "idempotency_window", c.IdempotencyWindow.String(), "mcp_stateless", c.MCPStateless,
+		"max_text_chars", c.Limits.MaxTextChars, "rate_per_minute", c.Limits.RatePerMinute, "rate_per_hour", c.Limits.RatePerHour, "global_rate_per_minute", c.GlobalRatePerMinute, "global_rate_per_hour", c.GlobalRatePerHour,
+		"sender_label", c.SenderLabel, "idempotency_window", c.IdempotencyWindow.String(), "mcp_stateless", c.MCPStateless, "max_request_bytes", c.MaxRequestBytes,
 	}
 }
 

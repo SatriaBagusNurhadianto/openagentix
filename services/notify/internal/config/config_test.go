@@ -74,3 +74,31 @@ func TestLogAttrsOmitConfigPathContents(t *testing.T) {
 		t.Fatal("LogAttrs must be key/value pairs")
 	}
 }
+
+func TestLoad_GlobalRate(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil || c.GlobalRatePerMinute != 30 || c.GlobalRatePerHour != 300 {
+		t.Fatalf("defaults: %v %+v", err, c)
+	}
+	c, err = Load(env(map[string]string{"NOTIFY_GLOBAL_RATE_PER_MINUTE": "5", "NOTIFY_GLOBAL_RATE_PER_HOUR": "50"}))
+	if err != nil || c.GlobalRatePerMinute != 5 || c.GlobalRatePerHour != 50 {
+		t.Fatalf("override: %v %+v", err, c)
+	}
+	if _, err = Load(env(map[string]string{"NOTIFY_GLOBAL_RATE_PER_MINUTE": "0"})); err == nil {
+		t.Fatal("zero must be rejected")
+	}
+}
+
+func TestLoad_MaxRequestBytes(t *testing.T) {
+	c, err := Load(env(map[string]string{}))
+	if err != nil || c.MaxRequestBytes != 64<<10 {
+		t.Fatalf("default: %v %d", err, c.MaxRequestBytes)
+	}
+	c, err = Load(env(map[string]string{"NOTIFY_MAX_REQUEST_BYTES": "4096"}))
+	if err != nil || c.MaxRequestBytes != 4096 {
+		t.Fatalf("override: %v %d", err, c.MaxRequestBytes)
+	}
+	if _, err = Load(env(map[string]string{"NOTIFY_MAX_REQUEST_BYTES": "-1"})); err == nil {
+		t.Fatal("negative must be rejected")
+	}
+}

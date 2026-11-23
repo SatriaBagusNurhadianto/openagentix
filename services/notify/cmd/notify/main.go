@@ -62,6 +62,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	svc := notify.New(notify.Options{
 		Destinations: ds, Label: cfg.SenderLabel, MaxInFlight: cfg.MaxInFlight,
 		IdempotencyWindow: cfg.IdempotencyWindow, IdempotencyMaxEntries: cfg.IdempotencyMaxEntries, Log: log,
+		GlobalRatePerMinute: cfg.GlobalRatePerMinute, GlobalRatePerHour: cfg.GlobalRatePerHour,
 	})
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {

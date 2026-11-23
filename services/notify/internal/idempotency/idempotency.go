@@ -22,12 +22,16 @@ const (
 	Mismatch
 	// Full: every slot is held by an unfinished request.
 	Full
+	// Uncertain: an earlier request with this key and content may have been
+	// delivered (or only partly). It is not retried; the value describes it.
+	Uncertain
 )
 
 type entry[V any] struct {
 	fingerprint string
 	value       V
 	done        bool
+	uncertain   bool
 	at          time.Time
 }
 
@@ -70,6 +74,8 @@ func (c *Cache[V]) Begin(key, fingerprint string) (Outcome, V) {
 				return Mismatch, zero
 			case !e.done:
 				return InFlight, zero
+			case e.uncertain:
+				return Uncertain, e.value
 			default:
 				return Hit, e.value
 			}
@@ -111,6 +117,17 @@ func (c *Cache[V]) Commit(key string, v V) {
 	defer c.mu.Unlock()
 	if e, ok := c.entries[key]; ok {
 		e.value, e.done, e.at = v, true, c.now()
+	}
+}
+
+// MarkUncertain keeps the reservation after an attempt whose outcome is
+// unknown or partial: the key stays held for the window (counted from now) and
+// Begin reports Uncertain with v instead of letting another attempt through.
+func (c *Cache[V]) MarkUncertain(key string, v V) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.entries[key]; ok && !e.done {
+		e.value, e.done, e.uncertain, e.at = v, true, true, c.now()
 	}
 }
 

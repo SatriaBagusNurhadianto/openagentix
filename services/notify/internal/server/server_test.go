@@ -197,3 +197,58 @@ func TestGracefulShutdownDrainsInFlightRequests(t *testing.T) {
 		t.Fatal("server still accepting connections after shutdown")
 	}
 }
+
+func postMCP(h http.Handler, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("POST", "/mcp", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+func callBody(text string) string {
+	return `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"notify_send","arguments":{"destination":"ops","text":"` + text + `"}}}`
+}
+
+func TestMCPBodyOverTheLimitIsRejectedBeforeTheToolRuns(t *testing.T) {
+	s := &sender{}
+	for _, cfg := range []config.Config{{}, {MaxRequestBytes: 2048}} {
+		h := Handler(deps(s, cfg, io.Discard, true))
+		rec := postMCP(h, callBody(strings.Repeat("a", 200<<10)))
+		if rec.Code < 400 || rec.Code >= 500 {
+			t.Fatalf("cfg %+v: status %d body %.200s", cfg, rec.Code, rec.Body)
+		}
+	}
+	if s.calls.Load() != 0 {
+		t.Fatalf("tool ran %d times", s.calls.Load())
+	}
+}
+
+func TestMCPBodyUnderTheLimitStillWorks(t *testing.T) {
+	s := &sender{}
+	h := Handler(deps(s, config.Config{}, io.Discard, true))
+	rec := postMCP(h, callBody("hello"))
+	if rec.Code != 200 || s.calls.Load() != 1 {
+		t.Fatalf("status %d calls %d body %.200s", rec.Code, s.calls.Load(), rec.Body)
+	}
+}
+
+func TestRecoverer_RePanicsErrAbortHandler(t *testing.T) {
+	var logs bytes.Buffer
+	h := recoverer(slog.New(slog.NewJSONHandler(&logs, nil)), http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		panic(http.ErrAbortHandler)
+	}))
+	rec := httptest.NewRecorder()
+	var got any
+	func() {
+		defer func() { got = recover() }()
+		h.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	}()
+	if got != http.ErrAbortHandler {
+		t.Fatalf("recovered %v, want http.ErrAbortHandler re-panicked so net/http can abort the connection", got)
+	}
+	if rec.Code == http.StatusInternalServerError || strings.Contains(logs.String(), "panic in handler") {
+		t.Fatalf("an intentional abort must not be reported as a failure: status %d logs %s", rec.Code, logs.String())
+	}
+}

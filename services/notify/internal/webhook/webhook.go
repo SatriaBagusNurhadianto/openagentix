@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"time"
 
@@ -42,10 +43,22 @@ type Client struct {
 // New returns a Client. The URL must already have passed ValidateURL.
 func New(cfg Config) *Client { return &Client{url: cfg.URL, secret: cfg.Secret, http: cfg.HTTP} }
 
+// privateLiteral reports whether host is an IP literal that is loopback,
+// link-local or unspecified (IPv4-mapped IPv6 forms included). Hostnames are
+// not resolved here: DNS-based cases are the egress NetworkPolicy's job.
+func privateLiteral(host string) bool {
+	a, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	a = a.Unmap()
+	return a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsUnspecified()
+}
+
 // ValidateURL requires an absolute https URL (http only if allowInsecure, for
 // in-cluster receivers) with a host, no credentials and no fragment. Errors
 // never repeat the URL, which may itself be a secret.
-func ValidateURL(raw string, allowInsecure bool) error {
+func ValidateURL(raw string, allowInsecure, allowPrivate bool) error {
 	u, err := url.Parse(raw)
 	switch {
 	case raw == "":
@@ -63,6 +76,9 @@ func ValidateURL(raw string, allowInsecure bool) error {
 		return errors.New("url must not contain credentials")
 	case u.Fragment != "":
 		return errors.New("url must not contain a fragment")
+	}
+	if !allowPrivate && privateLiteral(u.Hostname()) {
+		return errors.New("url points at a loopback, link-local (for example cloud metadata) or unspecified address; set allowPrivateAddress: true only if that is really intended")
 	}
 	return nil
 }
@@ -83,7 +99,7 @@ func (c *Client) Send(ctx context.Context, m delivery.Message) error {
 	})
 	req, err := http.NewRequest(http.MethodPost, c.url, bytes.NewReader(body))
 	if err != nil {
-		return &delivery.Error{Kind: delivery.Upstream, Detail: "invalid webhook endpoint"}
+		return &delivery.Error{Kind: delivery.Upstream, Detail: "invalid webhook endpoint", Definite: true}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "openagentix-notify")
@@ -100,8 +116,8 @@ func (c *Client) Send(ctx context.Context, m delivery.Message) error {
 	case resp.Status >= 200 && resp.Status < 300:
 		return nil
 	case resp.Status == http.StatusTooManyRequests:
-		return &delivery.Error{Kind: delivery.RateLimited, Detail: "the webhook receiver rate limited the request", RetryAfter: httpx.RetryAfter(resp.Header.Get("Retry-After"))}
+		return &delivery.Error{Kind: delivery.RateLimited, Detail: "the webhook receiver rate limited the request", RetryAfter: httpx.RetryAfter(resp.Header.Get("Retry-After")), Definite: true}
 	default:
-		return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("the webhook receiver refused the message (HTTP %d)", resp.Status)}
+		return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("the webhook receiver refused the message (HTTP %d)", resp.Status), Definite: resp.Status >= 400 && resp.Status < 500}
 	}
 }

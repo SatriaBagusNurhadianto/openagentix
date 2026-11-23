@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -108,5 +109,91 @@ func TestRetryAfter_ParsesSecondsOnly(t *testing.T) {
 		if got := RetryAfter(in); got != want {
 			t.Errorf("RetryAfter(%q) = %v, want %v", in, got, want)
 		}
+	}
+}
+
+func TestDo_ConnectionRefusedIsDefiniteButOtherFailuresAreNot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close() // nothing listens: the dial is refused before anything is written
+	req, _ := http.NewRequest("POST", url, strings.NewReader("x"))
+	_, err := Do(context.Background(), NewClient(time.Second), req, 100)
+	var de *delivery.Error
+	if !errors.As(err, &de) || !de.Definite {
+		t.Fatalf("refused dial: err = %v", err)
+	}
+
+	// A connection that is reset after the request was written is not provably undelivered.
+	rst := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _, _ := w.(http.Hijacker).Hijack()
+		c.Close()
+	}))
+	defer rst.Close()
+	req, _ = http.NewRequest("POST", rst.URL, strings.NewReader("x"))
+	_, err = Do(context.Background(), NewClient(time.Second), req, 100)
+	if !errors.As(err, &de) || de.Definite {
+		t.Fatalf("reset after write: err = %v", err)
+	}
+}
+
+func TestNewClient_IgnoresProxyEnvironmentVariables(t *testing.T) {
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { proxied.Add(1) }))
+	defer proxy.Close()
+	for _, k := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"} {
+		t.Setenv(k, proxy.URL)
+	}
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
+
+	c := NewClient(time.Second)
+	tr, ok := c.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport is %T: the client falls back to http.DefaultTransport, which honours HTTP(S)_PROXY", c.Transport)
+	}
+	if tr.Proxy != nil {
+		// A public host is never exempt from the environment proxy (loopback is).
+		u, _ := tr.Proxy(&http.Request{URL: mustURL(t, "https://api.telegram.org/")})
+		t.Fatalf("transport would use proxy %v", u)
+	}
+	if tr.DialContext == nil || tr.TLSHandshakeTimeout <= 0 || tr.ResponseHeaderTimeout <= 0 || tr.IdleConnTimeout <= 0 || tr.MaxIdleConns <= 0 || tr.MaxConnsPerHost <= 0 {
+		t.Fatalf("transport lacks limits/timeouts: %+v", tr)
+	}
+	if tr.TLSClientConfig != nil && tr.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("TLS verification must stay on")
+	}
+	// Behaviour: a direct request still works and nothing reaches the proxy.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }))
+	defer target.Close()
+	req, _ := http.NewRequest("GET", target.URL, nil)
+	if _, err := Do(context.Background(), c, req, 100); err != nil || proxied.Load() != 0 {
+		t.Fatalf("err=%v proxied=%d", err, proxied.Load())
+	}
+}
+
+func mustURL(t *testing.T, s string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func TestRetryAfter_ClampsHugeAndRejectsNegativeValues(t *testing.T) {
+	for _, v := range []string{"9223372036854775807", "9999999999", "99999999999999", "-5", "-9223372036854775808"} {
+		d := RetryAfter(v)
+		if d < 0 || d > MaxRetryAfterWait {
+			t.Errorf("RetryAfter(%q) = %v, want within [0, %v]", v, d, MaxRetryAfterWait)
+		}
+	}
+	if RetryAfter("30") != 30*time.Second || RetryAfter("0") != 0 {
+		t.Fatal("ordinary values must be unchanged")
+	}
+	if got := Seconds(1 << 60); got != MaxRetryAfterWait {
+		t.Fatalf("Seconds(huge) = %v", got)
+	}
+	if got := Seconds(-3); got != 0 {
+		t.Fatalf("Seconds(-3) = %v", got)
 	}
 }

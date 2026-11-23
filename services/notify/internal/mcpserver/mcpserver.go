@@ -29,7 +29,13 @@ type Options struct {
 	// deadline to tool handlers, so the server-wide request timeout has to be
 	// applied here too; zero means no bound.
 	Timeout time.Duration
+	// MaxRequestBytes bounds one HTTP request body (the SDK default is 4 MiB).
+	// Zero means DefaultMaxRequestBytes.
+	MaxRequestBytes int64
 }
+
+// DefaultMaxRequestBytes is used when Options.MaxRequestBytes is zero.
+const DefaultMaxRequestBytes = 64 << 10
 
 // SendInput is the notify_send argument object. There is deliberately no field
 // for a chat id, channel, URL or credential: the destination name is the only
@@ -71,6 +77,9 @@ func New(svc *notify.Service, log *slog.Logger, opts Options) http.Handler {
 	if opts.Version == "" {
 		opts.Version = "dev"
 	}
+	if opts.MaxRequestBytes <= 0 {
+		opts.MaxRequestBytes = DefaultMaxRequestBytes
+	}
 	h := &handlers{svc: svc, timeout: opts.Timeout}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "openagentix-notify", Title: "OpenAgentix Notify", Version: opts.Version}, &mcp.ServerOptions{
 		Instructions: "Deliver a result to a pre-approved chat destination. Call notify_list_destinations to see the destination names, then notify_send with one of them. You cannot choose a chat, channel or URL: only the configured names work. Messages are marked as automated.",
@@ -86,9 +95,10 @@ func New(svc *notify.Service, log *slog.Logger, opts Options) http.Handler {
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
 	}, h.list)
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
-		Stateless:    opts.Stateless,
-		JSONResponse: true,
-		Logger:       log,
+		Stateless:           opts.Stateless,
+		JSONResponse:        true,
+		Logger:              log,
+		MaxRequestBodyBytes: opts.MaxRequestBytes,
 	})
 }
 

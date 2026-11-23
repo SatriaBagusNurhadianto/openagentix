@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/openagentix/openagentix/services/notify/internal/delivery"
@@ -66,9 +67,61 @@ func Compose(m delivery.Message) string {
 	return b.String()
 }
 
+// wordJoiner is invisible and has no width; between a trigger character and
+// the word after it, it stops Telegram from recognising a mention, command or
+// hashtag.
+const wordJoiner = "\u2060"
+
+// Neutralise stops Telegram turning agent text into pings and links. Telegram
+// auto-detects @username, /command and #hashtag in plain text, so a word
+// joiner (U+2060) is inserted after each such trigger character that starts a
+// token: at the start of the text or after anything that is not a letter,
+// digit or underscore, and followed by a letter, digit or underscore. That also
+// covers "://": the second slash of a scheme starts a token, so
+// "https://host" becomes "https://" + U+2060 + "host", which Telegram does
+// not link. Mid-word characters are untouched, so "a/b", "input/output" and
+// "100%" read as before; "/usr/bin" at the start of a word does gain one
+// invisible character.
+//
+// Residual risk, deliberately not handled to keep prose predictable: bare
+// domains ("example.com", "www.example.com"), e-mail addresses, phone numbers
+// and $cashtags can still be auto-linked by Telegram clients.
+func Neutralise(s string) string {
+	if !strings.ContainsAny(s, "@/#") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + 8)
+	var prev rune = -1
+	rs := []rune(s)
+	for i, r := range rs {
+		b.WriteRune(r)
+		if (r == '@' || r == '/' || r == '#') && !isWordRune(prev) && i+1 < len(rs) && isWordRune(rs[i+1]) {
+			b.WriteString(wordJoiner)
+		}
+		prev = r
+	}
+	return b.String()
+}
+
+func isWordRune(r rune) bool {
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// parts is what Send will post: the message neutralised (after cleaning, before
+// splitting, so the added characters count toward the UTF-16 limit; the
+// operator's header is left alone) and split to fit.
+func (c *Client) parts(m delivery.Message) []string {
+	m.Title, m.Text = Neutralise(m.Title), Neutralise(m.Text)
+	return Split(Compose(m), MaxMessageUnits)
+}
+
+// Parts reports how many requests Send will make for m.
+func (c *Client) Parts(m delivery.Message) int { return len(c.parts(m)) }
+
 // Send posts the message, split into several parts if it exceeds the limit.
 func (c *Client) Send(ctx context.Context, m delivery.Message) error {
-	parts := Split(Compose(m), MaxMessageUnits)
+	parts := c.parts(m)
 	for i, part := range parts {
 		if err := c.sendPart(ctx, part); err != nil {
 			if de, ok := err.(*delivery.Error); ok {
@@ -102,13 +155,14 @@ func (c *Client) sendPart(ctx context.Context, text string) error {
 				}
 				continue
 			}
-			return &delivery.Error{Kind: delivery.RateLimited, Detail: "telegram rate limited the request", RetryAfter: res.retryAfter}
+			return &delivery.Error{Kind: delivery.RateLimited, Detail: "telegram rate limited the request", RetryAfter: res.retryAfter, Definite: true}
 		default:
 			code := res.status
 			if res.errorCode != 0 {
 				code = res.errorCode
 			}
-			return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("telegram refused the message (HTTP %d)", code)}
+			// 4xx: Telegram refused it. 5xx may still have accepted it.
+			return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("telegram refused the message (HTTP %d)", code), Definite: code >= 400 && code < 500}
 		}
 	}
 }
@@ -121,7 +175,7 @@ func (c *Client) post(ctx context.Context, text string) (apiResult, error) {
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base+"/bot"+c.token+"/sendMessage", bytes.NewReader(body))
 	if err != nil {
-		return apiResult{}, &delivery.Error{Kind: delivery.Upstream, Detail: "invalid telegram endpoint"}
+		return apiResult{}, &delivery.Error{Kind: delivery.Upstream, Detail: "invalid telegram endpoint", Definite: true}
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpx.Do(ctx, c.http, req, maxResponseBytes)
@@ -132,7 +186,7 @@ func (c *Client) post(ctx context.Context, text string) (apiResult, error) {
 		OK         bool `json:"ok"`
 		ErrorCode  int  `json:"error_code"`
 		Parameters struct {
-			RetryAfter int `json:"retry_after"`
+			RetryAfter int64 `json:"retry_after"`
 		} `json:"parameters"`
 	}
 	res := apiResult{status: resp.Status}
@@ -148,7 +202,7 @@ func (c *Client) post(ctx context.Context, text string) (apiResult, error) {
 			res.errorCode = resp.Status
 		}
 	}
-	res.retryAfter = time.Duration(env.Parameters.RetryAfter) * time.Second
+	res.retryAfter = httpx.Seconds(env.Parameters.RetryAfter)
 	if res.retryAfter == 0 {
 		res.retryAfter = httpx.RetryAfter(resp.Header.Get("Retry-After"))
 	}

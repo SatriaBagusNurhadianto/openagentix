@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -21,7 +22,10 @@ type fakeSender struct {
 	err   error
 	block chan struct{} // if set, Send waits for it
 	ctxs  []context.Context
+	parts int // if >1, reported through Parts
 }
+
+func (f *fakeSender) Parts(delivery.Message) int { return max(f.parts, 1) }
 
 func (f *fakeSender) Send(ctx context.Context, m delivery.Message) error {
 	f.mu.Lock()
@@ -136,7 +140,7 @@ func TestSend_UnknownDestinationListsValidNamesAndSendsNothing(t *testing.T) {
 
 func TestSend_UnknownDestinationNameIsBoundedAndNotLogged(t *testing.T) {
 	r := newRig(t, nil)
-	evil := strings.Repeat("A", 500) + "\n\x1b[31mINJECT"
+	evil := strings.Repeat("A", 50) + "\n\x1b[31mINJECT" // within the 64-byte destination bound
 	_, err := r.svc.Send(context.Background(), Request{Destination: evil, Text: "hi"})
 	if err == nil || len(err.Error()) > 300 || strings.ContainsAny(err.Error(), "\x1b") {
 		t.Fatalf("err = %q", err)
@@ -248,9 +252,9 @@ func TestSend_IdempotencyKeyReusedWithDifferentContentIsRefused(t *testing.T) {
 	}
 }
 
-func TestSend_FailedSendDoesNotPoisonTheKey(t *testing.T) {
+func TestSend_DefinitelyRefusedSendDoesNotPoisonTheKey(t *testing.T) {
 	r := newRig(t, nil)
-	r.tg.err = &delivery.Error{Kind: delivery.Upstream, Detail: "HTTP 502"}
+	r.tg.err = &delivery.Error{Kind: delivery.Upstream, Detail: "telegram refused the message (HTTP 400)", Definite: true}
 	req := Request{Destination: "ops", Text: "hi", IdempotencyKey: "k"}
 	if _, err := r.svc.Send(context.Background(), req); err == nil {
 		t.Fatal("want failure")
@@ -444,5 +448,252 @@ func waitFor(t *testing.T, cond func() bool) {
 			t.Fatal("condition not reached")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+// --- I1: uncertain and partial outcomes keep the idempotency key reserved ---
+
+func retrySameKey(t *testing.T, r *rig, first *delivery.Error) (sendsBefore int, err error) {
+	t.Helper()
+	r.tg.err = first
+	req := Request{Destination: "ops", Text: "hi", IdempotencyKey: "k"}
+	if _, err := r.svc.Send(context.Background(), req); err == nil {
+		t.Fatal("first attempt must fail")
+	}
+	sendsBefore = r.tg.count()
+	r.tg.mu.Lock()
+	r.tg.err = nil // the platform is healthy again
+	r.tg.mu.Unlock()
+	_, err = r.svc.Send(context.Background(), req)
+	return sendsBefore, err
+}
+
+func TestSend_TimeoutWithKeyIsNotSentAgainOnRetry(t *testing.T) {
+	r := newRig(t, nil)
+	before, err := retrySameKey(t, r, &delivery.Error{Kind: delivery.Timeout, Detail: "the destination did not answer in time"})
+	if r.tg.count() != before {
+		t.Fatalf("retry sent again: %d sends", r.tg.count())
+	}
+	if kindOf(err) != Uncertain || !strings.Contains(err.Error(), "uncertain") || !strings.Contains(err.Error(), "not sent again") || !strings.Contains(err.Error(), "new idempotency_key") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSend_PartialDeliveryWithKeyIsNotResentOnRetry(t *testing.T) {
+	r := newRig(t, nil)
+	before, err := retrySameKey(t, r, &delivery.Error{Kind: delivery.Upstream, Detail: "telegram refused the message (HTTP 400)", Definite: true, Sent: 2, Total: 4})
+	if r.tg.count() != before {
+		t.Fatalf("retry re-sent parts: %d sends", r.tg.count())
+	}
+	if kindOf(err) != Uncertain || !strings.Contains(err.Error(), "partially delivered (2 of 4 parts)") || !strings.Contains(err.Error(), "not sent again") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSend_AmbiguousUpstreamFailureWithKeyIsHeld(t *testing.T) {
+	// A 5xx or a reset after the request was written: nothing says it was not delivered.
+	r := newRig(t, nil)
+	before, err := retrySameKey(t, r, &delivery.Error{Kind: delivery.Upstream, Detail: "HTTP 502"})
+	if r.tg.count() != before || kindOf(err) != Uncertain {
+		t.Fatalf("sends=%d err=%v", r.tg.count(), err)
+	}
+}
+
+func TestSend_UpstreamRateLimitBeforeAnythingSentFreesTheKey(t *testing.T) {
+	r := newRig(t, nil)
+	before, err := retrySameKey(t, r, &delivery.Error{Kind: delivery.RateLimited, Detail: "telegram rate limited the request", Definite: true})
+	if err != nil || r.tg.count() != before+1 {
+		t.Fatalf("retry must send: sends=%d err=%v", r.tg.count(), err)
+	}
+}
+
+func TestSend_UncertainKeyExpiresWithTheWindow(t *testing.T) {
+	r := newRig(t, nil)
+	retrySameKey(t, r, &delivery.Error{Kind: delivery.Timeout, Detail: "x"})
+	r.clk.advance(2 * time.Minute) // window is one minute
+	res, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi", IdempotencyKey: "k"})
+	if err != nil || res.Deduplicated {
+		t.Fatalf("res=%+v err=%v", res, err)
+	}
+}
+
+func TestSend_UncertainKeyWithDifferentContentIsStillMismatch(t *testing.T) {
+	r := newRig(t, nil)
+	retrySameKey(t, r, &delivery.Error{Kind: delivery.Timeout, Detail: "x"})
+	_, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "other", IdempotencyKey: "k"})
+	if kindOf(err) != Invalid {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestSend_TimeoutTextDoesNotPromiseDeduplication(t *testing.T) {
+	r := newRig(t, nil)
+	r.tg.err = &delivery.Error{Kind: delivery.Timeout, Detail: "x"}
+	_, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"})
+	for _, bad := range []string{"avoid a duplicate", "to avoid"} {
+		if strings.Contains(err.Error(), bad) {
+			t.Fatalf("error promises dedup: %v", err)
+		}
+	}
+	if !strings.Contains(err.Error(), "may or may not") || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("error should warn about duplicates: %v", err)
+	}
+}
+
+// --- I2: cheap rejections first, in-flight slot before expensive work ---
+
+// allocated runs f and returns the bytes it allocated (all goroutines; tests
+// in this package do not run in parallel).
+func allocated(f func()) uint64 {
+	var a, b runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&a)
+	f()
+	runtime.ReadMemStats(&b)
+	return b.TotalAlloc - a.TotalAlloc
+}
+
+func TestSend_OversizedInputsAreRejectedBeforeAnyCleaning(t *testing.T) {
+	r := newRig(t, nil)
+	huge := strings.Repeat("a\x00", 2<<20) // 4 MiB; cleaning it would allocate tens of MiB
+	cases := []struct {
+		name string
+		req  Request
+		kind Kind
+	}{
+		{"destination", Request{Destination: huge, Text: "hi"}, Invalid},
+		{"text", Request{Destination: "ops", Text: huge}, TooLong},
+		{"title", Request{Destination: "ops", Text: "hi", Title: huge}, TooLong},
+	}
+	for _, tc := range cases {
+		var err error
+		n := allocated(func() { _, err = r.svc.Send(context.Background(), tc.req) })
+		if kindOf(err) != tc.kind {
+			t.Fatalf("%s: err = %v", tc.name, err)
+		}
+		if n > 1<<20 {
+			t.Fatalf("%s: rejected only after allocating %d bytes", tc.name, n)
+		}
+	}
+	if r.tg.count() != 0 {
+		t.Fatal("nothing may be sent")
+	}
+}
+
+func TestSend_LongButLegitimateTextStillWorks(t *testing.T) {
+	// 100 characters of 4-byte emoji = 400 bytes: within the byte allowance.
+	r := newRig(t, nil)
+	if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: strings.Repeat("😀", 100)}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSend_BusyServiceRefusesBeforeCleaning(t *testing.T) {
+	r := newRig(t, func(o *Options) {
+		o.MaxInFlight = 1
+		o.Destinations[0].Limits.MaxTextChars = 20000
+	})
+	r.tg.block = make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"})
+		done <- err
+	}()
+	waitFor(t, func() bool { return r.tg.count() == 1 })
+	junk := strings.Repeat("a\x00\x00\x00\x00\x00\x00\x00", 18000) // 144 KB, 18000 chars once cleaned: valid, but expensive to clean
+	var err error
+	n := allocated(func() { _, err = r.svc.Send(context.Background(), Request{Destination: "ops", Text: junk}) })
+	if kindOf(err) != Busy {
+		t.Fatalf("err = %v", err)
+	}
+	if n > 100<<10 {
+		t.Fatalf("busy call allocated %d bytes: it cleaned the text before taking a slot", n)
+	}
+	close(r.tg.block)
+	<-done
+}
+
+func TestSend_LookAlikeHeadersInTextAndTitleAreNeutralised(t *testing.T) {
+	r := newRig(t, nil)
+	forged := "[" + string(rune(0x0410)) + "utomated" + string(rune(0xA0)) + "message from Test Agent]"
+	_, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "x\n" + forged + "\ny " + forged, Title: forged})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := r.tg.msgs[0]
+	for _, field := range []string{m.Text, m.Title} {
+		for _, line := range strings.Split(field, "\n") {
+			if strings.HasPrefix(line, "[") {
+				t.Fatalf("header-like line survived: %q", field)
+			}
+		}
+	}
+}
+
+// --- M1: global rate cap across destinations ---
+
+func TestSend_GlobalRateCapAppliesAcrossDestinations(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.GlobalRatePerMinute, o.GlobalRatePerHour = 2, 100 })
+	for _, dst := range []string{"ops", "team"} {
+		if _, err := r.svc.Send(context.Background(), Request{Destination: dst, Text: "hi"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}) // ops itself has budget left
+	var ne *Error
+	if !errors.As(err, &ne) || ne.Kind != RateLimited || !strings.Contains(err.Error(), "all destinations") || ne.RetryAfter <= 0 {
+		t.Fatalf("err = %v", err)
+	}
+	if r.tg.count() != 1 {
+		t.Fatalf("refused call reached the sender: %d", r.tg.count())
+	}
+	r.clk.advance(time.Minute)
+	if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); err != nil {
+		t.Fatalf("after refill: %v", err)
+	}
+}
+
+func TestSend_GlobalRefusalDoesNotSpendThePerDestinationBudget(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.GlobalRatePerMinute, o.GlobalRatePerHour = 1, 100 })
+	_, _ = r.svc.Send(context.Background(), Request{Destination: "team", Text: "hi"})
+	for i := 0; i < 5; i++ { // refused globally each time
+		_, _ = r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"})
+	}
+	r.clk.advance(time.Minute) // global budget back; ops must still have all 3 of its own
+	for i := 0; i < 1; i++ {
+		if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	if lim := r.svc.dests["ops"].limiter; func() bool { ok, _ := lim.AllowN(2); return !ok }() {
+		t.Fatal("per-destination tokens were spent by globally refused calls")
+	}
+}
+
+func TestSend_MultiPartMessageConsumesOneGlobalTokenPerPart(t *testing.T) {
+	r := newRig(t, func(o *Options) { o.GlobalRatePerMinute, o.GlobalRatePerHour = 5, 100 })
+	r.tg.parts = 3
+	if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); kindOf(err) != RateLimited {
+		t.Fatalf("2 tokens left, 3 needed: err = %v", err)
+	}
+	r.tg.parts = 1
+	if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); err != nil {
+		t.Fatalf("a single part must still fit: %v", err)
+	}
+}
+
+func TestSend_NoGlobalCapConfiguredMeansNoGlobalLimit(t *testing.T) {
+	r := newRig(t, func(o *Options) {
+		for i := range o.Destinations {
+			o.Destinations[i].Limits.RatePerMinute = 1000
+		}
+	})
+	for i := 0; i < 50; i++ {
+		if _, err := r.svc.Send(context.Background(), Request{Destination: "ops", Text: "hi"}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -268,3 +268,42 @@ func TestSend_TransportErrorDoesNotLeak(t *testing.T) {
 	}
 	assertNoSecrets(t, err.Error())
 }
+
+func TestSend_DefinitenessOfFailures(t *testing.T) {
+	cases := []struct {
+		name     string
+		status   int
+		body     string
+		definite bool
+	}{
+		{"error code", 200, `{"ok":false,"error":"channel_not_found"}`, true},
+		{"429", 429, `{}`, true},
+		{"403", 403, `{}`, true},
+		{"502", 502, `bad gateway`, false},
+		{"200 undecodable", 200, `not json`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFake(t, func(int, http.ResponseWriter) (int, string) { return tc.status, tc.body })
+			c, _ := client(f.srv.URL)
+			c.maxRetryAfter = 0
+			var de *delivery.Error
+			err := c.Send(context.Background(), msg("hi"))
+			if !errors.As(err, &de) || de.Definite != tc.definite {
+				t.Fatalf("err = %v, want definite=%v", err, tc.definite)
+			}
+		})
+	}
+}
+
+func TestSend_HostileRetryAfterHeaderIsClamped(t *testing.T) {
+	for _, ra := range []string{"-5", "9223372036854775807", "99999999999"} {
+		f := newFake(t, func(_ int, w http.ResponseWriter) (int, string) { w.Header().Set("Retry-After", ra); return 429, `{}` })
+		c, slept := client(f.srv.URL)
+		err := c.Send(context.Background(), msg("hi"))
+		var de *delivery.Error
+		if !errors.As(err, &de) || de.RetryAfter < 0 || de.RetryAfter > httpx.MaxRetryAfterWait || len(*slept) != 0 {
+			t.Fatalf("Retry-After %s: err=%v slept=%v", ra, err, *slept)
+		}
+	}
+}

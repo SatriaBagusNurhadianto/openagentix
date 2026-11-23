@@ -84,11 +84,11 @@ func (c *Client) Send(ctx context.Context, m delivery.Message) error {
 				}
 				continue
 			}
-			return &delivery.Error{Kind: delivery.RateLimited, Detail: "slack rate limited the request", RetryAfter: retry}
+			return &delivery.Error{Kind: delivery.RateLimited, Detail: "slack rate limited the request", RetryAfter: retry, Definite: true}
 		case code != "":
-			return &delivery.Error{Kind: delivery.Upstream, Detail: "slack error: " + code}
+			return &delivery.Error{Kind: delivery.Upstream, Detail: "slack error: " + code, Definite: true}
 		default:
-			return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("slack refused the message (HTTP %d)", status)}
+			return &delivery.Error{Kind: delivery.Upstream, Detail: fmt.Sprintf("slack refused the message (HTTP %d)", status), Definite: status >= 400 && status < 500}
 		}
 	}
 }
@@ -102,7 +102,7 @@ func (c *Client) post(ctx context.Context, text string) (int, string, time.Durat
 	})
 	req, err := http.NewRequest(http.MethodPost, c.base+"/api/chat.postMessage", bytes.NewReader(body))
 	if err != nil {
-		return 0, "", 0, &delivery.Error{Kind: delivery.Upstream, Detail: "invalid slack endpoint"}
+		return 0, "", 0, &delivery.Error{Kind: delivery.Upstream, Detail: "invalid slack endpoint", Definite: true}
 	}
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 	req.Header.Set("Authorization", "Bearer "+c.token)

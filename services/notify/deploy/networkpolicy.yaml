@@ -6,7 +6,11 @@
 # (Calico, Cilium, ...). On a CNI that does not (e.g. plain kindnet/flannel)
 # these objects are accepted and silently do nothing.
 #
-# Ingress: only namespace mcp-tools, only the MCP port. Kubelet probes
+# Ingress: only the virtual MCP gateway pods in namespace mcp-tools (the same
+# selector charts/openagentix/templates/knowledge.yaml uses for the kb: label
+# app=virtualmcpserver plus toolhive-name=<mcp.virtual.name>; "tools" is the
+# chart default, change it here if you set mcp.virtual.name differently), only
+# the MCP port. Other pods in mcp-tools are NOT admitted. Kubelet probes
 # originate on the node and are allowed by CNIs that enforce policy; if yours
 # blocks them, add an ipBlock for the node CIDR.
 #
@@ -17,6 +21,18 @@
 # Telegram/Slack hostnames use an FQDN-aware policy (Cilium toFQDNs, Calico
 # DNS policy) or an egress proxy. In-cluster http webhook receivers
 # (allowInsecureHTTP) need an extra egress rule of your own.
+#
+# DNS: the rule below admits the kube-dns pods only. With NodeLocal DNSCache the
+# pod asks a link-local address on its own node (commonly 169.254.20.10), which
+# this policy blocks (169.254.0.0/16 is excluded on purpose, it holds cloud
+# metadata); add a /32 ipBlock for that exact address on UDP/TCP 53 if you run it.
+# Names that resolve only through DNS are the one thing this policy cannot
+# police: a webhook hostname that resolves to a public address is allowed.
+#
+# IPv6: the egress rule is IPv4 only (0.0.0.0/0). On a dual-stack or IPv6
+# cluster egress to public IPv6 addresses is therefore denied (fails closed).
+# If you need it, add an ::/0 ipBlock that excepts fc00::/7 and fe80::/10; the
+# service itself rejects loopback and link-local webhook IP literals at load.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -30,6 +46,8 @@ spec:
     - from:
         - namespaceSelector:
             matchLabels: {kubernetes.io/metadata.name: mcp-tools}
+          podSelector:
+            matchLabels: {app: virtualmcpserver, toolhive-name: tools}
       ports:
         - {protocol: TCP, port: 8080}
 ---

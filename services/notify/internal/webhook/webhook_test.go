@@ -183,12 +183,53 @@ func TestValidateURL(t *testing.T) {
 		{"", false, false},
 	}
 	for _, c := range cases {
-		err := ValidateURL(c.url, c.allow)
+		err := ValidateURL(c.url, c.allow, false)
 		if (err == nil) != c.ok {
 			t.Errorf("ValidateURL(%q, %v) err=%v, want ok=%v", c.url, c.allow, err, c.ok)
 		}
 		if err != nil && c.url != "" && strings.Contains(err.Error(), c.url) {
 			t.Errorf("validation error echoes the URL: %v", err)
+		}
+	}
+}
+
+func TestSend_DefinitenessOfFailures(t *testing.T) {
+	for status, want := range map[int]bool{400: true, 404: true, 429: true, 500: false, 502: false, 302: false} {
+		srv, _ := capture(t, status, "")
+		var de *delivery.Error
+		err := client(srv.URL, "").Send(context.Background(), msg())
+		if !errors.As(err, &de) || de.Definite != want {
+			t.Fatalf("status %d: err = %v, want definite=%v", status, err, want)
+		}
+	}
+}
+
+func TestValidateURL_PrivateAddressLiterals(t *testing.T) {
+	blocked := []string{
+		"https://127.0.0.1/x", "https://127.1.2.3:8443/x", "https://[::1]/x", "https://[::ffff:127.0.0.1]/x",
+		"https://169.254.169.254/latest/meta-data", "https://169.254.0.1/x", "https://[fe80::1]/x", "https://[fe80::1%25eth0]/x",
+		"https://0.0.0.0/x", "https://[::]/x", "https://[::ffff:169.254.169.254]/x",
+	}
+	for _, u := range blocked {
+		err := ValidateURL(u, true, false)
+		if err == nil || !strings.Contains(err.Error(), "allowPrivateAddress") {
+			t.Errorf("ValidateURL(%q) err=%v, want it refused and naming allowPrivateAddress", u, err)
+		}
+		if err != nil && (strings.Contains(err.Error(), "169.254") || strings.Contains(err.Error(), "127.")) {
+			t.Errorf("error echoes the address: %v", err)
+		}
+		if err := ValidateURL(u, true, true); err != nil {
+			t.Errorf("ValidateURL(%q, allowPrivate) = %v", u, err)
+		}
+	}
+	allowed := []string{
+		"https://hooks.example.com/x", "https://203.0.113.7/x", "https://[2001:db8::1]/x",
+		"https://10.1.2.3/x", // private ranges other than loopback/link-local are the NetworkPolicy's business
+		"https://localhost.example.com/x",
+	}
+	for _, u := range allowed {
+		if err := ValidateURL(u, true, false); err != nil {
+			t.Errorf("ValidateURL(%q) = %v", u, err)
 		}
 	}
 }

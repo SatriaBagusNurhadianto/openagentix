@@ -105,3 +105,49 @@ func TestAllow_ConcurrentCallsNeverExceedBurst(t *testing.T) {
 		t.Fatalf("allowed = %d, want 10", allowed)
 	}
 }
+
+func TestAllowN_ConsumesNTokensAtomically(t *testing.T) {
+	c := newClock()
+	l := New(5, 100, c.now)
+	if ok, _ := l.AllowN(3); !ok {
+		t.Fatal("3 of 5 must pass")
+	}
+	ok, retry := l.AllowN(3) // only 2 left: refuse and consume nothing
+	if ok || retry <= 0 {
+		t.Fatalf("ok=%v retry=%v", ok, retry)
+	}
+	if ok, _ := l.AllowN(2); !ok {
+		t.Fatal("the refused call must not have consumed anything")
+	}
+}
+
+func TestAllowN_MoreThanCapacityIsClampedNotStuck(t *testing.T) {
+	c := newClock()
+	l := New(5, 100, c.now)
+	if ok, _ := l.AllowN(50); !ok {
+		t.Fatal("a full bucket must admit an oversized request as a whole bucket")
+	}
+	if ok, retry := l.AllowN(50); ok || retry > time.Minute {
+		t.Fatalf("ok=%v retry=%v", ok, retry)
+	}
+}
+
+func TestRefund_GivesTokensBackUpToCapacity(t *testing.T) {
+	c := newClock()
+	l := New(2, 100, c.now)
+	l.Allow()
+	l.Allow()
+	l.Refund(1)
+	if ok, _ := l.Allow(); !ok {
+		t.Fatal("refunded token must be usable")
+	}
+	l.Refund(50)
+	for i := 0; i < 2; i++ {
+		if ok, _ := l.Allow(); !ok {
+			t.Fatalf("call %d", i)
+		}
+	}
+	if ok, _ := l.Allow(); ok {
+		t.Fatal("refund must not exceed capacity")
+	}
+}

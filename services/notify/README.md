@@ -25,7 +25,7 @@ One binary (`cmd/notify`), one port (default `:8080`):
 ## Security: read this first
 
 **The MCP endpoint has no authentication.** It trusts whoever can reach the port. The ToolHive gateway in front of it
-authenticates agents, and `deploy/networkpolicy.yaml` admits only the `mcp-tools` namespace. Do not expose the Service
+authenticates agents, and `deploy/networkpolicy.yaml` admits only the virtual MCP gateway pods (label `app=virtualmcpserver`, `toolhive-name=tools`, the same selector the knowledge base uses) in the `mcp-tools` namespace. Do not expose the Service
 through an Ingress or LoadBalancer. NetworkPolicy only works if your CNI enforces it (Calico, Cilium, ...); on plain
 kindnet or flannel it is silently ignored and the port is open to the whole cluster.
 
@@ -34,13 +34,18 @@ kindnet or flannel it is silently ignored and the port is open to the whole clus
 | Who or what | What could go wrong | What stops it |
 | --- | --- | --- |
 | A prompt-injected agent | Messages a stranger, a customer, or a public channel | Tool arguments only contain a destination **name**. Names map to ids in a config file the agent cannot read or write. There is no argument for a chat id, channel or URL, the schema rejects unknown arguments, and a test checks that nothing an agent sends reaches the upstream request except as message text. |
-| A prompt-injected agent | Spams a chat | Per-destination rate limit (default 6 per minute, 60 per hour), a text length limit, and a global in-flight cap. |
-| A prompt-injected agent | Pings everyone (`@channel`) or fakes a link or sender | Slack: `&`, `<`, `>` are escaped, so `<!channel>`, `<@U...>` and `<url\|label>` show as literal text; Slack markup, link names and unfurling are switched off. Telegram: plain text, no `parse_mode`. Every message starts with a fixed line `[Automated message from <label>]`, and the same line inside agent text is rewritten so it cannot be forged. |
-| A prompt-injected agent | Hides content with control or bidi characters | Control characters and bidirectional overrides are stripped; text is data and is never interpreted. |
+| A prompt-injected agent | Spams a chat | Per-destination rate limit (default 6 per minute, 60 per hour), a global rate cap across all destinations (default 30 per minute, 300 per hour; a multi-part Telegram message costs one token per part), a text length limit, and an in-flight cap. |
+| A prompt-injected agent | Exhausts memory or CPU with huge arguments | The MCP request body is capped (`NOTIFY_MAX_REQUEST_BYTES`, default 64 KiB). Destination, title and text are length-checked on raw bytes before any cleaning, and the in-flight slot is taken before anything that scales with the input. |
+| A prompt-injected agent | Pings everyone (`@channel`) or fakes a link or sender | Slack: `&`, `<`, `>` are escaped, so `<!channel>`, `<@U...>` and `<url\|label>` show as literal text; Slack markup, link names and unfurling are switched off. Telegram: plain text, no `parse_mode`, and an invisible word joiner (U+2060) is inserted after a leading `@`, `/` or `#` so mentions, bot commands, hashtags and `scheme://` links are not recognised (see "Telegram auto-linking" below for what remains). Every message starts with a fixed line `[Automated message from <label>]`; a line in agent text that, after normalisation, starts like that header (any case, odd spaces, zero-width characters, full-width letters, common Cyrillic or Greek look-alikes, or simply `[automated...`) is rewritten so it cannot pass as the header. Confusable coverage is best-effort, not complete. |
+| A prompt-injected agent | Hides content with control, bidi or invisible characters | Control characters, bidirectional overrides, U+2028/U+2029, soft hyphen, word joiner, zero-width space and non-joiner, interlinear annotation marks and the whole tag block (U+E0000 to U+E007F, a known channel for hidden ASCII) are stripped. The zero-width joiner is kept only between emoji. Text is data and is never interpreted. |
 | Anyone who can reach the port | Sends as the bot | There is no auth here by design: network policy plus the gateway are the control. |
 | A log reader | Learns tokens, chat ids, URLs or message content | Logs carry destination name, platform, outcome, sizes and durations only. Error text returned to agents carries no ids, URLs or tokens, and Go's transport errors (which embed the Telegram token in the URL) are replaced by fixed phrases. Tests assert this on captured log output. |
 | A bad config | Silently sends somewhere wrong | The file is validated at startup (unknown fields, bad names, bad ids and non-https URLs are rejected, and typos like `chatID` fail). Nothing secret may be written inline: tokens come from an env var or a file only. |
 | A webhook receiver that redirects | Leaks the body or signature to another host | Redirects are never followed. |
+| A mistaken or hostile config | Points a webhook at the node, the loopback or cloud metadata (`169.254.169.254`) | A webhook URL whose host is an IP literal that is loopback, link-local or unspecified is rejected at load unless that destination sets `allowPrivateAddress: true`. Hostnames are not resolved at load; the egress NetworkPolicy is the control for DNS-based cases. |
+| The environment | Routes outbound calls through a proxy | The HTTP clients ignore `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY`; they have their own transport with dial, TLS and header timeouts and connection limits. |
+
+Telegram auto-linking, residual risk: bare domains (`example.com`), e-mail addresses, phone numbers and `$cashtags` are not touched, to keep ordinary prose readable, so Telegram clients may still make them tappable. `@` mentions, `/commands`, `#hashtags` and `scheme://` URLs are neutralised.
 
 Out of scope: preventing a legitimate agent from sending a misleading message to an allowed destination. The header
 tells recipients it was automated; the content is the agent's.
@@ -100,16 +105,17 @@ destinations:
     url: https://hooks.example.com/notify/abc123   # https only
     # allowInsecureHTTP: true     # opt in to http:// for an in-cluster receiver
     secretEnv: NOTIFY_AUDIT_SECRET    # optional: enables the HMAC signature header (or secretFile)
+    # allowPrivateAddress: true   # opt in to a loopback, link-local or unspecified IP literal in the url
 ```
 
 All ids, URLs and secrets above are fake. Fields that do not belong to a platform (for example `channel` on a Telegram
-destination) are rejected. Unknown fields are rejected. At most 100 destinations.
+destination) are rejected. Unknown fields are rejected, and so is a file with more than one YAML document. At most 100 destinations. A `tokenFile` or `secretFile` larger than 64 KiB is rejected.
 
 ### Platform behaviour
 
 | Platform | Request | Notes |
 | --- | --- | --- |
-| telegram | `POST /bot<token>/sendMessage` with `chat_id` and `text` | Plain text, no `parse_mode`, link previews off. Text is split at 4096 UTF-16 code units (emoji count as two), preferring a newline or space in the second half of a part, never inside a character. On `429` the service waits `retry_after` once per part if it is at most `NOTIFY_MAX_RETRY_AFTER`. If a later part fails the error says how many parts were delivered. Telegram's error description is not relayed. |
+| telegram | `POST /bot<token>/sendMessage` with `chat_id` and `text` | Plain text, no `parse_mode`, link previews off. Mentions, commands and hashtags are neutralised first (the added U+2060 characters count toward the limit), then the text is split at 4096 UTF-16 code units (emoji count as two), preferring a newline or space in the second half of a part (that one space or newline is the only thing dropped at a break), never inside a character. On `429` the service waits `retry_after` once per part if it is at most `NOTIFY_MAX_RETRY_AFTER`. If a later part fails the error says how many parts were delivered. Telegram's error description is not relayed. |
 | slack | `POST /api/chat.postMessage` with `Authorization: Bearer` | `mrkdwn`, `link_names`, `unfurl_links` and `unfurl_media` are all `false`; `&`, `<`, `>` escaped. `429` handled like Telegram using `Retry-After`. Only Slack's `error` code (for example `channel_not_found`) is relayed, and only if it looks like a code. |
 | webhook | `POST` JSON `{"title","text","destination","sent_at"}` | `text` starts with the automated-message header. 2xx is success; `429` is reported as rate limited; no retries, no redirects, response capped at 64 KiB (a larger response is an error). With a secret, header `X-Notify-Signature: sha256=<hex HMAC-SHA256 of the body>`; `sent_at` is inside the signed body so receivers can reject stale requests. |
 
@@ -128,11 +134,14 @@ first line of `text` and `title` is its own field.
 | `NOTIFY_OUTBOUND_TIMEOUT` | `10s` | timeout of each call to Telegram, Slack or a webhook |
 | `NOTIFY_MAX_RETRY_AFTER` | `10s` | longest upstream `429` wait honoured (once); `0` disables the retry |
 | `NOTIFY_MAX_INFLIGHT` | `8` | concurrent sends across all destinations; extra calls get a "busy" error |
+| `NOTIFY_MAX_REQUEST_BYTES` | `65536` | largest MCP request body; a larger one is rejected before it is parsed |
+| `NOTIFY_GLOBAL_RATE_PER_MINUTE` | `30` | burst and per-minute budget across all destinations; a Telegram message sent as N parts costs N |
+| `NOTIFY_GLOBAL_RATE_PER_HOUR` | `300` | hourly budget across all destinations, same accounting |
 | `NOTIFY_MAX_TEXT_CHARS` | `4000` | default text limit in characters (max 20000) |
 | `NOTIFY_RATE_PER_MINUTE` | `6` | default per-destination burst and per-minute rate |
 | `NOTIFY_RATE_PER_HOUR` | `60` | default per-destination hourly budget |
 | `NOTIFY_SENDER_LABEL` | `OpenAgentix agent` | text in the header line (1 to 60 characters) |
-| `NOTIFY_IDEMPOTENCY_WINDOW` | `10m` | how long a key remembers its result |
+| `NOTIFY_IDEMPOTENCY_WINDOW` | `10m` | how long a key remembers its result, including an uncertain or partial one |
 | `NOTIFY_IDEMPOTENCY_MAX_ENTRIES` | `1000` | bound on remembered keys |
 | `NOTIFY_MCP_STATELESS` | `true` | no MCP sessions; any replica can answer any request |
 
@@ -147,7 +156,7 @@ Plus whatever variables your destinations name in `tokenEnv` / `secretEnv`.
 | `destination` | yes | a configured name |
 | `text` | yes | plain-text body; trimmed, control characters removed, at most the destination's limit in characters |
 | `title` | no | one-line title, at most 100 characters |
-| `idempotency_key` | no | `A-Za-z0-9._:-`, up to 128 characters |
+| `idempotency_key` | no | `A-Za-z0-9._:-`, up to 128 characters. Strongly advised: it is what makes a retry safe (see "Delivery semantics") |
 
 Result (text and structured): `destination`, `platform`, `delivery_id` (`ntf_...`, generated here), `sent_at` (RFC 3339),
 `deduplicated`.
@@ -158,13 +167,14 @@ Tool errors (`isError: true`), all safe to show an agent:
 | --- | --- |
 | unknown destination | `unknown destination "x": valid destinations are: a, b, c` |
 | text empty after cleaning | text must not be empty |
-| text or title too long | the length, and the limit for that destination |
-| rate limited here | which limits, and `retry in 20s` |
+| text, title or destination too long | the limit for it (very long raw input is refused on size alone, before any processing) |
+| rate limited here | which limits (per destination or global), and `retry in 20s` |
 | platform rate limited us | `retry in Ns` (after one honoured retry) |
 | busy | in-flight cap reached, or the same `idempotency_key` is still being sent |
 | `idempotency_key` reused with different content | use a new key |
+| retry of a key whose earlier attempt was uncertain or partial | `delivery of the earlier attempt is uncertain` or `the earlier attempt was partially delivered (N of M parts)`, then `not sent again; use a new idempotency_key only if a possible duplicate is acceptable` |
 | upstream failure | `could not deliver to destination "x" (telegram): telegram refused the message (HTTP 400)`; never ids, URLs or tokens |
-| timeout | delivery may or may not have happened; retry later with an `idempotency_key` |
+| timeout | delivery may or may not have happened. With a key, a retry with the same key is not sent again; without one, a retry may send a duplicate |
 | no destinations configured | notifications are disabled |
 
 ### `notify_list_destinations`
@@ -181,11 +191,22 @@ URLs or tokens.
 * **Rate limit = token bucket**: a burst of `perMinute` is allowed, refilling evenly; the hourly bucket is checked
   too. A refused call consumes nothing; a failed upstream send does consume a token (it still hit the platform). A
   replayed idempotency key consumes nothing.
-* **Idempotency** only covers successful sends: a failed send frees the key so a retry actually sends. Same key plus
-  different content is refused rather than silently dropped. Keys are scoped per destination.
-* **At-most-once is not guaranteed.** If the platform accepted a message but the answer was lost (timeout), the agent
-  cannot know; use a key and retry. A multi-part Telegram message can be delivered partially (the error says how many
-  parts).
+* **Delivery semantics.** Without an `idempotency_key` delivery is at-least-once on retry: if an attempt times out or
+  fails halfway, the caller cannot know what arrived, and calling again may send the message twice (or, for a
+  multi-part Telegram message, send some parts twice). With a key it is at-most-once per key and window: a key is
+  freed only when the platform provably did not take the message (validation, rate limits here, a refusal such as a
+  4xx or a Slack error code, a `429`, or a connection that could not be opened). When the outcome is unknown (a
+  timeout, a connection lost after the request was written, a 5xx, an unreadable answer) or only part of a Telegram
+  message went out, the key stays reserved in an "uncertain" state for the whole idempotency window and a retry with
+  that key does not send anything: it returns the "uncertain / partially delivered" error. A caller that accepts a
+  possible duplicate must use a new key. Same key plus different content is refused. Keys are scoped per destination
+  and live in memory, so a restart forgets them.
+* **Global cap.** The global rate cap is checked after the per-destination limit; a call refused by the global cap gives
+  its per-destination token back. A Telegram message split into N parts costs N global tokens (a message needing
+  more tokens than the bucket holds is treated as needing the whole bucket).
+* **A busy service answers busy** even to a replay of a finished key: the in-flight slot is taken before the key is looked up.
+* **No caller identity.** The service cannot tell agents apart, so rate limits, the in-flight cap and idempotency keys
+  are shared by all callers. One misbehaving agent can use up the budget of a destination for the others.
 * The sent text is not stored anywhere and not logged.
 * No real Telegram or Slack call is made in tests, so platform request shapes follow their public API documentation,
   not an observed exchange. Do a manual send to a test chat after deploying.
@@ -203,8 +224,8 @@ kubectl -n openagentix-notify create secret generic notify-credentials \
 kubectl apply -f deploy/deployment.yaml -f deploy/networkpolicy.yaml
 ```
 
-`networkpolicy.yaml` admits ingress only from namespace `mcp-tools` on the MCP port, and allows egress to DNS and to
-TCP 443 on public addresses (private ranges and link-local excluded). NetworkPolicy cannot match hostnames, so it cannot
+`networkpolicy.yaml` admits ingress only from the virtual MCP gateway pods (`app=virtualmcpserver`, `toolhive-name=tools`) in namespace `mcp-tools` on the MCP port, and allows egress to the kube-dns pods and to
+TCP 443 on public IPv4 addresses (private ranges and link-local excluded). With NodeLocal DNSCache the node-local resolver address is blocked unless you add it; on an IPv6 or dual-stack cluster public IPv6 egress is denied until you add a rule (details in the manifest comments). NetworkPolicy cannot match hostnames, so it cannot
 say "only api.telegram.org and slack.com"; use an FQDN-aware policy or an egress proxy for that. Agents then reach the
 tool through the gateway entry for `http://notify.openagentix-notify.svc.cluster.local:8080/mcp`.
 
@@ -216,10 +237,10 @@ tool through the gateway entry for `http://notify.openagentix-notify.svc.cluster
 | `internal/config` | environment settings |
 | `internal/destinations` | parse and validate the destinations file, resolve secrets, build senders |
 | `internal/notify` | policy: lookup, size, rate, concurrency, idempotency, logging, error mapping |
-| `internal/sanitize` | control-character stripping, Slack escaping, the header line |
+| `internal/sanitize` | control and invisible character stripping, Slack escaping, the header line and look-alike neutralisation |
 | `internal/ratelimit`, `internal/idempotency` | in-process token bucket and bounded result cache |
 | `internal/delivery` | `Message`, `Sender` and the safe `Error` shared by the platform clients |
-| `internal/httpx` | no-redirect client, size-capped reads, transport errors without URLs |
+| `internal/httpx` | no-redirect, no-proxy client with its own transport, size-capped reads, transport errors without URLs, clamped `Retry-After` |
 | `internal/telegram`, `internal/slack`, `internal/webhook` | platform clients |
 | `internal/mcpserver` | the two MCP tools; applies the request timeout to every tool call |
 | `internal/server` | `/mcp`, probes, access log, panic recovery, request deadline, shutdown |

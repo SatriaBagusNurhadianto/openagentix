@@ -44,6 +44,12 @@ type Error struct {
 	RetryAfter time.Duration // for RateLimited
 	Sent       int           // parts delivered before the failure (multi-part messages)
 	Total      int           // parts in the message
+	// Definite is true only when the platform provably did not accept the
+	// message: it answered with a refusal (4xx, a Slack error code, 429) or
+	// the connection could not be opened, so nothing was written. Anything
+	// else (timeout, a reset after the request was written, a 5xx, an
+	// unreadable answer) is uncertain, which is the zero value on purpose.
+	Definite bool
 }
 
 func (e *Error) Error() string {

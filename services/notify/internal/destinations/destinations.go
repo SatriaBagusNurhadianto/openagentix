@@ -32,11 +32,14 @@ import (
 var ErrNotConfigured = errors.New("no destinations file")
 
 const (
-	maxFileBytes     = 1 << 20
-	maxDestinations  = 100
-	maxDescription   = 200
-	maxSecretLen     = 512
-	maxRatePerWindow = 100000
+	maxFileBytes    = 1 << 20
+	maxDestinations = 100
+	maxDescription  = 200
+	maxSecretLen    = 512
+	// A token or signing secret is a few hundred bytes; the bound only stops
+	// a wrong path (a log, a device) from being slurped into memory.
+	maxSecretFileBytes = 64 << 10
+	maxRatePerWindow   = 100000
 )
 
 var (
@@ -81,6 +84,7 @@ type rawDest struct {
 
 	URL               string `yaml:"url"` // webhook
 	AllowInsecureHTTP bool   `yaml:"allowInsecureHTTP"`
+	AllowPrivateAddr  bool   `yaml:"allowPrivateAddress"`
 	SecretEnv         string `yaml:"secretEnv"`
 	SecretFile        string `yaml:"secretFile"`
 
@@ -122,6 +126,11 @@ func Parse(data []byte, o Options) ([]Destination, error) {
 	dec.KnownFields(true)
 	if err := dec.Decode(&file); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("invalid destinations file: %s", scrubYAML(err))
+	}
+	// A second document would be silently ignored by a single Decode: refuse it.
+	var extra yaml.Node
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, errors.New("invalid destinations file: it contains more than one YAML document")
 	}
 	if len(file.Destinations) > maxDestinations {
 		return nil, fmt.Errorf("too many destinations (maximum %d)", maxDestinations)
@@ -201,6 +210,9 @@ func build(r rawDest, o Options) (Destination, error) {
 			fail("%s does not apply to platform %s", field, r.Platform)
 		}
 	}
+	if r.Platform != "webhook" && r.AllowPrivateAddr {
+		fail("allowPrivateAddress does not apply to platform %s", r.Platform)
+	}
 	var sender delivery.Sender
 	switch r.Platform {
 	case "telegram":
@@ -234,7 +246,7 @@ func build(r rawDest, o Options) (Destination, error) {
 		forbid("channel", r.Channel)
 		forbid("tokenEnv", r.TokenEnv)
 		forbid("tokenFile", r.TokenFile)
-		if err := webhook.ValidateURL(r.URL, r.AllowInsecureHTTP); err != nil {
+		if err := webhook.ValidateURL(r.URL, r.AllowInsecureHTTP, r.AllowPrivateAddr); err != nil {
 			errs = append(errs, err)
 		}
 		sec, err := secret("signing secret", "secretEnv", "secretFile", r.SecretEnv, r.SecretFile, false, o)
@@ -249,6 +261,25 @@ func build(r rawDest, o Options) (Destination, error) {
 		return Destination{}, errors.Join(errs...)
 	}
 	return Destination{Name: r.Name, Description: desc, Platform: r.Platform, Limits: lim, Sender: sender}, nil
+}
+
+var errTooLarge = errors.New("file too large")
+
+// readBounded reads at most limit bytes of path, or reports errTooLarge.
+func readBounded(path string, limit int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, errTooLarge
+	}
+	return b, nil
 }
 
 // secret resolves a credential from exactly one of an environment variable or
@@ -273,8 +304,11 @@ func secret(what, envKey, fileKey, envName, file string, required bool, o Option
 			return "", fmt.Errorf("%s: environment variable %s is not set or empty", envKey, envName)
 		}
 	} else {
-		b, err := os.ReadFile(file)
-		if err != nil {
+		b, err := readBounded(file, maxSecretFileBytes)
+		switch {
+		case errors.Is(err, errTooLarge):
+			return "", fmt.Errorf("%s: the file is larger than %d KiB", fileKey, maxSecretFileBytes>>10)
+		case err != nil:
 			return "", fmt.Errorf("%s: cannot read the file", fileKey)
 		}
 		raw = string(b)

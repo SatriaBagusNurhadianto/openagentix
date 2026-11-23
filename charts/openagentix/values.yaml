@@ -291,7 +291,7 @@ knowledge:
       maxRelationsPerWindow: 30
       tokensPerHour: 300000            # sliding hour, counted from the usage the gateway reports
       maxHops: 3                       # longest graph traversal a query may ask for (1..3)
-      promptVersion: v1                # stored with every relation; changing it re-extracts all documents on their next ingest
+      promptVersion: v2                # stored with every relation; changing it re-extracts all documents on their next ingest (v2: naming rules, entity resolution)
       # Added to the prompt of agents with `knowledge: true` when the graph is on. {graph_search}, {graph_entity}, {graph_paths}
       # and {get} are replaced with the tool names as the agent sees them.
       agentPrompt: |

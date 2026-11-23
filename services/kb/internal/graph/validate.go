@@ -114,8 +114,7 @@ func Validate(output []byte, w Window, lim Limits) (Extraction, ValidateStats, e
 	grounded := func(s string) bool { return strings.Contains(lowText, strings.ToLower(s)) }
 
 	var ex Extraction
-	byName := map[string]int{} // normalised name or alias -> entity index, -1 if ambiguous
-	byKey := map[string]int{}  // type + normalised name -> entity index
+	byKey := map[string]int{} // store.MergeKey -> entity index
 	st.EntitiesIn = len(raw.Entities)
 	for _, item := range raw.Entities {
 		var re rawEntity
@@ -124,7 +123,7 @@ func Validate(output []byte, w Window, lim Limits) (Extraction, ValidateStats, e
 		}
 		name, ok := cleanName(re.Name)
 		typ := strings.ToLower(strings.TrimSpace(re.Type))
-		if !ok || !isEntityType(typ) || !grounded(name) {
+		if !ok || !isEntityType(typ) || !grounded(name) || !nameAllowed(w.Text, lowText, name, typ) {
 			continue
 		}
 		var aliases []string
@@ -132,13 +131,25 @@ func Validate(output []byte, w Window, lim Limits) (Extraction, ValidateStats, e
 			if len(aliases) == MaxAliases {
 				break
 			}
-			if a, ok := cleanName(a); ok && grounded(a) {
+			if a, ok := cleanName(a); ok && grounded(a) && !store.IsGenericOnly(a) {
 				aliases = append(aliases, a)
 			}
 		}
-		key := typ + "\x00" + store.NormalizeName(name)
+		// Entity resolution: the same canonical name in one window is one entity,
+		// whatever the type the model gave it (see store.CanonicalForm).
+		key := store.MergeKey(name, typ, "")
 		if i, dup := byKey[key]; dup {
-			ex.Entities[i].Aliases = appendUnique(ex.Entities[i].Aliases, aliases, MaxAliases)
+			e := &ex.Entities[i]
+			forms := append([]string{name}, aliases...)
+			if store.BetterName(e.Name, name) {
+				forms = append(forms, e.Name)
+				e.Name = name
+			}
+			e.Aliases = mergeForms(e.Name, e.Aliases, forms)
+			if e.Description == "" {
+				e.Description = cleanDescription(re.Description)
+			}
+			e.Chunks = chunksMentioning(w, append([]string{e.Name}, e.Aliases...))
 			continue
 		}
 		if len(ex.Entities) >= lim.MaxEntities {
@@ -146,30 +157,46 @@ func Validate(output []byte, w Window, lim Limits) (Extraction, ValidateStats, e
 		}
 		byKey[key] = len(ex.Entities)
 		ex.Entities = append(ex.Entities, store.ExtractedEntity{
-			Name: name, Type: typ, Description: cleanDescription(re.Description), Aliases: aliases, Chunks: chunksMentioning(w, append([]string{name}, aliases...)),
+			Name: name, Type: typ, Description: cleanDescription(re.Description), Aliases: mergeForms(name, nil, aliases),
+			Chunks: chunksMentioning(w, append([]string{name}, aliases...)),
 		})
+	}
+	// A relation names an entity by a listed name or alias; failing that, by any
+	// form with the same canonical name ("Basalt" for the entity "Team Basalt").
+	// A name two entities claim is ambiguous (-1) and its relations are dropped.
+	byName := map[string]int{}
+	byCanon := map[string]int{}
+	claim := func(m map[string]int, k string, i int) {
+		if j, seen := m[k]; seen && j != i {
+			m[k] = -1
+		} else {
+			m[k] = i
+		}
 	}
 	for i, e := range ex.Entities {
 		for _, n := range append([]string{e.Name}, e.Aliases...) {
-			k := store.NormalizeName(n)
-			if j, seen := byName[k]; seen && j != i {
-				byName[k] = -1
-			} else {
-				byName[k] = i
-			}
+			claim(byName, store.NormalizeName(n), i)
+			claim(byCanon, store.CanonicalForm(n), i)
 		}
+	}
+	resolve := func(n string) (int, bool) {
+		if i, ok := byName[store.NormalizeName(n)]; ok {
+			return i, true
+		}
+		i, ok := byCanon[store.CanonicalForm(n)]
+		return i, ok
 	}
 	st.EntitiesDropped = st.EntitiesIn - len(ex.Entities)
 
-	seen := map[[3]string]bool{}
+	seen := map[[3]any]bool{}
 	st.RelationsIn = len(raw.Relations)
 	for _, item := range raw.Relations {
 		var rr rawRelation
 		if json.Unmarshal(item, &rr) != nil || len(ex.Relations) >= lim.MaxRelations {
 			continue
 		}
-		src, ok1 := byName[store.NormalizeName(rr.Source)]
-		dst, ok2 := byName[store.NormalizeName(rr.Target)]
+		src, ok1 := resolve(rr.Source)
+		dst, ok2 := resolve(rr.Target)
 		if !ok1 || !ok2 || src < 0 || dst < 0 || src == dst {
 			continue
 		}
@@ -183,7 +210,7 @@ func Validate(output []byte, w Window, lim Limits) (Extraction, ValidateStats, e
 		if off < 0 {
 			continue
 		}
-		k := [3]string{ex.Entities[src].Name + "\x00" + ex.Entities[src].Type, pred, ex.Entities[dst].Name + "\x00" + ex.Entities[dst].Type}
+		k := [3]any{src, pred, dst}
 		if seen[k] {
 			continue
 		}
@@ -205,6 +232,84 @@ func unfence(b []byte) []byte {
 	b = bytes.TrimPrefix(b, []byte("json"))
 	b = bytes.TrimSuffix(bytes.TrimSpace(b), []byte("```"))
 	return bytes.TrimSpace(b)
+}
+
+// nameAllowed applies the rules that keep unnamed or generic things out of the
+// graph. They are deterministic, English-only and independent of any corpus.
+//
+//  1. A name made only of category, generic-noun and role words ("database",
+//     "the wiki", "team", "on-call engineer") says what kind of thing it is, not
+//     which one. From several documents it would become one hub that links
+//     unrelated facts.
+//  2. A person has a proper name: a role ("Granite team lead", "finance
+//     engineering duty officer") denotes whoever holds it, so a name with a role
+//     word is not a person, and a person's name has a capitalised (or numbered)
+//     word that is not itself generic, as it is written in the text. A person
+//     described in lower case ("the intern") has no name to merge on.
+//  3. An event is one occurrence: its name must carry a date or identifier (a
+//     digit) that tells it from the next one ("power outage on 3 March"). "disk
+//     outage" from two documents is two events, so without a digit there is no
+//     entity.
+func nameAllowed(text, lowText, name, typ string) bool {
+	if store.IsGenericOnly(name) {
+		return false
+	}
+	switch typ {
+	case "person":
+		return !store.HasRoleWord(name) && hasProperToken(text, lowText, name)
+	case "event":
+		return store.HasDigit(name)
+	}
+	return true
+}
+
+// hasProperToken reports whether name, where it occurs in text, has a word that
+// starts with an upper-case letter or contains a digit and is not a generic word.
+// When lower-casing changes the text's length, so that offsets cannot be mapped
+// back, the name as the model wrote it is judged instead.
+func hasProperToken(text, lowText, name string) bool {
+	low := strings.ToLower(name)
+	if len(lowText) != len(text) {
+		return properWords(name)
+	}
+	for from := 0; from < len(lowText); {
+		i := strings.Index(lowText[from:], low)
+		if i < 0 {
+			return false
+		}
+		if properWords(text[from+i : from+i+len(low)]) {
+			return true
+		}
+		from += i + 1
+	}
+	return false
+}
+
+func properWords(span string) bool {
+	for _, t := range strings.FieldsFunc(span, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		r, _ := utf8.DecodeRuneInString(t)
+		if (unicode.IsUpper(r) || store.HasDigit(t)) && !store.IsGenericOnly(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// mergeForms returns the aliases of an entity displayed as name: the existing
+// aliases and the other forms, without name itself or a repeat, at most
+// MaxAliases.
+func mergeForms(name string, have, add []string) []string {
+	out := []string{}
+	for _, a := range append(append([]string{}, have...), add...) {
+		if len(out) == MaxAliases {
+			break
+		}
+		if strings.EqualFold(a, name) {
+			continue
+		}
+		out = appendUnique(out, []string{a}, MaxAliases)
+	}
+	return out
 }
 
 func isEntityType(t string) bool {

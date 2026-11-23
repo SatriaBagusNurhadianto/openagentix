@@ -73,7 +73,7 @@ const (
 	DefaultGraphMaxRelationsPerWindow = 30
 	DefaultGraphTokensPerHour         = 300000
 	DefaultGraphMaxHops               = 3
-	DefaultGraphPromptVersion         = "v1"
+	DefaultGraphPromptVersion         = "v2"
 )
 
 var promptVersionRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,32}$`)

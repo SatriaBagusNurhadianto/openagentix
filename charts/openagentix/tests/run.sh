@@ -974,7 +974,7 @@ eq "graph on: key comes from a Secret reference"       "$(q "$D" "$KE|select(.na
 eq "graph on: key env has no literal value"            "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|has(\"value\")")" false
 eq "graph on: key Secret is required (a missing key is visible, not silent)" "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef.optional // false")" false
 eq "graph on: defaults window/entities/relations"      "$(gv KB_GRAPH_WINDOW_CHARS)/$(gv KB_GRAPH_MAX_ENTITIES_PER_CHUNK)/$(gv KB_GRAPH_MAX_RELATIONS_PER_WINDOW)" 2400/12/30
-eq "graph on: defaults budget/hops/prompt version"     "$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 300000/3/v1
+eq "graph on: defaults budget/hops/prompt version"     "$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 300000/3/v2
 eq "graph on: exactly the 10 KB_GRAPH_* variables"     "$(q "$D" "[$KE|select(.name|startswith(\"KB_GRAPH\"))]|length")" 10
 eq "graph on: nothing else on the kb Deployment changed" "$(diff <(q "$D" "[$KE|.name]|map(select(startswith(\"KB_GRAPH\")|not))|join(\",\")") <(q "$(docs)" "[$KE|.name]|join(\",\")") >/dev/null && echo same || echo differs)" same
 eq "graph on: the kb keeps its embedding-key annotations untouched" "$(q "$D" "$KB|.metadata.annotations[\"openagentix.io/gateway-user\"]+\"/\"+.metadata.annotations[\"openagentix.io/gateway-key-secret\"]")" kb/kb-virtual-key

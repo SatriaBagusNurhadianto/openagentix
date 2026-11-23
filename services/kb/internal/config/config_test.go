@@ -216,7 +216,7 @@ func TestGraphSettings(t *testing.T) {
 	}
 	g := c.Graph
 	if !g.Enabled || g.ExtractModel != "extract-default" || g.GatewayURL != "http://gw/v1" || g.APIKey != "sekrit" ||
-		g.WindowChars != 2400 || g.MaxEntitiesPerChunk != 12 || g.MaxRelationsPerWindow != 30 || g.TokensPerHour != 300000 || g.MaxHops != 3 {
+		g.WindowChars != 2400 || g.MaxEntitiesPerChunk != 12 || g.MaxRelationsPerWindow != 30 || g.TokensPerHour != 300000 || g.MaxHops != 3 || g.PromptVersion != "v2" {
 		t.Fatalf("%+v", g)
 	}
 	c, err = Load(graphEnv(map[string]string{

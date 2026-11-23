@@ -107,6 +107,12 @@ func TestValidateEveryTypeInTheListIsAccepted(t *testing.T) {
 	for _, typ := range EntityTypes {
 		out := js(m{"entities": ents(m{"name": "Checkout", "type": strings.ToUpper(typ)})})
 		ex, _, err := Validate(out, win(), lim())
+		if typ == "event" { // an event needs a date or an identifier in its name, see TestValidateEventsNeedADate
+			if err != nil || len(ex.Entities) != 0 {
+				t.Fatalf("event: %+v %v", ex, err)
+			}
+			continue
+		}
 		if err != nil || len(ex.Entities) != 1 || ex.Entities[0].Type != typ {
 			t.Fatalf("%s: %+v %v", typ, ex, err)
 		}
@@ -178,8 +184,9 @@ func TestValidateDedupeAndCaps(t *testing.T) {
 }
 
 func TestValidateAmbiguousNameDropsTheRelation(t *testing.T) {
-	es := ents(m{"name": "Checkout", "type": "service"}, m{"name": "Checkout", "type": "team"}, m{"name": "Payments service", "type": "service"})
-	rel := m{"source": "Checkout", "predicate": "calls", "target": "Payments service", "evidence": "The Checkout service calls the Payments service for every order."}
+	// "Billing team" is an alias of one entity and the name of another: a relation that names it is ambiguous.
+	es := ents(m{"name": "Payments service", "type": "service", "aliases": []string{"Billing team"}}, m{"name": "Billing team", "type": "team"}, m{"name": "Checkout service", "type": "service"})
+	rel := m{"source": "Billing team", "predicate": "owns", "target": "Checkout service", "evidence": "Payments service is owned by the Billing team."}
 	ex, _, _ := Validate(js(m{"entities": es, "relations": []m{rel}}), win(), lim())
 	if len(ex.Entities) != 3 || len(ex.Relations) != 0 {
 		t.Fatalf("%+v", ex)
@@ -221,5 +228,131 @@ func TestNormalizePredicate(t *testing.T) {
 		if got := normalizePredicate(in); got != want {
 			t.Errorf("normalizePredicate(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// window text for the entity-resolution rules.
+const resolveText = "Orion is owned by team Basalt. Mira Okafor is the on-call engineer of Team Basalt. The wiki and the database are old.\n\n" +
+	"Cluster Teal had a power outage on 3 March. A disk outage hit Teal. Quill uses cluster Teal. The Granite team lead and the Pylon author agree. " +
+	"Aiko Brandt meets the finance engineering duty officer. Vane-3 is a region. The dashboard is blue."
+
+func resolveWin() Window { return Plan([]string{resolveText}, 5000)[0] }
+
+func names(ex Extraction) []string {
+	var out []string
+	for _, e := range ex.Entities {
+		out = append(out, e.Name)
+	}
+	return out
+}
+
+func TestValidateMergesCategoryVariantsInOneWindow(t *testing.T) {
+	out := js(m{"entities": ents(
+		m{"name": "Basalt", "type": "team", "aliases": []string{}},
+		m{"name": "Team Basalt", "type": "organization", "aliases": []string{}},
+		m{"name": "Orion", "type": "service"},
+		m{"name": "cluster Teal", "type": "system"},
+		m{"name": "Teal", "type": "system"},
+		m{"name": "Quill", "type": "service"},
+	), "relations": []m{
+		{"source": "Basalt", "predicate": "owns", "target": "Orion", "evidence": "Orion is owned by team Basalt."},
+		{"source": "Quill", "predicate": "uses", "target": "Teal", "evidence": "Quill uses cluster Teal."}, // names the entity by a form the model also listed
+	}})
+	ex, st, err := Validate(out, resolveWin(), lim())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(names(ex)) != "[Team Basalt Orion cluster Teal Quill]" {
+		t.Fatalf("entities = %v", names(ex))
+	}
+	b := ex.Entities[0]
+	if b.Type != "team" || fmt.Sprint(b.Aliases) != "[Basalt]" {
+		t.Fatalf("first type is primary and the other form an alias: %+v", b)
+	}
+	if len(ex.Relations) != 2 || st.RelationsDropped != 0 {
+		t.Fatalf("relations through either form: %+v %+v", ex.Relations, st)
+	}
+	if ex.Entities[ex.Relations[0].Src].Name != "Team Basalt" || ex.Entities[ex.Relations[1].Dst].Name != "cluster Teal" {
+		t.Fatalf("relations = %+v", ex.Relations)
+	}
+}
+
+func TestValidateRelationResolvesByCanonicalFormWhenTheExactFormIsNotListed(t *testing.T) {
+	out := js(m{"entities": ents(m{"name": "Team Basalt", "type": "team"}, m{"name": "Orion", "type": "service"}),
+		"relations": []m{{"source": "Basalt", "predicate": "owns", "target": "Orion", "evidence": "Orion is owned by team Basalt."}}})
+	ex, _, _ := Validate(out, resolveWin(), lim())
+	if len(ex.Relations) != 1 {
+		t.Fatalf("relation = %+v", ex.Relations)
+	}
+}
+
+func TestValidateDropsEntitiesThatAreOnlyGenericWords(t *testing.T) {
+	var es []any
+	for _, n := range []string{"The wiki", "database", "dashboard", "Team"} {
+		es = append(es, m{"name": n, "type": "system"})
+	}
+	es = append(es, m{"name": "Vane-3", "type": "location"})
+	ex, st, _ := Validate(js(m{"entities": es}), resolveWin(), lim())
+	if fmt.Sprint(names(ex)) != "[Vane-3]" || st.EntitiesDropped != 4 {
+		t.Fatalf("kept %v", names(ex))
+	}
+}
+
+func TestValidatePeopleNeedAProperNameAndNotARole(t *testing.T) {
+	var es []any
+	for _, n := range []string{"on-call engineer", "Granite team lead", "Pylon author", "finance engineering duty officer", "Aiko Brandt", "Mira Okafor"} {
+		es = append(es, m{"name": n, "type": "person"})
+	}
+	ex, _, _ := Validate(js(m{"entities": es}), resolveWin(), lim())
+	if fmt.Sprint(names(ex)) != "[Aiko Brandt Mira Okafor]" {
+		t.Fatalf("kept %v", names(ex))
+	}
+	// A person written in lower case in the text has no proper-name token there, even if the model capitalises it.
+	w := Plan([]string{"the intern fixed the build and mira okafor left."}, 5000)[0]
+	ex, _, _ = Validate(js(m{"entities": ents(m{"name": "Intern", "type": "person"}, m{"name": "Mira Okafor", "type": "person"})}), w, lim())
+	if len(ex.Entities) != 0 {
+		t.Fatalf("lower-case person names kept: %v", names(ex))
+	}
+}
+
+func TestValidateEventsNeedADate(t *testing.T) {
+	es := ents(
+		m{"name": "power outage on 3 March", "type": "event"},
+		m{"name": "disk outage", "type": "event"},
+		m{"name": "Vane-3", "type": "event"},
+		m{"name": "Teal", "type": "system"},
+	)
+	ex, _, _ := Validate(js(m{"entities": es}), resolveWin(), lim())
+	if fmt.Sprint(names(ex)) != "[power outage on 3 March Vane-3 Teal]" {
+		t.Fatalf("kept %v", names(ex))
+	}
+}
+
+func TestValidateDisplayNameDoesNotDependOnOrder(t *testing.T) {
+	for _, order := range [][]string{{"Basalt", "Team Basalt"}, {"Team Basalt", "Basalt"}} {
+		var es []any
+		for _, n := range order {
+			es = append(es, m{"name": n, "type": "team"})
+		}
+		ex, _, _ := Validate(js(m{"entities": es}), resolveWin(), lim())
+		if len(ex.Entities) != 1 || ex.Entities[0].Name != "Team Basalt" || fmt.Sprint(ex.Entities[0].Aliases) != "[Basalt]" {
+			t.Fatalf("order %v: %+v", order, ex.Entities)
+		}
+	}
+}
+
+func TestValidateDoesNotMergeDistinctNames(t *testing.T) {
+	w := Plan([]string{"Mira Okafor and Mira Lindqvist work on Vane-1, Vane-2 and Vane-3. Quill and Quire are ledgers."}, 5000)[0]
+	var es []any
+	for _, n := range []string{"Mira Okafor", "Mira Lindqvist"} {
+		es = append(es, m{"name": n, "type": "person"})
+	}
+	for _, n := range []string{"Vane-1", "Vane-2", "Vane-3"} {
+		es = append(es, m{"name": n, "type": "location"})
+	}
+	es = append(es, m{"name": "Quill", "type": "service"}, m{"name": "Quire", "type": "service"})
+	ex, _, _ := Validate(js(m{"entities": es}), w, lim())
+	if len(ex.Entities) != 7 {
+		t.Fatalf("kept %v", names(ex))
 	}
 }

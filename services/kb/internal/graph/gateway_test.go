@@ -275,3 +275,20 @@ func TestNewGatewayValidates(t *testing.T) {
 		}
 	}
 }
+
+// The prompt is what keeps generic things out of the graph before Validate has
+// to; its wording is versioned (KB_GRAPH_PROMPT_VERSION, default v2), so these
+// checks pin the rules that version 2 added.
+func TestSystemPromptStatesTheNamingRules(t *testing.T) {
+	for _, want := range []string{
+		"proper name",                           // names are proper names or specific designations
+		"without a leading generic word",        // "Basalt", not "Team Basalt"
+		"Do not output an entity for a generic", // unnamed things are not entities
+		"date or identifier",                    // events
+		"role",                                  // roles are not people
+	} {
+		if !strings.Contains(systemPrompt, want) {
+			t.Errorf("system prompt lacks %q", want)
+		}
+	}
+}

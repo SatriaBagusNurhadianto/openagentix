@@ -33,7 +33,9 @@ Answer with one JSON object and nothing else:
 
 Rules:
 - type is exactly one of: ` + strings.Join(EntityTypes, ", ") + `.
-- name is how the text names the thing, at most 80 characters, copied from the text. aliases are other names the text uses for it.
+- name is how the text names the thing, at most 80 characters, copied from the text. Use its proper name or specific designation (Orion, Basalt, Vane-3, Mira Okafor), without a leading generic word such as team, cluster, service, region or system when a proper name exists: write "Basalt" for "team Basalt" and "Teal" for "cluster Teal". aliases are other names the text uses for it, including the longer form.
+- Do not output an entity for a generic or unnamed thing: "the database", "the wiki", "a dashboard", "the provider", "the on-call engineer", "a storage layer". If the text does not give it a name, leave it out. A person is a named individual, never a role.
+- An event is a single occurrence. Output one only when its name carries a date or identifier from the text, for example "power outage on 3 March"; otherwise leave it out and state the fact as a relation between named entities.
 - description is at most one short sentence, in your own words, and only states what the text says.
 - A relation connects two entities from your entities list, using their name exactly as listed in "name".
 - predicate is a short verb phrase such as calls, depends_on, owns, part_of, located_in, member_of, works_for, manages, uses. Use lower case with underscores, at most 40 characters.

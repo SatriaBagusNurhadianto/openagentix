@@ -98,11 +98,48 @@ func TestGatewayRequestShape(t *testing.T) {
 	if r.path != "/v1/chat/completions" || r.auth != "Bearer KEY-123" {
 		t.Fatalf("path=%s auth=%s", r.path, r.auth)
 	}
-	if r.body["model"] != "extract-default" || r.body["temperature"] != float64(0) {
+	if r.body["model"] != "extract-default" {
 		t.Fatalf("body = %v", r.body)
 	}
-	if rf, _ := r.body["response_format"].(map[string]any); rf["type"] != "json_object" {
+	// Sampling parameters are left to the provider: some models reject temperature outright (seen live: HTTP 400).
+	for _, forbidden := range []string{"temperature", "top_p"} {
+		if _, ok := r.body[forbidden]; ok {
+			t.Fatalf("extractor sent %q", forbidden)
+		}
+	}
+	// A strict JSON schema, every object closed: the gateway turns json_object into an open schema that the
+	// provider rejects (seen live: HTTP 400 "additionalProperties: true is not supported").
+	rf, _ := r.body["response_format"].(map[string]any)
+	js, _ := rf["json_schema"].(map[string]any)
+	if rf["type"] != "json_schema" || js["strict"] != true || js["name"] == "" {
 		t.Fatalf("response_format = %v", r.body["response_format"])
+	}
+	var open []string
+	var walk func(path string, v any)
+	walk = func(path string, v any) {
+		switch x := v.(type) {
+		case map[string]any:
+			if x["type"] == "object" && x["additionalProperties"] != false {
+				open = append(open, path)
+			}
+			for k, c := range x {
+				walk(path+"/"+k, c)
+			}
+		case []any:
+			for _, c := range x {
+				walk(path, c)
+			}
+		}
+	}
+	walk("", js["schema"])
+	if len(open) > 0 || js["schema"] == nil {
+		t.Fatalf("schema missing or has open objects: %v", open)
+	}
+	schema, _ := json.Marshal(js["schema"])
+	for _, typ := range EntityTypes {
+		if !strings.Contains(string(schema), `"`+typ+`"`) {
+			t.Fatalf("schema does not list entity type %q", typ)
+		}
 	}
 	for _, forbidden := range []string{"tools", "tool_choice", "functions", "function_call"} {
 		if _, ok := r.body[forbidden]; ok {

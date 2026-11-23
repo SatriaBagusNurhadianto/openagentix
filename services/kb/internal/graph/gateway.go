@@ -114,14 +114,35 @@ func userMessage(w Window) string {
 		"<<<BEGIN UNTRUSTED DOCUMENT " + marker + ">>>\n" + w.Text + "\n<<<END UNTRUSTED DOCUMENT " + marker + ">>>"
 }
 
+// responseFormat asks for the answer as a strict JSON schema in which every
+// object is closed. Two things were learned against a real provider: the
+// "json_object" format reaches it as an open schema, which it rejects, and
+// some models reject sampling parameters such as temperature, so none is sent.
+// The schema is a convenience for the model; Validate is what is trusted.
+func responseFormat() map[string]any {
+	str := map[string]any{"type": "string"}
+	object := func(props map[string]any, required ...string) map[string]any {
+		return map[string]any{"type": "object", "additionalProperties": false, "required": required, "properties": props}
+	}
+	array := func(items any) map[string]any { return map[string]any{"type": "array", "items": items} }
+	entity := object(map[string]any{
+		"name": str, "type": map[string]any{"type": "string", "enum": EntityTypes}, "description": str, "aliases": array(str),
+	}, "name", "type", "description", "aliases")
+	relation := object(map[string]any{"source": str, "predicate": str, "target": str, "evidence": str},
+		"source", "predicate", "target", "evidence")
+	return map[string]any{"type": "json_schema", "json_schema": map[string]any{
+		"name": "extraction", "strict": true,
+		"schema": object(map[string]any{"entities": array(entity), "relations": array(relation)}, "entities", "relations"),
+	}}
+}
+
 // Extract runs one model call for the window and validates the answer.
 func (g *Gateway) Extract(ctx context.Context, w Window) (Extraction, Usage, error) {
 	user := userMessage(w)
 	body, err := json.Marshal(map[string]any{
 		"model":           g.cfg.Model,
-		"temperature":     0,
 		"max_tokens":      g.cfg.MaxOutputTokens,
-		"response_format": map[string]string{"type": "json_object"},
+		"response_format": responseFormat(),
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": user},

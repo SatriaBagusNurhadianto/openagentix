@@ -1,0 +1,9 @@
+# Demo for the local kind cluster: observability ON with the bundled dev profile (VictoriaMetrics + Jaeger, in namespace
+# openagentix-observability). Combine it with the other demo files (lists are REPLACED, never merged, and this file has none):
+#   TELEGRAM_ALLOWED_CHAT_IDS=<your chat id> NOTIFY_TELEGRAM_CHAT_ID=<your chat id> \
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml" ./install.sh
+# Content capture stays OFF (observability.capture.content=false). README "Observability".
+observability:
+  enabled: true
+  bundled:
+    enabled: true

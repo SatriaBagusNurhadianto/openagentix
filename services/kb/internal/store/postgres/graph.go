@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -106,20 +107,28 @@ func (s *Store) upsertEntity(ctx context.Context, q querier, in store.EntityInpu
 	// unites the aliases (every form seen stays findable, the displayed one is
 	// not its own alias), records a different type and, unless the entity is
 	// manual, displays the more specific name (store.BetterName, in SQL).
-	const takeNew = `({{schema}}.entities.origin <> 'manual' AND (
+	// The exception is a curated entity (origin manual) merging into an extracted
+	// one: it takes over the name, the type (the old one is recorded) and the
+	// description, and the entity becomes manual (takeManual).
+	const takeManual = `(EXCLUDED.origin = 'manual' AND {{schema}}.entities.origin <> 'manual')`
+	const takeNew = `(` + takeManual + ` OR ({{schema}}.entities.origin <> 'manual' AND (
 		  cardinality(string_to_array(EXCLUDED.match_name, ' ')) > cardinality(string_to_array({{schema}}.entities.match_name, ' '))
 		  OR (cardinality(string_to_array(EXCLUDED.match_name, ' ')) = cardinality(string_to_array({{schema}}.entities.match_name, ' '))
-		      AND EXCLUDED.name COLLATE "C" < {{schema}}.entities.name COLLATE "C")))`
+		      AND EXCLUDED.name COLLATE "C" < {{schema}}.entities.name COLLATE "C"))))`
+	const newType = `(CASE WHEN ` + takeManual + ` THEN EXCLUDED.type ELSE {{schema}}.entities.type END)`
 	return scanEntity(q.QueryRow(ctx, s.q(`
 		INSERT INTO {{schema}}.entities (collection, name, norm_name, match_name, type, description, aliases, origin, canon_name`+cols+`)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9`+vals+`)
 		ON CONFLICT (collection, canon_name) DO UPDATE SET
-		  description = CASE WHEN {{schema}}.entities.description = '' THEN EXCLUDED.description ELSE {{schema}}.entities.description END,
+		  description = CASE WHEN `+takeManual+` AND EXCLUDED.description <> '' THEN EXCLUDED.description
+		                     WHEN {{schema}}.entities.description = '' THEN EXCLUDED.description ELSE {{schema}}.entities.description END,
 		  aliases = (SELECT coalesce(array_agg(DISTINCT a COLLATE "C" ORDER BY a COLLATE "C"), '{}')
 		             FROM unnest({{schema}}.entities.aliases || EXCLUDED.aliases || ARRAY[{{schema}}.entities.match_name, EXCLUDED.match_name]) AS a
 		             WHERE a <> '' AND a <> CASE WHEN `+takeNew+` THEN EXCLUDED.match_name ELSE {{schema}}.entities.match_name END),
 		  other_types = (SELECT coalesce(array_agg(DISTINCT t COLLATE "C" ORDER BY t COLLATE "C"), '{}')
-		                 FROM unnest({{schema}}.entities.other_types || ARRAY[EXCLUDED.type]) AS t WHERE t <> {{schema}}.entities.type),
+		                 FROM unnest({{schema}}.entities.other_types || ARRAY[EXCLUDED.type, {{schema}}.entities.type]) AS t WHERE t <> `+newType+`),
+		  type = `+newType+`,
+		  origin = CASE WHEN `+takeManual+` THEN 'manual' ELSE {{schema}}.entities.origin END,
 		  name = CASE WHEN `+takeNew+` THEN EXCLUDED.name ELSE {{schema}}.entities.name END,
 		  norm_name = CASE WHEN `+takeNew+` THEN EXCLUDED.norm_name ELSE {{schema}}.entities.norm_name END,
 		  match_name = CASE WHEN `+takeNew+` THEN EXCLUDED.match_name ELSE {{schema}}.entities.match_name END`+setEmb+`
@@ -185,6 +194,9 @@ func (s *Store) AddRelation(ctx context.Context, r store.Relation) (int64, error
 func (s *Store) addRelation(ctx context.Context, q querier, r store.Relation) (int64, error) {
 	if r.Predicate == "" {
 		return 0, errors.New("relation needs a predicate")
+	}
+	if r.FactsetID != "" {
+		return 0, errors.New("relations of a fact set are stored by ReplaceFactSet")
 	}
 	if r.Origin == "" {
 		r.Origin = store.OriginExtracted
@@ -498,21 +510,23 @@ func (s *Store) collectPaths(ctx context.Context, collection string, raw []rawPa
 	}
 	edges := map[int64]edge{}
 	rows, err = s.pool.Query(ctx, s.q(`
-		SELECT r.id, r.collection, r.src_id, r.dst_id, r.predicate, r.evidence, r.document_id, r.chunk_index, r.prompt_version, r.model, r.origin, d.source_uri
+		SELECT r.id, r.collection, r.src_id, r.dst_id, r.predicate, r.evidence, coalesce(r.document_id, ''), coalesce(r.chunk_index, 0),
+		       coalesce(r.factset_id, ''), r.prompt_version, r.model, r.origin, coalesce(d.source_uri, f.source_uri, '')
 		FROM {{schema}}.relations r
-		JOIN {{schema}}.documents d ON d.collection = r.collection AND d.id = r.document_id
-		WHERE r.collection = $1 AND r.id = ANY($2)`), collection, rids)
+		LEFT JOIN {{schema}}.documents d ON d.collection = r.collection AND d.id = r.document_id
+		LEFT JOIN {{schema}}.graph_factsets f ON f.collection = r.collection AND f.id = r.factset_id
+		WHERE r.collection = $1 AND r.id = ANY($2) AND (d.id IS NOT NULL OR f.id IS NOT NULL)`), collection, rids)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		var r store.Relation
 		var uri string
-		if err := rows.Scan(&r.ID, &r.Collection, &r.SrcID, &r.DstID, &r.Predicate, &r.Evidence, &r.DocumentID, &r.ChunkIndex, &r.PromptVersion, &r.Model, &r.Origin, &uri); err != nil {
+		if err := rows.Scan(&r.ID, &r.Collection, &r.SrcID, &r.DstID, &r.Predicate, &r.Evidence, &r.DocumentID, &r.ChunkIndex, &r.FactsetID, &r.PromptVersion, &r.Model, &r.Origin, &uri); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		edges[r.ID] = edge{r, store.Citation{DocumentID: r.DocumentID, ChunkIndex: r.ChunkIndex, SourceURI: uri}}
+		edges[r.ID] = edge{r, store.Citation{DocumentID: r.DocumentID, ChunkIndex: r.ChunkIndex, FactsetID: r.FactsetID, SourceURI: uri}}
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -611,8 +625,11 @@ func (s *Store) GraphStats(ctx context.Context, collection string) (store.GraphS
 		       (SELECT count(*) FROM {{schema}}.entity_chunks WHERE collection = $1),
 		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'pending'),
 		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'done'),
-		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'failed')`), collection).
-		Scan(&st.Entities, &st.Relations, &st.Mentions, &st.JobsPending, &st.JobsDone, &st.JobsFailed)
+		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'failed'),
+		       (SELECT count(*) FROM {{schema}}.graph_factsets WHERE collection = $1),
+		       (SELECT count(*) FROM {{schema}}.entities WHERE collection = $1 AND origin = 'manual'),
+		       (SELECT count(*) FROM {{schema}}.relations WHERE collection = $1 AND origin = 'manual')`), collection).
+		Scan(&st.Entities, &st.Relations, &st.Mentions, &st.JobsPending, &st.JobsDone, &st.JobsFailed, &st.FactSets, &st.ManualEntities, &st.ManualRelations)
 	if err != nil {
 		return st, err
 	}
@@ -796,4 +813,160 @@ func (s *Store) ApplyExtraction(ctx context.Context, res store.ExtractionResult)
 			WHERE collection = $1 AND document_id = $2 AND window_idx = $3`), coll, doc, res.Job.WindowIdx)
 		return err
 	})
+}
+
+// demoteUndeclared un-marks the given entities that no fact set declares any
+// more. The caller then collects entities nothing refers to.
+func (s *Store) demoteUndeclared(ctx context.Context, q querier, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := q.Exec(ctx, s.q(`
+		UPDATE {{schema}}.entities e SET origin = 'extracted'
+		WHERE e.id = ANY($1) AND e.origin = 'manual'
+		  AND NOT EXISTS (SELECT 1 FROM {{schema}}.graph_factset_entities m WHERE m.entity_id = e.id)`), ids)
+	return err
+}
+
+// dropFactSet deletes a fact set row (its relations and declarations go with it
+// by cascade) and un-marks the entities nobody declares any more. It reports
+// whether the fact set existed. The caller holds the collection lock.
+func (s *Store) dropFactSet(ctx context.Context, q querier, collection, id string) (bool, error) {
+	rows, err := q.Query(ctx, s.q(`SELECT entity_id FROM {{schema}}.graph_factset_entities WHERE collection = $1 AND factset_id = $2`), collection, id)
+	if err != nil {
+		return false, err
+	}
+	var ids []int64
+	for rows.Next() {
+		var x int64
+		if err := rows.Scan(&x); err != nil {
+			rows.Close()
+			return false, err
+		}
+		ids = append(ids, x)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	tag, err := q.Exec(ctx, s.q(`DELETE FROM {{schema}}.graph_factsets WHERE collection = $1 AND id = $2`), collection, id)
+	if err != nil || tag.RowsAffected() == 0 {
+		return false, err
+	}
+	return true, s.demoteUndeclared(ctx, q, ids)
+}
+
+func (s *Store) ReplaceFactSet(ctx context.Context, fs store.FactSet) (bool, error) {
+	if err := s.needGraph(); err != nil {
+		return false, err
+	}
+	ends, err := fs.Resolve()
+	if err != nil {
+		return false, err
+	}
+	body, err := json.Marshal(fs.Clone())
+	if err != nil {
+		return false, err
+	}
+	hash := fs.Hash()
+	changed := false
+	err = s.inGraphTx(ctx, fs.Collection, func(tx pgx.Tx) error {
+		var old string
+		switch err := tx.QueryRow(ctx, s.q(`SELECT body_hash FROM {{schema}}.graph_factsets WHERE collection = $1 AND id = $2`), fs.Collection, fs.ID).Scan(&old); {
+		case err == nil && old == hash:
+			return nil
+		case err != nil && !errors.Is(err, pgx.ErrNoRows):
+			return err
+		}
+		changed = true
+		if _, err := s.dropFactSet(ctx, tx, fs.Collection, fs.ID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, s.q(`
+			INSERT INTO {{schema}}.graph_factsets (collection, id, source_uri, body_hash, body, entity_count, relation_count)
+			VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`), fs.Collection, fs.ID, fs.SourceURI, hash, string(body), len(fs.Entities), len(fs.Relations)); err != nil {
+			return err
+		}
+		ids := make([]int64, len(fs.Entities))
+		for i, x := range fs.Entities {
+			e, err := s.upsertEntity(ctx, tx, store.EntityInput{
+				Collection: fs.Collection, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, Origin: store.OriginManual,
+			})
+			if err != nil {
+				return err
+			}
+			ids[i] = e.ID
+			if _, err := tx.Exec(ctx, s.q(`
+				INSERT INTO {{schema}}.graph_factset_entities (collection, factset_id, entity_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`),
+				fs.Collection, fs.ID, e.ID); err != nil {
+				return err
+			}
+		}
+		for i, r := range fs.Relations {
+			if _, err := tx.Exec(ctx, s.q(`
+				INSERT INTO {{schema}}.relations (collection, src_id, dst_id, predicate, evidence, factset_id, origin)
+				VALUES ($1, $2, $3, $4, $5, $6, 'manual') ON CONFLICT DO NOTHING`),
+				fs.Collection, ids[ends[i][0]], ids[ends[i][1]], r.Predicate, r.Note, fs.ID); err != nil {
+				return err
+			}
+		}
+		return s.collectEntities(ctx, tx, fs.Collection)
+	})
+	return changed, err
+}
+
+func (s *Store) GetFactSet(ctx context.Context, collection, id string) (store.FactSet, error) {
+	if err := s.needGraph(); err != nil {
+		return store.FactSet{}, err
+	}
+	var body []byte
+	err := s.pool.QueryRow(ctx, s.q(`SELECT body FROM {{schema}}.graph_factsets WHERE collection = $1 AND id = $2`), collection, id).Scan(&body)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return store.FactSet{}, store.ErrFactSetNotFound
+	}
+	if err != nil {
+		return store.FactSet{}, err
+	}
+	fs := store.FactSet{Collection: collection, ID: id}
+	if err := json.Unmarshal(body, &fs); err != nil {
+		return store.FactSet{}, fmt.Errorf("stored fact set is unreadable: %w", err)
+	}
+	return fs, nil
+}
+
+func (s *Store) ListFactSets(ctx context.Context, collection string) ([]store.FactSetInfo, error) {
+	if err := s.needGraph(); err != nil {
+		return nil, err
+	}
+	rows, err := s.pool.Query(ctx, s.q(`
+		SELECT id, source_uri, entity_count, relation_count, updated_at FROM {{schema}}.graph_factsets
+		WHERE collection = $1 ORDER BY id COLLATE "C"`), collection)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []store.FactSetInfo
+	for rows.Next() {
+		var i store.FactSetInfo
+		if err := rows.Scan(&i.ID, &i.SourceURI, &i.Entities, &i.Relations, &i.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, i)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) DeleteFactSet(ctx context.Context, collection, id string) (bool, error) {
+	if err := s.needGraph(); err != nil {
+		return false, err
+	}
+	existed := false
+	err := s.inGraphTx(ctx, collection, func(tx pgx.Tx) error {
+		var err error
+		if existed, err = s.dropFactSet(ctx, tx, collection, id); err != nil || !existed {
+			return err
+		}
+		return s.collectEntities(ctx, tx, collection)
+	})
+	return existed, err
 }

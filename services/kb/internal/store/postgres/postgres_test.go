@@ -363,7 +363,7 @@ func TestUnavailableSettingDoesNotPoisonTransaction(t *testing.T) {
 	}
 }
 
-var graphTables = []string{"entities", "relations", "entity_chunks", "extraction_jobs"}
+var graphTables = []string{"entities", "relations", "entity_chunks", "extraction_jobs", "graph_factsets", "graph_factset_entities"}
 
 func tablesIn(t *testing.T, url, schema string) []string {
 	t.Helper()
@@ -457,7 +457,7 @@ func TestGraphMigrationsApplyOnceAndAreIdempotent(t *testing.T) {
 				t.Fatalf("dim=%d: table %s missing (tables: %s)", dim, tbl, got)
 			}
 		}
-		if want := map[int]string{0: "1,3,5", 3: "1,2,3,4,5"}[dim]; migrationsIn(t, url, schema) != want {
+		if want := map[int]string{0: "1,3,5,6", 3: "1,2,3,4,5,6"}[dim]; migrationsIn(t, url, schema) != want {
 			t.Fatalf("dim=%d: migrations = %s, want %s", dim, migrationsIn(t, url, schema), want)
 		}
 	}
@@ -559,5 +559,89 @@ func TestGraphMigration5UpgradesAnOldGraphSchema(t *testing.T) {
 			}
 		}
 		s2.Close()
+	}
+}
+
+// TestGraphMigration6UpgradesASchemaOfMigration5 starts from the schema
+// migration 5 left (relations always cite a document, no fact set tables) with
+// extracted and manual rows, and checks that migration 6 keeps every row,
+// allows relations that cite a fact set, refuses one that cites nothing, still
+// cascades document relations, and that a second start changes nothing.
+func TestGraphMigration6UpgradesASchemaOfMigration5(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	s, schema := openAt(t, url, 0, true)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	q := `"` + schema + `".`
+	// back to the schema of migration 5
+	exec(`DROP TABLE ` + q + `graph_factset_entities`)
+	exec(`ALTER TABLE ` + q + `relations DROP CONSTRAINT relations_factset_fk, DROP CONSTRAINT relations_one_source`)
+	exec(`DROP INDEX ` + q + `relations_factset_key`)
+	exec(`DROP INDEX ` + q + `relations_factset_idx`)
+	exec(`ALTER TABLE ` + q + `relations DROP COLUMN factset_id`)
+	exec(`ALTER TABLE ` + q + `relations ALTER COLUMN document_id SET NOT NULL, ALTER COLUMN chunk_index SET NOT NULL`)
+	exec(`DROP TABLE ` + q + `graph_factsets`)
+	exec(`DELETE FROM ` + q + `schema_migrations WHERE version = 6`)
+	exec(`INSERT INTO ` + q + `documents (collection, id, text) VALUES ('c', 'd1', 'x')`)
+	for _, n := range []string{"Basalt", "Orion", "Teal"} {
+		exec(`INSERT INTO `+q+`entities (collection, name, norm_name, match_name, canon_name, type, origin) VALUES ('c', $1, lower($1), lower($1), lower($1), 'team', 'extracted')`, n)
+	}
+	exec(`INSERT INTO ` + q + `relations (collection, src_id, dst_id, predicate, document_id, chunk_index, origin)
+	      SELECT 'c', a.id, b.id, 'owns', 'd1', 0, 'extracted' FROM ` + q + `entities a, ` + q + `entities b WHERE a.name = 'Basalt' AND b.name = 'Orion'`)
+	exec(`INSERT INTO ` + q + `relations (collection, src_id, dst_id, predicate, document_id, chunk_index, origin)
+	      SELECT 'c', a.id, b.id, 'peer_of', 'd1', 0, 'manual' FROM ` + q + `entities a, ` + q + `entities b WHERE a.name = 'Orion' AND b.name = 'Teal'`)
+	s.Close()
+
+	s2, err := Open(ctx, Options{URL: url, Schema: schema, Graph: true})
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	st, err := s2.GraphStats(ctx, "c")
+	if err != nil || st.Entities != 3 || st.Relations != 2 || st.ManualRelations != 1 || st.FactSets != 0 {
+		t.Fatalf("after the upgrade: %+v %v", st, err)
+	}
+	fs := store.FactSet{Collection: "c", ID: "org", Entities: []store.FactEntity{{Name: "Teal", Type: "team"}, {Name: "Quartz", Type: "service"}},
+		Relations: []store.FactRelation{{Source: "Teal", Predicate: "owns", Target: "Quartz"}}}
+	if changed, err := s2.ReplaceFactSet(ctx, fs); err != nil || !changed {
+		t.Fatalf("replace on the upgraded schema: %v %v", changed, err)
+	}
+	hits, _ := s2.FindEntitiesByName(ctx, "c", "Teal", 1)
+	ps, err := s2.Expand(ctx, store.ExpandQuery{Collection: "c", SeedIDs: []int64{hits[0].Entity.ID}, Hops: 1})
+	if err != nil || len(ps) != 2 {
+		t.Fatalf("expand (old manual document relation and the curated one): %v %v", ps, err)
+	}
+	var lo, hi int64
+	if err := s2.pool.QueryRow(ctx, `SELECT min(id), max(id) FROM `+q+`entities`).Scan(&lo, &hi); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s2.pool.Exec(ctx, `INSERT INTO `+q+`relations (collection, src_id, dst_id, predicate) VALUES ('c', $1, $2, 'x')`, lo, hi); err == nil {
+		t.Fatal("a relation that cites neither a document nor a fact set was accepted")
+	}
+	if _, err := s2.pool.Exec(ctx, `INSERT INTO `+q+`relations (collection, src_id, dst_id, predicate, document_id, chunk_index, factset_id) VALUES ('c', $1, $2, 'x', 'd1', 0, 'org')`, lo, hi); err == nil {
+		t.Fatal("a relation that cites both was accepted")
+	}
+	if ok, err := s2.DeleteDocument(ctx, "c", "d1"); err != nil || !ok {
+		t.Fatalf("delete document: %v %v", ok, err)
+	}
+	if st, _ := s2.GraphStats(ctx, "c"); st.Relations != 1 || st.ManualRelations != 1 || st.FactSets != 1 {
+		t.Fatalf("document relations must cascade and the curated one stay: %+v", st)
+	}
+	s2.Close()
+
+	s3, err := Open(ctx, Options{URL: url, Schema: schema, Graph: true})
+	if err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+	defer s3.Close()
+	if st, _ := s3.GraphStats(ctx, "c"); st.FactSets != 1 || st.ManualRelations != 1 || st.Relations != 1 {
+		t.Fatalf("a restart changed the fact set: %+v", st)
+	}
+	if got := migrationsIn(t, url, schema); got != "1,3,5,6" {
+		t.Fatalf("migrations = %s", got)
 	}
 }

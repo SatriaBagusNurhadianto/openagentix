@@ -1,7 +1,11 @@
 package store
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +21,8 @@ var (
 	// no longer exists or is no longer pending (its document was replaced or
 	// deleted, or another worker already completed it).
 	ErrJobGone = errors.New("extraction job is gone or already finished")
+	// ErrFactSetNotFound is returned when a fact set does not exist.
+	ErrFactSetNotFound = errors.New("fact set not found")
 )
 
 // Graph limits.
@@ -85,6 +91,8 @@ type EntityInput struct {
 }
 
 // Relation is a directed, typed edge with the evidence it was extracted from.
+// It cites exactly one source: a document chunk (DocumentID, ChunkIndex) or a
+// curated fact set (FactsetID, whose Evidence is the operator's note).
 type Relation struct {
 	ID            int64
 	Collection    string
@@ -93,6 +101,7 @@ type Relation struct {
 	Evidence      string
 	DocumentID    string
 	ChunkIndex    int
+	FactsetID     string
 	PromptVersion string
 	Model         string
 	Origin        string // default OriginExtracted
@@ -105,11 +114,22 @@ type EntityChunk struct {
 	ChunkIndex int
 }
 
-// Citation points at the chunk an edge was derived from.
+// Citation points at the chunk an edge was derived from, or, for a curated
+// edge, at its fact set (DocumentID is then empty).
 type Citation struct {
 	DocumentID string
 	ChunkIndex int
+	FactsetID  string
 	SourceURI  string
+}
+
+// Source names what a citation points at, so that two edges can be told to come
+// from the same document or the same fact set.
+func (c Citation) Source() string {
+	if c.FactsetID != "" {
+		return "factset:" + c.FactsetID
+	}
+	return "document:" + c.DocumentID
 }
 
 // Step is one traversed edge. Forward is true when it was walked from Edge.SrcID
@@ -219,6 +239,8 @@ type ExtractionResult struct {
 type GraphStats struct {
 	Entities, Relations, Mentions     int
 	JobsPending, JobsDone, JobsFailed int
+	// FactSets, ManualEntities and ManualRelations count curated facts.
+	FactSets, ManualEntities, ManualRelations int
 	// LastErrorCode is the error code of the most recently updated job of the
 	// collection that has one (never a message), or empty.
 	LastErrorCode string
@@ -343,4 +365,96 @@ func SortPaths(ps []Path) {
 		}
 		return false
 	})
+}
+
+// FactEntity is one curated entity of a fact set.
+type FactEntity struct {
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	Description string   `json:"description,omitempty"`
+	Aliases     []string `json:"aliases,omitempty"`
+}
+
+// FactRelation is one curated relation of a fact set. Source and Target are
+// names of entities declared in the same fact set. Note is the evidence text.
+type FactRelation struct {
+	Source    string `json:"source"`
+	Predicate string `json:"predicate"`
+	Target    string `json:"target"`
+	Note      string `json:"note,omitempty"`
+}
+
+// FactSet is a named, operator-written catalogue of entities and relations of
+// one collection. ReplaceFactSet stores it as a whole. The JSON form is the
+// request body of the REST API and what is stored to give it back.
+type FactSet struct {
+	Collection string         `json:"-"`
+	ID         string         `json:"-"`
+	SourceURI  string         `json:"source_uri,omitempty"`
+	Entities   []FactEntity   `json:"entities"`
+	Relations  []FactRelation `json:"relations"`
+}
+
+// Hash identifies the content of a fact set (not its collection or id): two
+// sets with equal hashes are the same catalogue.
+func (f FactSet) Hash() string {
+	if f.Entities == nil {
+		f.Entities = []FactEntity{}
+	}
+	if f.Relations == nil {
+		f.Relations = []FactRelation{}
+	}
+	b, _ := json.Marshal(f)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// FactSetInfo summarises a stored fact set.
+type FactSetInfo struct {
+	ID        string
+	SourceURI string
+	Entities  int
+	Relations int
+	UpdatedAt time.Time
+}
+
+// Clone returns a copy that shares no memory with f.
+func (f FactSet) Clone() FactSet {
+	c := f
+	c.Entities = make([]FactEntity, len(f.Entities))
+	for i, e := range f.Entities {
+		e.Aliases = append([]string(nil), e.Aliases...)
+		c.Entities[i] = e
+	}
+	c.Relations = append([]FactRelation{}, f.Relations...)
+	return c
+}
+
+// Resolve checks that f can be stored and returns, for each relation, the
+// indexes into Entities of its source and target. An entity is named by its
+// NormalizeName form; every relation endpoint must be one of them.
+func (f FactSet) Resolve() ([][2]int, error) {
+	if f.Collection == "" || f.ID == "" {
+		return nil, errors.New("fact set needs a collection and an id")
+	}
+	byName := map[string]int{}
+	for i, e := range f.Entities {
+		n := NormalizeName(e.Name)
+		if n == "" || e.Type == "" {
+			return nil, fmt.Errorf("fact set entity %d needs a name and a type", i)
+		}
+		if _, dup := byName[n]; !dup {
+			byName[n] = i
+		}
+	}
+	out := make([][2]int, len(f.Relations))
+	for i, r := range f.Relations {
+		src, ok1 := byName[NormalizeName(r.Source)]
+		dst, ok2 := byName[NormalizeName(r.Target)]
+		if !ok1 || !ok2 || r.Predicate == "" {
+			return nil, fmt.Errorf("fact set relation %d needs a predicate and two entities declared in the same fact set", i)
+		}
+		out[i] = [2]int{src, dst}
+	}
+	return out, nil
 }

@@ -67,6 +67,7 @@ func pathNames(ps []store.Path) []string {
 func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.Store))) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
+	runFactSets(t, f, run)
 
 	run("graph: upsert merges by canonical name within one collection, whatever the type", func(t *testing.T, s store.Store) {
 		g := graphFixture{t, ctx, s}

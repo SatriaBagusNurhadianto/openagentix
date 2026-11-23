@@ -27,6 +27,7 @@ type rkey struct {
 	src, dst         int64
 	predicate, docID string
 	chunk            int
+	factset          string
 }
 
 type mkey struct {
@@ -51,12 +52,24 @@ type graph struct {
 	relKeys                      map[rkey]int64
 	mentions                     map[mkey]string // value: collection
 	jobs                         map[store.JobKey]*jobRec
+	factsets                     map[fskey]*fsRec
+}
+
+type fskey struct{ collection, id string }
+
+// fsRec is a stored fact set: its normalised body and the entities it declares.
+type fsRec struct {
+	fs      store.FactSet
+	hash    string
+	updated time.Time
+	members []int64
 }
 
 func newGraph() graph {
 	return graph{
 		entities: map[int64]*ent{}, byKey: map[ekey]int64{}, relations: map[int64]*store.Relation{},
 		relKeys: map[rkey]int64{}, mentions: map[mkey]string{}, jobs: map[store.JobKey]*jobRec{},
+		factsets: map[fskey]*fsRec{},
 	}
 }
 
@@ -105,11 +118,25 @@ func (s *Store) upsertEntityLocked(in store.EntityInput) (*ent, error) {
 	aliases := store.MatchAliases(name, in.Aliases)
 	if id, ok := g.byKey[k]; ok {
 		e := g.entities[id]
+		// A curated entity taking over an extracted one: its name, type and
+		// description win from now on (see store.EntityInput).
+		takeManual := in.Origin == store.OriginManual && e.Origin != store.OriginManual
+		if takeManual {
+			if in.Type != e.Type {
+				e.OtherTypes = unionSorted(e.OtherTypes, []string{e.Type})
+				e.Type = in.Type
+			}
+			e.OtherTypes = slices.DeleteFunc(e.OtherTypes, func(t string) bool { return t == e.Type })
+			if in.Description != "" {
+				e.Description = in.Description
+			}
+			e.Origin = store.OriginManual
+		}
 		if e.Description == "" {
 			e.Description = in.Description
 		}
 		oldMatch := e.match
-		if e.Origin != store.OriginManual && store.BetterName(e.Name, name) {
+		if takeManual || (e.Origin != store.OriginManual && store.BetterName(e.Name, name)) {
 			e.Name, e.NormName, e.match = name, store.NormalizeName(name), store.MatchForm(name)
 		}
 		// every form seen is findable; the displayed one is not its own alias
@@ -159,13 +186,16 @@ func (s *Store) addRelationLocked(r store.Relation) (int64, error) {
 	if src == nil || dst == nil || src.Collection != r.Collection || dst.Collection != r.Collection {
 		return 0, fmt.Errorf("%w: relation endpoint is not an entity of collection %q", store.ErrNotFound, r.Collection)
 	}
+	if r.FactsetID != "" {
+		return 0, errors.New("relations of a fact set are stored by ReplaceFactSet")
+	}
 	if _, ok := s.m[key{r.Collection, r.DocumentID}]; !ok {
 		return 0, fmt.Errorf("%w: relation document %q", store.ErrNotFound, r.DocumentID)
 	}
 	if r.Predicate == "" {
 		return 0, errors.New("relation needs a predicate")
 	}
-	k := rkey{r.Collection, r.SrcID, r.DstID, r.Predicate, r.DocumentID, r.ChunkIndex}
+	k := rkey{r.Collection, r.SrcID, r.DstID, r.Predicate, r.DocumentID, r.ChunkIndex, r.FactsetID}
 	if id, ok := g.relKeys[k]; ok {
 		return id, nil
 	}
@@ -210,7 +240,7 @@ func (s *Store) dropDocGraphLocked(collection, doc string) {
 	g := &s.g
 	for id, r := range g.relations {
 		if r.Collection == collection && r.DocumentID == doc {
-			delete(g.relKeys, rkey{r.Collection, r.SrcID, r.DstID, r.Predicate, r.DocumentID, r.ChunkIndex})
+			delete(g.relKeys, rkey{r.Collection, r.SrcID, r.DstID, r.Predicate, r.DocumentID, r.ChunkIndex, r.FactsetID})
 			delete(g.relations, id)
 		}
 	}
@@ -363,10 +393,14 @@ func (s *Store) buildPath(nodes []int64, steps []adj) store.Path {
 	for i, a := range steps {
 		r := *a.rel
 		uri := ""
-		if e := s.m[key{r.Collection, r.DocumentID}]; e != nil {
+		if r.FactsetID != "" {
+			if f := s.g.factsets[fskey{r.Collection, r.FactsetID}]; f != nil {
+				uri = f.fs.SourceURI
+			}
+		} else if e := s.m[key{r.Collection, r.DocumentID}]; e != nil {
 			uri = e.doc.SourceURI
 		}
-		p.Steps[i] = store.Step{Edge: r, Forward: a.forward, Cite: store.Citation{DocumentID: r.DocumentID, ChunkIndex: r.ChunkIndex, SourceURI: uri}}
+		p.Steps[i] = store.Step{Edge: r, Forward: a.forward, Cite: store.Citation{DocumentID: r.DocumentID, ChunkIndex: r.ChunkIndex, FactsetID: r.FactsetID, SourceURI: uri}}
 	}
 	return p
 }
@@ -415,11 +449,22 @@ func (s *Store) GraphStats(_ context.Context, collection string) (store.GraphSta
 	for _, e := range s.g.entities {
 		if e.Collection == collection {
 			st.Entities++
+			if e.Origin == store.OriginManual {
+				st.ManualEntities++
+			}
 		}
 	}
 	for _, r := range s.g.relations {
 		if r.Collection == collection {
 			st.Relations++
+			if r.Origin == store.OriginManual {
+				st.ManualRelations++
+			}
+		}
+	}
+	for k := range s.g.factsets {
+		if k.collection == collection {
+			st.FactSets++
 		}
 	}
 	for _, c := range s.g.mentions {
@@ -577,4 +622,120 @@ func (s *Store) ApplyExtraction(_ context.Context, res store.ExtractionResult) e
 	j.LastErrorCode = ""
 	j.UpdatedAt = time.Now().UTC()
 	return nil
+}
+
+// declared reports whether any fact set of the collection other than skip
+// declares the entity.
+func (s *Store) declaredLocked(collection string, id int64, skip fskey) bool {
+	for k, f := range s.g.factsets {
+		if k.collection == collection && k != skip && slices.Contains(f.members, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// dropFactSetLocked removes a fact set, its relations and its mark on entities
+// no other fact set declares. Entities are not collected.
+func (s *Store) dropFactSetLocked(k fskey) {
+	g := &s.g
+	f := g.factsets[k]
+	if f == nil {
+		return
+	}
+	for id, r := range g.relations {
+		if r.Collection == k.collection && r.FactsetID == k.id {
+			delete(g.relKeys, rkey{r.Collection, r.SrcID, r.DstID, r.Predicate, r.DocumentID, r.ChunkIndex, r.FactsetID})
+			delete(g.relations, id)
+		}
+	}
+	for _, id := range f.members {
+		if e := g.entities[id]; e != nil && !s.declaredLocked(k.collection, id, k) {
+			e.Origin = store.OriginExtracted
+		}
+	}
+	delete(g.factsets, k)
+}
+
+func (s *Store) ReplaceFactSet(_ context.Context, fs store.FactSet) (bool, error) {
+	ends, err := fs.Resolve()
+	if err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g := &s.g
+	k := fskey{fs.Collection, fs.ID}
+	hash := fs.Hash()
+	if old := g.factsets[k]; old != nil && old.hash == hash {
+		return false, nil
+	}
+	s.dropFactSetLocked(k)
+	ids := make([]int64, len(fs.Entities))
+	var members []int64
+	for i, x := range fs.Entities {
+		e, err := s.upsertEntityLocked(store.EntityInput{
+			Collection: fs.Collection, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, Origin: store.OriginManual,
+		})
+		if err != nil {
+			return false, err
+		}
+		ids[i] = e.ID
+		if !slices.Contains(members, e.ID) {
+			members = append(members, e.ID)
+		}
+	}
+	g.factsets[k] = &fsRec{fs: fs.Clone(), hash: hash, updated: time.Now().UTC(), members: members}
+	for i, r := range fs.Relations {
+		src, dst := ids[ends[i][0]], ids[ends[i][1]]
+		rk := rkey{fs.Collection, src, dst, r.Predicate, "", 0, fs.ID}
+		if _, dup := g.relKeys[rk]; dup {
+			continue
+		}
+		g.nextRel++
+		g.relations[g.nextRel] = &store.Relation{
+			ID: g.nextRel, Collection: fs.Collection, SrcID: src, DstID: dst, Predicate: r.Predicate, Evidence: r.Note,
+			FactsetID: fs.ID, Origin: store.OriginManual,
+		}
+		g.relKeys[rk] = g.nextRel
+	}
+	s.collectLocked(fs.Collection)
+	return true, nil
+}
+
+func (s *Store) GetFactSet(_ context.Context, collection, id string) (store.FactSet, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	f := s.g.factsets[fskey{collection, id}]
+	if f == nil {
+		return store.FactSet{}, store.ErrFactSetNotFound
+	}
+	out := f.fs.Clone()
+	out.Collection, out.ID = collection, id
+	return out, nil
+}
+
+func (s *Store) ListFactSets(_ context.Context, collection string) ([]store.FactSetInfo, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []store.FactSetInfo
+	for k, f := range s.g.factsets {
+		if k.collection == collection {
+			out = append(out, store.FactSetInfo{ID: k.id, SourceURI: f.fs.SourceURI, Entities: len(f.fs.Entities), Relations: len(f.fs.Relations), UpdatedAt: f.updated})
+		}
+	}
+	slices.SortFunc(out, func(a, b store.FactSetInfo) int { return strings.Compare(a.ID, b.ID) })
+	return out, nil
+}
+
+func (s *Store) DeleteFactSet(_ context.Context, collection, id string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := fskey{collection, id}
+	if s.g.factsets[k] == nil {
+		return false, nil
+	}
+	s.dropFactSetLocked(k)
+	s.collectLocked(collection)
+	return true, nil
 }

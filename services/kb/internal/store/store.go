@@ -108,6 +108,23 @@ type Store interface {
 	// GraphStats counts the graph rows of a collection.
 	GraphStats(ctx context.Context, collection string) (GraphStats, error)
 
+	// ReplaceFactSet atomically replaces the fact set of fs.Collection and fs.ID
+	// (creating it if new) with the curated entities and relations of fs, which
+	// must be valid: every relation names entities declared in fs. Entities are
+	// merged with existing ones by canonical name; the curated name and type win
+	// for display and the entity becomes manual. Facts the previous version had
+	// and this one has not are removed; a manual entity that no other fact set
+	// declares is un-marked, and removed if nothing else refers to it. Replacing
+	// a fact set by an identical one changes nothing and returns changed=false.
+	ReplaceFactSet(ctx context.Context, fs FactSet) (changed bool, err error)
+	// GetFactSet returns a stored fact set, or ErrFactSetNotFound.
+	GetFactSet(ctx context.Context, collection, id string) (FactSet, error)
+	// ListFactSets returns the fact sets of a collection sorted by id.
+	ListFactSets(ctx context.Context, collection string) ([]FactSetInfo, error)
+	// DeleteFactSet removes a fact set and its relations; it reports whether it
+	// existed. Its entities are un-marked and removed only if unused.
+	DeleteFactSet(ctx context.Context, collection, id string) (bool, error)
+
 	// SyncExtractionJobs makes the extraction jobs of a document match specs. If
 	// the document already has exactly these jobs for promptVersion nothing
 	// changes and it returns 0. Otherwise the document's graph rows and jobs are

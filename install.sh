@@ -30,6 +30,8 @@
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
 #                        same files on every run, or the extras disappear.
 #   KOURIER_VALUES_FILE="k.yaml"  extra values for the Agent Kourier release (see components/channels/kourier-values.yaml)
+#   KOURIER_APISERVER_CIDRS="10.0.0.0/24 ..."  the API server addresses Kourier's NetworkPolicy allows (comma or space separated); default: on kind the
+#                        /24 of the API server's node address, elsewhere the exact endpoint addresses (components/channels/apiserver-cidrs.sh)
 # Observability is opt-in too: the ONE switch is the chart value observability.enabled (components/observability/demo-values.yaml). When the chart
 # renders its marker ConfigMap (openagentix-observability) this script applies the same settings to what the chart does not own: the kagent
 # controller and agent runtimes (spikes/kagent/kagent-helm.sh, only when they differ from the release) and the Agent Kourier release.

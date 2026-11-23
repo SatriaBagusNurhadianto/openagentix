@@ -4,12 +4,18 @@
 #   kourier.sh install     needs KOURIER_TEAM_NS (namespaces whose connections the broker serves, space separated)
 #                          optional KOURIER_EGRESS (JSON list of NetworkPolicy egress rules, from the chart's marker ConfigMap)
 #                          optional KOURIER_VALUES_FILE (extra values files, space separated, applied last)
+#                          optional KOURIER_APISERVER_CIDRS (CIDRs, comma or space separated, the API server addresses the NetworkPolicy
+#                          allows; wins over detection. Default: on kind the /24 of the API server's node address, so that an address
+#                          change after a Docker restart does not cut Kourier off; elsewhere the exact endpoint addresses (/32).
+#                          See apiserver-cidrs.sh; offline tests: tests/run.sh)
 #   kourier.sh uninstall   removes the release; PURGE_DATA=1 also its PVC and the three CRDs (this deletes every
 #                          ChatConnection/Binding/AgentBackend that is left); the namespace is kept
 # Idempotent: when the release already has this chart version and exactly these values, nothing is changed (no new
 # revision, no pod restart). Never prints a secret value (there are none here).
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=apiserver-cidrs.sh
+. "$HERE/apiserver-cidrs.sh"
 CTX=${KUBE_CONTEXT:-kind-${CLUSTER:-openagentix}}
 K="${KUBECTL:-kubectl} --context $CTX"
 REL=agent-kourier
@@ -24,9 +30,14 @@ case "${1:-}" in
 install)
   T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
   # desired release values: the file in this directory, the namespaces and egress from the chart, the API server address
-  APISERVER=$($K get endpointslices.discovery.k8s.io -n default -l kubernetes.io/service-name=kubernetes -o json \
-    | jq -c '[.items[].endpoints[].addresses[]|select(test(":")|not)+"/32"]|unique')
-  [ "$APISERVER" != "[]" ] || { echo "ERROR: could not find the API server address (endpointslice default/kubernetes)" >&2; exit 1; }
+  # which API server addresses the NetworkPolicy allows: see apiserver-cidrs.sh (kind: the node /24; elsewhere: the exact addresses)
+  EPS=""; NODES=""
+  if [ -z "$(printf '%s' "${KOURIER_APISERVER_CIDRS:-}" | tr -d '[:space:],')" ]; then
+    EPS=$($K get endpointslices.discovery.k8s.io -n default -l kubernetes.io/service-name=kubernetes -o json)
+    NODES=$($K get nodes -o json 2>/dev/null || echo '{"items":[]}')   # only used to recognise kind; unreadable means "not kind": exact addresses
+  fi
+  APISERVER=$(kourier_apiserver_cidrs "${KOURIER_APISERVER_CIDRS:-}" "$EPS" "$NODES") || exit 1
+  echo "agent-kourier: the NetworkPolicy lets it reach the API server at $APISERVER"
   NSJSON=$(printf '%s\n' ${KOURIER_TEAM_NS:?KOURIER_TEAM_NS is required} | jq -R . | jq -sc .)
   yq -c . "$HERE/kourier-values.yaml" > "$T/base.json"
   jq -n --argjson ns "$NSJSON" --argjson api "$APISERVER" --argjson egress "${KOURIER_EGRESS:-[]}" \

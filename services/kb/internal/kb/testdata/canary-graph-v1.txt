@@ -1,0 +1,124 @@
+E|15|system|Cluster Amber
+E|16|location|Vane-1
+E|17|event|power outage on 3 March
+E|18|system|faulty transfer switch
+E|19|team|Team Basalt
+E|20|person|Mira Okafor
+E|21|service|Ember
+E|23|team|Granite
+E|24|team|Team Granite
+E|25|person|Mira Lindqvist
+E|26|location|Gothenburg
+E|27|person|Granite team lead
+E|28|service|Ink
+E|29|system|Onyx
+E|30|system|product database
+E|31|system|object storage
+E|32|system|admin interface
+E|33|system|Cluster Jade
+E|34|location|Vane-3
+E|35|service|wiki
+E|36|service|ticket system
+E|37|service|build runners
+E|38|system|Cluster Larch
+E|39|location|Kestrel-1
+E|40|event|disk outage
+E|41|concept|firmware bug
+E|42|service|Lantern
+E|43|system|Ink
+E|45|team|team Slate
+E|46|team|Team Marrow
+E|47|person|Aiko Brandt
+E|48|person|Pylon author
+E|49|event|Partner incidents
+E|51|system|internal wiki
+E|52|event|engineering day
+E|53|system|Cluster Onyx
+E|54|location|Vane-2
+E|55|organization|provider
+E|56|event|network outage
+E|57|system|second uplink
+E|58|person|on-call engineer
+E|59|service|Orion
+E|60|service|Quill
+E|62|team|Basalt
+E|63|service|Parch
+E|64|system|Amber
+E|65|system|database
+E|66|system|standby
+E|67|system|queue
+E|68|event|nightly job
+E|69|service|Pylon
+E|70|team|Marrow
+E|71|location|Lisbon office
+E|72|system|dashboard
+E|74|system|Teal
+E|75|system|dedicated database
+E|76|system|Read replicas
+E|77|service|Quire
+E|79|service|Sparrow
+E|83|system|notification tools
+E|84|system|cluster Teal
+E|85|team|platform group
+E|86|system|storage layer
+E|87|concept|maintenance ticket
+E|90|system|storage controller
+E|91|system|disk health alerts
+E|93|team|Team Tern
+E|94|person|Dev Okonkwo
+E|95|person|finance engineering duty officer
+E|96|team|finance controllers
+E|97|event|nightly batch window
+R|15|located_in|16|amber-region-incident|Cluster Amber runs in region Vane-1 and had a power outage on 3 March.
+R|18|caused|17|amber-region-incident|A faulty transfer switch in the data hall cut two racks for about twenty minutes.
+R|20|member_of|19|basalt-on-call|Team Basalt's on-call engineer is Mira Okafor for the current quarter.
+R|23|owns|21|ember-ownership|Service Ember is owned by team Granite, which also keeps its runbooks up to date.
+R|25|member_of|24|granite-on-call|Team Granite's on-call engineer is Mira Lindqvist for this month.
+R|25|located_in|26|granite-on-call|She is based in Gothenburg
+R|27|member_of|24|granite-on-call|Escalations that cannot be solved in the first hour go to the Granite team lead.
+R|28|uses|29|ink-storage|Ink stores its data in cluster Onyx
+R|28|depends_on|30|ink-storage|The catalogue is rebuilt from the product database every few hours
+R|28|uses|31|ink-storage|Large images are not stored in the database but in object storage behind a cache.
+R|32|part_of|28|ink-storage|Ink exposes a small admin interface that is reachable only from the office network.
+R|33|located_in|34|jade-region|Cluster Jade runs in region Vane-3 as a small cluster for internal tools.
+R|35|part_of|33|jade-region|It hosts the wiki, the ticket system and a few build runners.
+R|36|part_of|33|jade-region|It hosts the wiki, the ticket system and a few build runners.
+R|37|part_of|33|jade-region|It hosts the wiki, the ticket system and a few build runners.
+R|38|located_in|39|kestrel-region-incident|Cluster Larch runs in region Kestrel-1
+R|41|caused|40|kestrel-region-incident|A firmware bug in one batch of drives caused a group of nodes to drop their volumes at the same time.
+R|42|calls|43|lantern-dependencies|Lantern calls the catalogue API Ink for that data
+R|42|owned_by|45|lantern-ownership|Service Lantern is owned by team Slate
+R|47|on_call_for|46|marrow-on-call|Team Marrow's on-call engineer is Aiko Brandt this week.
+R|47|handles|49|marrow-on-call|Partner incidents are handled first by her and, if needed, by the Pylon author.
+R|48|handles|49|marrow-on-call|Partner incidents are handled first by her and, if needed, by the Pylon author.
+R|20|part_of|52|mira-okafor-talk|At the last engineering day Mira Okafor gave a short talk about keeping alerts useful.
+R|20|uses|51|mira-okafor-talk|The slides were shared on the internal wiki afterwards.
+R|53|located_in|54|onyx-region-incident|Cluster Onyx runs in region Vane-2
+R|55|caused|56|onyx-region-incident|A routing change at the provider isolated the region from the internet for roughly half an hour.
+R|53|depends_on|57|onyx-region-incident|The review recommended a second uplink, which was approved but not yet installed.
+R|59|calls|60|orion-dependencies|Orion calls the ledger API Quill to record each payment intent before it confirms the order.
+R|62|owns|59|orion-ownership|Service Orion is owned by team Basalt
+R|63|uses|64|parch-storage|Parch stores its data in cluster Amber, in a database that is replicated to a standby.
+R|65|part_of|64|parch-storage|Parch stores its data in cluster Amber, in a database that is replicated to a standby.
+R|65|depends_on|66|parch-storage|in a database that is replicated to a standby
+R|63|uses|67|parch-storage|Preference changes are written through a queue so that bursts do not slow down readers.
+R|68|manages|63|parch-storage|A nightly job removes preferences of deleted accounts.
+R|69|owned_by|70|pylon-ownership|Service Pylon is owned by team Marrow, a small group based in the Lisbon office.
+R|70|located_in|71|pylon-ownership|a small group based in the Lisbon office
+R|69|uses|72|pylon-ownership|Pylon enforces rate limits per partner and reports the numbers to a dashboard.
+R|60|uses|74|quill-storage|Quill stores its data in cluster Teal, using a dedicated database with synchronous replication.
+R|75|part_of|74|quill-storage|Quill stores its data in cluster Teal, using a dedicated database with synchronous replication.
+R|76|part_of|60|quill-storage|Read replicas serve the reporting queries so that the write path stays quiet.
+R|77|uses|33|quire-storage|Quire stores its data in cluster Jade, next to the internal tools, because its volume is modest.
+R|79|calls|77|sparrow-dependencies|Sparrow calls the ledger API Quire once per customer and walks the result page by page.
+R|79|owned_by|23|sparrow-ownership|Service Sparrow is owned by team Granite
+R|23|owns|83|sparrow-ownership|the same group that looks after the notification tools
+R|84|part_of|85|teal-maintenance|Maintenance on cluster Teal happens on the first Tuesday of each month.
+R|86|part_of|84|teal-maintenance|the storage layer is checked before the next node is drained
+R|87|part_of|84|teal-maintenance|A maintenance ticket must be opened beforehand, and it lists who may mute alerts and for how long.
+R|84|located_in|34|teal-region-incident|Cluster Teal runs in region Vane-3
+R|90|part_of|84|teal-region-incident|A failing storage controller made several volumes read-only for about forty minutes.
+R|91|depends_on|87|teal-region-incident|Since then the alerts are tied to the maintenance ticket and return automatically when it closes.
+R|94|member_of|93|tern-on-call|Team Tern's on-call engineer is Dev Okonkwo
+R|93|depends_on|97|tern-on-call|Team Tern only needs on-call cover during the nightly batch window.
+R|94|uses|96|tern-on-call|The request is being discussed with the finance controllers.

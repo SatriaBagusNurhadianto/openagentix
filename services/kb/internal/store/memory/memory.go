@@ -41,11 +41,12 @@ type Store struct {
 	dim int
 	mu  sync.RWMutex
 	m   map[key]*entry
+	g   graph
 }
 
 // New returns an empty store. dim > 0 makes it reject embeddings of any other
 // length; dim == 0 accepts any length.
-func New(dim int) *Store { return &Store{dim: dim, m: map[key]*entry{}} }
+func New(dim int) *Store { return &Store{dim: dim, m: map[key]*entry{}, g: newGraph()} }
 
 func tokenize(s string) []string {
 	return strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
@@ -79,6 +80,9 @@ func (s *Store) DeleteDocument(_ context.Context, collection, id string) (bool, 
 	k := key{collection, id}
 	_, ok := s.m[k]
 	delete(s.m, k)
+	if ok {
+		s.dropDocGraphLocked(collection, id)
+	}
 	return ok, nil
 }
 

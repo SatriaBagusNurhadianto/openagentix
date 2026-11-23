@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -35,15 +36,15 @@ func randomSchema() string {
 // open returns a store in a fresh schema that is dropped at test end.
 func open(t *testing.T, dim int) (*Store, string) {
 	t.Helper()
-	return openAt(t, testURL(t), dim)
+	return openAt(t, testURL(t), dim, false)
 }
 
-func openAt(t *testing.T, url string, dim int) (*Store, string) {
+func openAt(t *testing.T, url string, dim int, graph bool) (*Store, string) {
 	t.Helper()
 	schema := randomSchema()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	s, err := Open(ctx, Options{URL: url, Schema: schema, VectorDim: dim})
+	s, err := Open(ctx, Options{URL: url, Schema: schema, VectorDim: dim, Graph: graph})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
@@ -61,12 +62,14 @@ func openAt(t *testing.T, url string, dim int) (*Store, string) {
 
 func TestConformanceLexical(t *testing.T) {
 	testURL(t)
-	storetest.Run(t, storetest.Factory{New: func(t *testing.T) store.Store { s, _ := open(t, 0); return s }})
+	url := testURL(t)
+	storetest.Run(t, storetest.Factory{New: func(t *testing.T) store.Store { s, _ := openAt(t, url, 0, true); return s }, Graph: true})
 }
 
 func TestConformanceHybrid(t *testing.T) {
 	testURL(t)
-	storetest.Run(t, storetest.Factory{New: func(t *testing.T) store.Store { s, _ := open(t, 3); return s }, Vectors: true, Dim: 3})
+	url := testURL(t)
+	storetest.Run(t, storetest.Factory{New: func(t *testing.T) store.Store { s, _ := openAt(t, url, 3, true); return s }, Vectors: true, Dim: 3, Graph: true})
 }
 
 func TestMigrationsAreIdempotent(t *testing.T) {
@@ -357,5 +360,135 @@ func TestUnavailableSettingDoesNotPoisonTransaction(t *testing.T) {
 	var one int
 	if err := tx.QueryRow(ctx, `SELECT 1`).Scan(&one); err != nil || one != 1 {
 		t.Fatalf("transaction unusable after a failed SET: %v", err)
+	}
+}
+
+var graphTables = []string{"entities", "relations", "entity_chunks", "extraction_jobs"}
+
+func tablesIn(t *testing.T, url, schema string) []string {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	rows, err := pool.Query(context.Background(), `SELECT table_name FROM information_schema.tables WHERE table_schema = $1 ORDER BY 1`, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}
+
+func migrationsIn(t *testing.T, url, schema string) string {
+	t.Helper()
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	var v string
+	if err := pool.QueryRow(context.Background(), `SELECT string_agg(version::text, ',' ORDER BY version) FROM "`+schema+`".schema_migrations`).Scan(&v); err != nil {
+		t.Fatal(err)
+	}
+	return v
+}
+
+func TestGraphDisabledCreatesNoGraphTable(t *testing.T) {
+	url := testURL(t)
+	for _, dim := range []int{0, 3} {
+		s, schema := openAt(t, url, dim, false)
+		got := strings.Join(tablesIn(t, url, schema), ",")
+		for _, tbl := range graphTables {
+			if strings.Contains(got, tbl) {
+				t.Fatalf("dim=%d: graph disabled but table %s exists (tables: %s)", dim, tbl, got)
+			}
+		}
+		if want := map[int]string{0: "1", 3: "1,2"}[dim]; migrationsIn(t, url, schema) != want {
+			t.Fatalf("dim=%d: migrations = %s, want %s", dim, migrationsIn(t, url, schema), want)
+		}
+		ctx := context.Background()
+		if _, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "x", Type: "concept"}); !errors.Is(err, store.ErrGraphDisabled) {
+			t.Fatalf("UpsertEntity: %v", err)
+		}
+		if _, err := s.Expand(ctx, store.ExpandQuery{Collection: "c", SeedIDs: []int64{1}}); !errors.Is(err, store.ErrGraphDisabled) {
+			t.Fatalf("Expand: %v", err)
+		}
+		if _, _, err := s.ClaimJob(ctx, time.Second); !errors.Is(err, store.ErrGraphDisabled) {
+			t.Fatalf("ClaimJob: %v", err)
+		}
+		// Plain document operations are unchanged.
+		if err := s.UpsertDocument(ctx, store.Document{Collection: "c", ID: "a", Text: "t"}, []store.Chunk{{Text: "hello"}}); err != nil {
+			t.Fatal(err)
+		}
+		if chunks, err := s.DocumentChunks(ctx, "c", "a"); err != nil || len(chunks) != 1 {
+			t.Fatalf("chunks=%v err=%v", chunks, err)
+		}
+		if ok, err := s.DeleteDocument(ctx, "c", "a"); err != nil || !ok {
+			t.Fatalf("delete: %v %v", ok, err)
+		}
+	}
+}
+
+func TestGraphMigrationsApplyOnceAndAreIdempotent(t *testing.T) {
+	url := testURL(t)
+	for _, dim := range []int{0, 3} {
+		schema := randomSchema()
+		ctx := context.Background()
+		for i := 0; i < 3; i++ {
+			s, err := Open(ctx, Options{URL: url, Schema: schema, VectorDim: dim, Graph: true})
+			if err != nil {
+				t.Fatalf("dim=%d open #%d: %v", dim, i, err)
+			}
+			s.Close()
+		}
+		t.Cleanup(func() { dropSchema(t, url, schema) })
+		got := strings.Join(tablesIn(t, url, schema), ",")
+		for _, tbl := range graphTables {
+			if !strings.Contains(got, tbl) {
+				t.Fatalf("dim=%d: table %s missing (tables: %s)", dim, tbl, got)
+			}
+		}
+		if want := map[int]string{0: "1,3", 3: "1,2,3,4"}[dim]; migrationsIn(t, url, schema) != want {
+			t.Fatalf("dim=%d: migrations = %s, want %s", dim, migrationsIn(t, url, schema), want)
+		}
+	}
+}
+
+func TestNonGraphDocumentsStillCascadeGraphRows(t *testing.T) {
+	// Deleting a document must not leave relations, mentions or jobs behind even
+	// when they were written directly (the FKs cascade, not only the Go code).
+	url := testURL(t)
+	s, schema := openAt(t, url, 0, true)
+	ctx := context.Background()
+	if err := s.UpsertDocument(ctx, store.Document{Collection: "c", ID: "a", Text: "t"}, []store.Chunk{{Text: "hello"}}); err != nil {
+		t.Fatal(err)
+	}
+	a, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "A", Type: "concept"})
+	b, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "B", Type: "concept"})
+	if _, err := s.AddRelation(ctx, store.Relation{Collection: "c", SrcID: a.ID, DstID: b.ID, Predicate: "x", Evidence: "e", DocumentID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SyncExtractionJobs(ctx, "c", "a", "v1", []store.JobSpec{{WindowIdx: 0, WindowHash: "h", ChunkCount: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	pool, _ := pgxpool.New(ctx, url)
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `DELETE FROM "`+schema+`".documents`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tbl := range []string{"relations", "entity_chunks", "extraction_jobs"} {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM "`+schema+`".`+tbl).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("%s: %d rows left (%v)", tbl, n, err)
+		}
 	}
 }

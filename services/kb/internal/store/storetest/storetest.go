@@ -19,6 +19,8 @@ type Factory struct {
 	New     func(t *testing.T) store.Store
 	Vectors bool
 	Dim     int
+	// Graph reports that the stores support the knowledge-graph methods.
+	Graph bool
 }
 
 func ch(texts ...string) []store.Chunk {
@@ -314,6 +316,9 @@ func Run(t *testing.T, f Factory) {
 		}
 	})
 
+	if f.Graph {
+		runGraph(t, f, run)
+	}
 	if !f.Vectors {
 		return
 	}

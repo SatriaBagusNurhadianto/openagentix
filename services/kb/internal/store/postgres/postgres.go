@@ -31,6 +31,10 @@ type Options struct {
 	URL       string
 	Schema    string // PostgreSQL schema holding the tables; created if missing
 	VectorDim int    // > 0 enables pgvector with this dimension
+	// Graph creates the knowledge-graph tables (migrations 3 and 4) and enables
+	// the graph methods. With false no graph table is created and those methods
+	// return store.ErrGraphDisabled.
+	Graph bool
 }
 
 // Store implements store.Store on PostgreSQL.
@@ -38,6 +42,7 @@ type Store struct {
 	pool   *pgxpool.Pool
 	schema string // quoted identifier
 	dim    int
+	graph  bool
 	// vecSchema is the quoted schema holding the pgvector extension. All
 	// vector types and operators are referenced qualified with it, so the
 	// extension can live in any schema (by default "public", shared by every
@@ -65,7 +70,7 @@ func Open(ctx context.Context, o Options) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("database unreachable: %w", err)
 	}
-	s := &Store{pool: pool, schema: quoted, dim: o.VectorDim}
+	s := &Store{pool: pool, schema: quoted, dim: o.VectorDim, graph: o.Graph}
 	if err := s.migrate(ctx, o.Schema); err != nil {
 		pool.Close()
 		return nil, err
@@ -112,6 +117,8 @@ func (s *Store) migrate(ctx context.Context, rawSchema string) error {
 	}{
 		{1, "migrations/0001_init.sql", true, nil},
 		{2, "migrations/0002_vector.sql", s.dim > 0, s.prepareVector},
+		{3, "migrations/0003_graph.sql", s.graph, nil},
+		{4, "migrations/0004_graph_vector.sql", s.graph && s.dim > 0, nil},
 	}
 	for _, st := range steps {
 		if !st.enabled {
@@ -249,6 +256,9 @@ func (s *Store) UpsertDocument(ctx context.Context, doc store.Document, chunks [
 }
 
 func (s *Store) DeleteDocument(ctx context.Context, collection, id string) (bool, error) {
+	if s.graph {
+		return s.deleteDocumentWithGraph(ctx, collection, id)
+	}
 	tag, err := s.pool.Exec(ctx, `DELETE FROM `+s.schema+`.documents WHERE collection = $1 AND id = $2`, collection, id)
 	if err != nil {
 		return false, err

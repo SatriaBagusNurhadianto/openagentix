@@ -73,6 +73,58 @@ type Store interface {
 	ListCollections(ctx context.Context) ([]CollectionInfo, error)
 	// Search returns at most q.TopK hits, best first.
 	Search(ctx context.Context, q Query) ([]Hit, error)
+	// DocumentChunks returns the chunk texts of a document in order, or
+	// ErrNotFound.
+	DocumentChunks(ctx context.Context, collection, id string) ([]string, error)
+
+	// The knowledge-graph methods below return ErrGraphDisabled on a store that
+	// was opened without graph support. All of them are scoped to one collection:
+	// entities are never shared across collections.
+
+	// UpsertEntity creates an entity or merges into the existing one with the
+	// same collection, type and normalised name.
+	UpsertEntity(ctx context.Context, in EntityInput) (Entity, error)
+	// AddRelation stores an edge and returns its id. Both entities must belong to
+	// r.Collection and the document must exist (else ErrNotFound). Adding the same
+	// (src, dst, predicate, document, chunk) again returns the existing id.
+	AddRelation(ctx context.Context, r Relation) (int64, error)
+	// LinkEntityChunk records that an entity is mentioned in a chunk (idempotent).
+	LinkEntityChunk(ctx context.Context, collection string, ec EntityChunk) error
+	// DeleteDocumentGraph removes the relations, mentions and extraction jobs of
+	// a document, and then the extracted entities nothing refers to any more.
+	DeleteDocumentGraph(ctx context.Context, collection, documentID string) error
+	// FindEntitiesByName finds seed entities whose name or alias equals the text,
+	// is contained in it (an entity named in a question) or contains it.
+	FindEntitiesByName(ctx context.Context, collection, text string, limit int) ([]EntityHit, error)
+	// FindEntitiesByEmbedding finds seed entities by cosine similarity of their
+	// name embedding. It returns nothing on a store without vectors.
+	FindEntitiesByEmbedding(ctx context.Context, collection string, embedding []float32, limit int) ([]EntityHit, error)
+	// Expand returns the simple paths of 1..Hops edges from the seeds, each edge
+	// with its citation, ordered by length and then by entity and edge ids.
+	Expand(ctx context.Context, q ExpandQuery) ([]Path, error)
+	// ShortestPaths returns all shortest paths (up to Limit) between two entities
+	// that are at most MaxHops edges long.
+	ShortestPaths(ctx context.Context, q PathQuery) ([]Path, error)
+	// GraphStats counts the graph rows of a collection.
+	GraphStats(ctx context.Context, collection string) (GraphStats, error)
+
+	// SyncExtractionJobs makes the extraction jobs of a document match specs. If
+	// the document already has exactly these jobs for promptVersion nothing
+	// changes and it returns 0. Otherwise the document's graph rows and jobs are
+	// replaced by new pending jobs and it returns their number.
+	SyncExtractionJobs(ctx context.Context, collection, documentID, promptVersion string, specs []JobSpec) (int, error)
+	// ClaimJob leases the oldest runnable pending job for the given duration. A
+	// job whose lease expired (its worker died) is claimable again. ok is false
+	// when nothing is runnable.
+	ClaimJob(ctx context.Context, lease time.Duration) (job Job, ok bool, err error)
+	// ApplyExtraction stores a result and marks its job done in one transaction.
+	// It returns ErrJobGone if the job is not pending any more.
+	ApplyExtraction(ctx context.Context, res ExtractionResult) error
+	// FailJob records a failed attempt. With final, or when it is not final but
+	// the caller decided so, the job becomes failed; otherwise it is retried
+	// after retryIn.
+	FailJob(ctx context.Context, key JobKey, code string, retryIn time.Duration, final bool) error
+
 	// Ping checks that the backend is reachable.
 	Ping(ctx context.Context) error
 	// Close releases resources.

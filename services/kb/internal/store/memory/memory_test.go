@@ -12,6 +12,7 @@ func TestConformance(t *testing.T) {
 		New:     func(t *testing.T) store.Store { return New(3) },
 		Vectors: true,
 		Dim:     3,
+		Graph:   true,
 	})
 }
 

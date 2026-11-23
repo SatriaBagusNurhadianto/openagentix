@@ -41,7 +41,7 @@
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
 # The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
-# kb-admin, kb-postgres, kb-database and, for gateway-routed embeddings, kb-virtual-key in openagentix-knowledge.
+# kb-admin, kb-postgres, kb-database and, for gateway-routed embeddings, kb-virtual-key (and, with knowledge.kb.graph.enabled, the extraction key kb-extract-key) in openagentix-knowledge.
 # Secret values are never echoed, never put in argv or written to disk.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
@@ -125,7 +125,11 @@ BRIDGE_IMAGE=$(jq -r 'select(.kind=="Deployment" and .metadata.name=="telegram-b
 KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDERED")   # empty when knowledge.enabled=false
 # Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
 NOTIFY_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="notify")' <<<"$RENDERED")   # empty when notify.enabled=false
-KB_KEY=$(jq -r 'select(.kind=="Deployment" and (.metadata.annotations["openagentix.io/gateway-user"]//"")!="")|[.metadata.annotations["openagentix.io/gateway-user"],.metadata.annotations["openagentix.io/gateway-key-secret"],.metadata.namespace]|@tsv' <<<"$RENDERED")
+# A Deployment asks for one key per annotation SET: openagentix.io/gateway-user<sfx> (the user id), gateway-key-secret<sfx> (the Secret) and,
+# optionally, gateway-key-name<sfx> (the Secret key, default OPENAI_API_KEY); <sfx> is empty for the first set, "-extract" for the kb's
+# extraction key. Annotation names are unique per object, so a second key on one Deployment needs a second suffix: the earlier one-pair lookup
+# is the same expression with an empty suffix.
+KB_KEY=$(jq -r 'select(.kind=="Deployment")|.metadata as $m|($m.annotations//{})|to_entries[]|select(.key|test("^openagentix.io/gateway-user(-.+)?$"))|select(.value!="")|(.key|ltrimstr("openagentix.io/gateway-user")) as $sfx|[.value,$m.annotations["openagentix.io/gateway-key-secret"+$sfx],$m.namespace,($m.annotations["openagentix.io/gateway-key-name"+$sfx]//"OPENAI_API_KEY")]|@tsv' <<<"$RENDERED")
 [ -z "$KB_KEY" ] || AGENT_KEYS=$(printf '%s\n%s' "$AGENT_KEYS" "$KB_KEY")
 
 # --- 3b. long-term memory needs pgvector in kagent's PostgreSQL and config.database.vectorEnabled=true ------------------
@@ -281,11 +285,12 @@ if [ -n "$NOTIFY_DEP" ]; then
 fi
 
 CM_ARGS=()
-while IFS=$'\t' read -r agent secret ns; do
+while IFS=$'\t' read -r agent secret ns vkey; do
   [ -n "$agent" ] || continue
+  vkey=${vkey:-OPENAI_API_KEY}
   $K get secret -n "$ns" "$secret" >/dev/null 2>&1 || \
-    $K create secret generic "$secret" -n "$ns" --from-file=OPENAI_API_KEY=<(printf 'vk-%s' "$(openssl rand -hex 16)") >/dev/null
-  h=$($K get secret -n "$ns" "$secret" -o jsonpath='{.data.OPENAI_API_KEY}' | base64 -d | shasum -a 256 | awk '{print "sha256:"$1}')
+    $K create secret generic "$secret" -n "$ns" --from-file="$vkey"=<(printf 'vk-%s' "$(openssl rand -hex 16)") >/dev/null
+  h=$($K get secret -n "$ns" "$secret" -o jsonpath="{.data.${vkey//./\\.}}" | base64 -d | shasum -a 256 | awk '{print "sha256:"$1}')
   CM_ARGS+=(--from-literal="$agent={\"keyHash\":\"$h\",\"metadata\":{\"user_id\":\"$agent\"}}")
   echo "virtual key for agent '$agent': Secret $ns/$secret"
 done <<<"$AGENT_KEYS"

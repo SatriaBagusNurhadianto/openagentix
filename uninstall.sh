@@ -4,6 +4,7 @@
 # (provider keys, virtual keys, llm-api-keys, telegram-bridge), so a later ./install.sh reuses them.
 # PURGE_SECRETS=1 additionally deletes the Secrets/ConfigMap that install.sh created for this release (except the
 # knowledge base database credentials: they must stay as long as its volume does).
+# PURGE_SECRETS=1 also deletes the kb's graph extraction key (Secret kb-extract-key) when the knowledge graph was enabled.
 # PURGE_SECRETS=1 also deletes the notify service's Secrets (the destinations file with the chat ids, and the copied bot token).
 # Observability: the release's objects (bundled VictoriaMetrics and Jaeger, monitors, telemetry configs) go with the release; PURGE_DATA=1 also
 # deletes the VictoriaMetrics volume. The kagent controller's telemetry settings and Agent Kourier's OTLP env are NOT reverted by uninstalling
@@ -21,6 +22,8 @@ $K config use-context "$CTX" >/dev/null || { echo "ERROR: kube context $CTX not 
 VKEYS=""
 if [ "${PURGE_SECRETS:-0}" = 1 ]; then   # read per-agent virtual key secret names before the release is removed
   VKEYS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="ModelConfig")|.metadata.namespace+"/"+.spec.apiKeySecret' 2>/dev/null || true)
+  # the kb's extraction key (only annotated when install.sh created it; absent with the knowledge graph off)
+  VKEYS+=$'\n'$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="Deployment" and .metadata.name=="kb" and (.metadata.annotations["openagentix.io/gateway-key-secret-extract"]//"")!="")|.metadata.namespace+"/"+.metadata.annotations["openagentix.io/gateway-key-secret-extract"]' 2>/dev/null || true)
 fi
 NOTIFYSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="Deployment" and .metadata.name=="notify")|.metadata.namespace as $ns|([.spec.template.spec.volumes[]?.secret.secretName]+[.spec.template.spec.containers[0].env[]?.valueFrom.secretKeyRef.name])|map(select(.!=null))|unique|.[]|$ns+"/"+.' 2>/dev/null || true)
 WHSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="ChatConnection" and .spec.platform=="webhook")|.metadata.namespace+"/"+.spec.credentialsSecretRef.name' 2>/dev/null || true)

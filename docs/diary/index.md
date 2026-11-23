@@ -77,6 +77,6 @@ Two layers. `install.sh` creates the kind cluster, installs the upstream release
 | [Observability](./features/observability.md) | Cost per agent, one trace per turn, audit |
 | [Security](./features/security.md) | Identity, network policies, what is not protected |
 | [Install](./features/install.md) | install.sh, values files, uninstall, demo values |
-| [Maintainer notes](./README.md) | How to keep this diary current |
+| [Maintainer notes](https://github.com/openagentix/openagentix/blob/main/docs/diary/README.md) | How to keep this diary current |
 
 Decision records are in `docs/decisions/`: ADR 0001 (runtime), ADR 0002 (schedules and delivery), ADR 0003 (observability).

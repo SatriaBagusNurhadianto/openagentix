@@ -5,6 +5,9 @@
 # PURGE_SECRETS=1 additionally deletes the Secrets/ConfigMap that install.sh created for this release (except the
 # knowledge base database credentials: they must stay as long as its volume does).
 # PURGE_SECRETS=1 also deletes the notify service's Secrets (the destinations file with the chat ids, and the copied bot token).
+# Observability: the release's objects (bundled VictoriaMetrics and Jaeger, monitors, telemetry configs) go with the release; PURGE_DATA=1 also
+# deletes the VictoriaMetrics volume. The kagent controller's telemetry settings and Agent Kourier's OTLP env are NOT reverted by uninstalling
+# (they exporter-fail quietly); re-run ./install.sh WITHOUT the observability values to remove them.
 # PURGE_DATA=1 deletes the knowledge base volumes (database, model cache), the memory embedding model cache and the database credentials.
 # Agent Kourier (installed by install.sh when channels.kourier.enabled): its Helm release is removed too (after the openagentix
 # release, which owns the connections and bindings). PURGE_SECRETS=1 also deletes the webhook connection Secrets install.sh generated
@@ -39,6 +42,7 @@ fi
 if [ "${PURGE_DATA:-0}" = 1 ]; then   # the knowledge base's data: database volume, its credentials, the model cache
   $K delete pvc data-kb-postgres-0 kb-embeddings-models -n openagentix-knowledge --ignore-not-found
   $K delete secret kb-postgres kb-database -n openagentix-knowledge --ignore-not-found
+  $K delete pvc victoria-metrics -n openagentix-observability --ignore-not-found   # bundled metrics store
   $K delete pvc memory-embeddings-models -n openagentix-memory --ignore-not-found   # memory embedding model cache (saved memories live in kagent's PostgreSQL)
 fi
 echo "removed release openagentix. Upstream components and namespaces were left in place."

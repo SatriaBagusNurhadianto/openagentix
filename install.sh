@@ -30,6 +30,9 @@
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
 #                        same files on every run, or the extras disappear.
 #   KOURIER_VALUES_FILE="k.yaml"  extra values for the Agent Kourier release (see components/channels/kourier-values.yaml)
+# Observability is opt-in too: the ONE switch is the chart value observability.enabled (components/observability/demo-values.yaml). When the chart
+# renders its marker ConfigMap (openagentix-observability) this script applies the same settings to what the chart does not own: the kagent
+# controller and agent runtimes (spikes/kagent/kagent-helm.sh, only when they differ from the release) and the Agent Kourier release.
 # Channels and triggers (Agent Kourier) are opt-in. The ONE switch is the chart value channels.kourier.enabled (default false), set
 # in a VALUES_FILE, e.g. VALUES_FILE=components/channels/demo-values.yaml ./install.sh . When it is true this script installs the
 # pinned Kourier release (components/channels/kourier.sh, cosign-verified when cosign exists) BEFORE the chart, generates the
@@ -138,6 +141,48 @@ if [ "${SKIP_PREREQS:-0}" != 1 ] && jq -e -s 'any(.[]; .kind=="Harness" and (.sp
     echo "-> enabling config.database.vectorEnabled (spikes/kagent/kagent-helm.sh)"
     bash spikes/kagent/kagent-helm.sh
   fi
+fi
+
+# --- 3c. observability: kagent controller + agent runtimes, from the chart's marker ConfigMap ----------------------------------
+# Desired state is computed from the same values the chart used (one switch). The kagent release is only touched when its
+# telemetry settings differ from that state, in either direction (off removes them), so a re-run changes nothing.
+OBS_CM=$(jq -c 'select(.kind=="ConfigMap" and .metadata.name=="openagentix-observability")' <<<"$RENDERED")
+OBS_KOURIER_FILE=""
+if [ "${SKIP_PREREQS:-0}" != 1 ] && helm_has kagent $KAGENT_NS; then
+  if [ -n "$OBS_CM" ]; then
+    O_EP=$(jq -r '.data.otlpEndpoint' <<<"$OBS_CM"); O_PROTO=$(jq -r '.data.otlpProtocol' <<<"$OBS_CM")
+    O_TRACES=$(jq -r '.data.runtimeTraces' <<<"$OBS_CM"); O_CAP=$(jq -r '.data.captureContent' <<<"$OBS_CM"); O_BAG=$(jq -r '.data.baggage' <<<"$OBS_CM")
+    O_PROP=$(jq -r '.data.propagators' <<<"$OBS_CM")
+    # kagent: an http/protobuf FILE endpoint carries the signal path; grpc takes host:port as is.
+    if [ "$O_PROTO" = grpc ]; then O_FILE_EP="$O_EP"; else O_FILE_EP="${O_EP%/}/v1/traces"; fi
+    OBS_WANT=$(jq -nc --arg ep "$O_FILE_EP" --arg proto "$O_PROTO" --argjson on "$O_TRACES" --argjson cap "$O_CAP" --argjson bag "$O_BAG" --arg prop "$O_PROP" '
+      if $on then {config:{telemetry:{traces:{endpoint:$ep,protocol:$proto}},
+                           runtimeDefaults:{telemetry:{traces:{endpoint:$ep,protocol:$proto},captureContent:$cap}}}}
+                  + (if $bag then {controller:{env:[{name:"OTEL_PROPAGATORS",value:$prop}]}} else {} end)
+      else {} end')
+  else
+    OBS_WANT='{}'
+  fi
+  OBS_NORM='{t:(.config.telemetry//{}), r:(.config.runtimeDefaults.telemetry//{}), e:([.controller.env[]?|select(.name=="OTEL_PROPAGATORS")])}'
+  OBS_HAVE=$(helm get values kagent -n $KAGENT_NS -o json | jq -cS "$OBS_NORM")
+  OBS_WANT_N=$(jq -cS "$OBS_NORM" <<<"$OBS_WANT")
+  if [ "$OBS_HAVE" = "$OBS_WANT_N" ]; then
+    echo "kagent release: telemetry settings already as wanted"
+  else
+    log "kagent telemetry settings (spikes/kagent/kagent-helm.sh)"
+    OBS_T=$(mktemp -d)
+    jq -c . <<<"$OBS_WANT" > "$OBS_T/telemetry.json"
+    if [ "$OBS_WANT" = '{}' ]; then bash spikes/kagent/kagent-helm.sh; else KAGENT_EXTRA_VALUES="$OBS_T/telemetry.json" bash spikes/kagent/kagent-helm.sh; fi
+    rm -rf "$OBS_T"
+  fi
+fi
+if [ -n "$OBS_CM" ]; then   # Agent Kourier: OTLP env and who may scrape / be reached (merged into its release values by kourier.sh)
+  OBS_T=$(mktemp -d)
+  jq -n --argjson env "$(jq -c '.data.kourierEnv|fromjson' <<<"$OBS_CM")" --argjson from "$(jq -c '.data.kourierMetricsFrom|fromjson' <<<"$OBS_CM")" --argjson eg "$(jq -c '.data.kourierEgress|fromjson' <<<"$OBS_CM")" \
+    '(if ($env|length)>0 then {extraEnv:$env} else {} end) + (if ($from|length)>0 then {networkPolicy:{metricsFrom:$from}} else {} end)' > "$OBS_T/kourier-obs.json"
+  # extraEgress is set by kourier.sh from the chart (KOURIER_EGRESS); add the OTLP rule to that same list.
+  OBS_KOURIER_EGRESS=$(jq -c '.data.kourierEgress|fromjson' <<<"$OBS_CM")
+  OBS_KOURIER_FILE="$OBS_T/kourier-obs.json"
 fi
 
 for ns in $RELEASE_NS $NAMESPACES; do
@@ -281,11 +326,14 @@ if [ -n "$CH_CM" ]; then
       $K get secret -n "$CH_NS" "$csec" >/dev/null 2>&1 || echo "WARN: Secret $CH_NS/$csec for the $cplat connection does not exist: create it first (README \"Channels and triggers\", keys botToken and appToken)"
     fi
   done < <(jq -r 'select(.kind=="ChatConnection")|[.spec.platform,.spec.credentialsSecretRef.name,(.spec.webhook.verify.scheme//"")]|@tsv' <<<"$RENDERED")
-  KOURIER_TEAM_NS="$CH_NS" KOURIER_NS="$CH_BROKER_NS" KOURIER_EGRESS="$(jq -r '.data.brokerEgress' <<<"$CH_CM")" \
+  KOURIER_EGRESS_ALL=$(jq -c --argjson more "${OBS_KOURIER_EGRESS:-[]}" '.data.brokerEgress|fromjson + $more' <<<"$CH_CM")
+  KOURIER_TEAM_NS="$CH_NS" KOURIER_NS="$CH_BROKER_NS" KOURIER_EGRESS="$KOURIER_EGRESS_ALL" KOURIER_VALUES_FILE="${KOURIER_VALUES_FILE:-}${OBS_KOURIER_FILE:+ $OBS_KOURIER_FILE}" \
     CLUSTER="$CLUSTER" KUBE_CONTEXT="$CTX" KUBECTL="$K" bash components/channels/kourier.sh install
 elif helm status agent-kourier -n agent-kourier >/dev/null 2>&1; then
   echo "NOTE: Agent Kourier is installed but channels.kourier.enabled is false in these values: this run removes its connections and bindings. Pass the same VALUES_FILE as before to keep them, or ./uninstall.sh to remove Kourier."
 fi
+
+[ -z "$OBS_KOURIER_FILE" ] || rm -rf "$(dirname "$OBS_KOURIER_FILE")"
 
 # --- 5. images ----------------------------------------------------------------------------------------------
 SET=()

@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -46,7 +47,7 @@ type (
 func (h *handlers) registerGraph(srv *mcp.Server, ro *mcp.ToolAnnotations) {
 	mcp.AddTool(srv, &mcp.Tool{
 		Name:        "kb_graph_search",
-		Description: "Search the knowledge graph of facts extracted from the documents. Finds the entities your question names, then follows their relations up to 'hops' steps, and returns chains like 'Teal -runs_in-> Vane-3', each fact with the document_id, chunk and quote it came from, plus the supporting passages. Use it for questions that link several things (who owns, what depends on, where does it run). Open a document_id with kb_get_document.",
+		Description: "Search the knowledge graph of facts extracted from the documents, together with facts an operator curated by hand. Finds the entities your question names, then follows their relations up to 'hops' steps, and returns chains like 'Teal -runs_in-> Vane-3', each fact with the document_id, chunk and quote it came from (or, for a curated fact, the fact set and note), plus the supporting passages. Use it for questions that link several things (who owns, what depends on, where does it run). Open a document_id with kb_get_document.",
 		Annotations: ro,
 	}, h.graphSearch)
 	mcp.AddTool(srv, &mcp.Tool{
@@ -86,6 +87,17 @@ func (b *textBudget) line(format string, a ...any) bool {
 func (b *textBudget) String() string { return strings.TrimRight(b.sb.String(), "\n") }
 
 func fact(e kb.GraphEdge) string {
+	if e.Curated {
+		// A curated fact cites a fact set, not a document: there is no passage to open.
+		s := fmt.Sprintf("%s -%s-> %s | curated: factset=%s", e.Subject, e.Predicate, e.Object, e.FactsetID)
+		if e.SourceURI != "" {
+			s += " source=" + e.SourceURI
+		}
+		if e.Evidence != "" {
+			s += fmt.Sprintf(" | %q", e.Evidence)
+		}
+		return s
+	}
 	s := fmt.Sprintf("%s -%s-> %s | document_id=%s chunk=%d", e.Subject, e.Predicate, e.Object, e.DocumentID, e.ChunkIndex)
 	if e.SourceURI != "" {
 		s += " | source " + e.SourceURI
@@ -125,6 +137,12 @@ func writePaths(b *textBudget, paths []kb.GraphPath, chunks []kb.GraphChunk, wit
 		}
 	}
 	b.line("\nFacts and where they come from:")
+	for _, p := range paths {
+		if slices.ContainsFunc(p.Edges, func(e kb.GraphEdge) bool { return e.Curated }) {
+			b.line("(curated = written by an operator in a fact set, not extracted from a document; it has no passage to open)")
+			break
+		}
+	}
 	seen := map[string]bool{}
 	for _, p := range paths {
 		for _, e := range p.Edges {

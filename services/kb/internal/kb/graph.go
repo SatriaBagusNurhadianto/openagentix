@@ -27,8 +27,10 @@ const (
 )
 
 // GraphEdge is one fact: Subject -Predicate-> Object, with the chunk it was
-// extracted from. Forward is true when a path walked the edge from Subject to
-// Object and false when it walked it backwards.
+// extracted from, or, when Curated, the fact set an operator wrote it in
+// (FactsetID; DocumentID is then empty and Evidence is the operator's note).
+// Forward is true when a path walked the edge from Subject to Object and false
+// when it walked it backwards.
 type GraphEdge struct {
 	Subject    string `json:"subject"`
 	Predicate  string `json:"predicate"`
@@ -36,6 +38,8 @@ type GraphEdge struct {
 	Forward    bool   `json:"forward"`
 	DocumentID string `json:"document_id"`
 	ChunkIndex int    `json:"chunk_index"`
+	Curated    bool   `json:"curated,omitempty"`
+	FactsetID  string `json:"factset_id,omitempty"`
 	SourceURI  string `json:"source_uri"`
 	Evidence   string `json:"evidence"`
 }
@@ -182,8 +186,8 @@ func toEdge(st store.Step, ents []store.Entity, i int) GraphEdge {
 	}
 	return GraphEdge{
 		Subject: subj.Name, Predicate: st.Edge.Predicate, Object: obj.Name, Forward: st.Forward,
-		DocumentID: st.Cite.DocumentID, ChunkIndex: st.Cite.ChunkIndex, SourceURI: st.Cite.SourceURI,
-		Evidence: truncRunes(st.Edge.Evidence, MaxGraphEvidence),
+		DocumentID: st.Cite.DocumentID, ChunkIndex: st.Cite.ChunkIndex, Curated: st.Cite.FactsetID != "", FactsetID: st.Cite.FactsetID,
+		SourceURI: st.Cite.SourceURI, Evidence: truncRunes(st.Edge.Evidence, MaxGraphEvidence),
 	}
 }
 
@@ -211,6 +215,9 @@ func (s *Service) supportingChunks(ctx context.Context, paths []GraphPath) ([]Gr
 	docs := map[dk][]string{}
 	for _, p := range paths {
 		for _, e := range p.Edges {
+			if e.Curated {
+				continue // a curated fact has a note, not a passage
+			}
 			k := ck{dk{p.Collection, e.DocumentID}, e.ChunkIndex}
 			if seen[k] || len(out) >= MaxGraphChunks {
 				continue
@@ -319,10 +326,12 @@ func (c cand) edgeIDs() []int64 {
 	return ids
 }
 
+// documents is the number of distinct sources the chain draws on: a fact set
+// counts as one, however many of its facts the chain uses.
 func (c cand) documents() int {
 	docs := map[string]bool{}
 	for _, st := range c.Path.Steps {
-		docs[st.Cite.DocumentID] = true
+		docs[st.Cite.Source()] = true
 	}
 	return len(docs)
 }

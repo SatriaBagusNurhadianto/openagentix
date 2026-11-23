@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
@@ -51,6 +52,10 @@ func New(svc *kb.Service, cfg Config, log *slog.Logger) http.Handler {
 	if svc.GraphEnabled() {
 		mux.HandleFunc("GET /v1/collections/{collection}/graph/stats", s.auth(s.graphStats))
 		mux.HandleFunc("GET /v1/graph/stats", s.auth(s.graphStatsAll))
+		mux.HandleFunc("GET /v1/collections/{collection}/graph/factsets", s.auth(s.listFactSets))
+		mux.HandleFunc("PUT /v1/collections/{collection}/graph/factsets/{id}", s.auth(s.putFactSet))
+		mux.HandleFunc("GET /v1/collections/{collection}/graph/factsets/{id}", s.auth(s.getFactSet))
+		mux.HandleFunc("DELETE /v1/collections/{collection}/graph/factsets/{id}", s.auth(s.deleteFactSet))
 	}
 	return mux
 }
@@ -81,14 +86,16 @@ type putRequest struct {
 	Text      string `json:"text"`
 }
 
-func (s *server) putDocument(w http.ResponseWriter, r *http.Request) {
+// decodeBody reads the request body as one JSON object into v, refusing unknown
+// fields and trailing data. It writes the error response and reports false on
+// failure.
+func (s *server) decodeBody(w http.ResponseWriter, r *http.Request, v any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxBodyBytes)
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	var req putRequest
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(v); err != nil {
 		s.bodyError(w, err)
-		return
+		return false
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		if err == nil {
@@ -96,6 +103,14 @@ func (s *server) putDocument(w http.ResponseWriter, r *http.Request) {
 		} else {
 			s.bodyError(w, err)
 		}
+		return false
+	}
+	return true
+}
+
+func (s *server) putDocument(w http.ResponseWriter, r *http.Request) {
+	var req putRequest
+	if !s.decodeBody(w, r, &req) {
 		return
 	}
 	coll, id := r.PathValue("collection"), r.PathValue("id")
@@ -164,6 +179,7 @@ func graphStatsJSON(collection string, st store.GraphStats) map[string]any {
 	return map[string]any{
 		"collection": collection, "entities": st.Entities, "relations": st.Relations, "mentions": st.Mentions,
 		"jobs":            map[string]int{"pending": st.JobsPending, "done": st.JobsDone, "failed": st.JobsFailed},
+		"manual":          map[string]int{"entities": st.ManualEntities, "relations": st.ManualRelations, "factsets": st.FactSets},
 		"last_error_code": st.LastErrorCode,
 	}
 }
@@ -205,6 +221,8 @@ func (s *server) fail(w http.ResponseWriter, r *http.Request, err error) {
 	case errors.Is(err, kb.ErrUpstream):
 		s.log.Error("upstream failure", "method", r.Method, "path", r.Pattern, "err", err)
 		writeError(w, http.StatusBadGateway, "embedding service failed")
+	case errors.Is(err, store.ErrFactSetNotFound):
+		writeError(w, http.StatusNotFound, "fact set not found")
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, "document not found")
 	case errors.Is(err, context.DeadlineExceeded):
@@ -227,4 +245,58 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+func (s *server) putFactSet(w http.ResponseWriter, r *http.Request) {
+	var req store.FactSet
+	if !s.decodeBody(w, r, &req) {
+		return
+	}
+	coll, id := r.PathValue("collection"), r.PathValue("id")
+	res, err := s.svc.PutFactSet(r.Context(), coll, id, req)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	// Counts only: the catalogue's names and notes are never logged.
+	s.log.Info("fact set replaced", "collection", coll, "id", id, "entities", res.Entities, "relations", res.Relations, "changed", res.Changed)
+	writeJSON(w, http.StatusOK, map[string]any{"collection": coll, "id": id, "entities": res.Entities, "relations": res.Relations, "changed": res.Changed})
+}
+
+func (s *server) getFactSet(w http.ResponseWriter, r *http.Request) {
+	fs, err := s.svc.GetFactSet(r.Context(), r.PathValue("collection"), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, fs)
+}
+
+func (s *server) listFactSets(w http.ResponseWriter, r *http.Request) {
+	coll := r.PathValue("collection")
+	infos, err := s.svc.ListFactSets(r.Context(), coll)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(infos))
+	for _, i := range infos {
+		out = append(out, map[string]any{"id": i.ID, "source_uri": i.SourceURI, "entities": i.Entities, "relations": i.Relations, "updated_at": i.UpdatedAt.UTC().Format(time.RFC3339)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"collection": coll, "factsets": out})
+}
+
+func (s *server) deleteFactSet(w http.ResponseWriter, r *http.Request) {
+	coll, id := r.PathValue("collection"), r.PathValue("id")
+	ok, err := s.svc.DeleteFactSet(r.Context(), coll, id)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "fact set not found")
+		return
+	}
+	s.log.Info("fact set deleted", "collection", coll, "id", id)
+	w.WriteHeader(http.StatusNoContent)
 }

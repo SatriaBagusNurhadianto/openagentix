@@ -456,3 +456,73 @@ func TestGraphLogsNeverContainContent(t *testing.T) {
 		}
 	}
 }
+
+func (g *genv) seedCatalogue(t *testing.T) {
+	t.Helper()
+	_, err := g.env.svc.PutFactSet(context.Background(), "kg", "org-catalogue", store.FactSet{
+		SourceURI: "https://src/catalogue",
+		Entities:  []store.FactEntity{{Name: "Basalt", Type: "team"}, {Name: "Priya Venkat", Type: "person"}},
+		Relations: []store.FactRelation{{Source: "Basalt", Predicate: "escalates_to", Target: "Priya Venkat", Note: `Escalations go to "Priya"`}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGraphToolsMarkCuratedFacts(t *testing.T) {
+	g := setupGraph(t, true, embed.None{})
+	g.seedChain(t)
+	g.seedCatalogue(t)
+	const curated = `Basalt -escalates_to-> Priya Venkat | curated: factset=org-catalogue source=https://src/catalogue | "Escalations go to \"Priya\""`
+
+	res := g.call(t, "kb_graph_paths", map[string]any{"from": "Orion", "to": "Priya Venkat", "collection": "kg"})
+	txt := text(t, res)
+	if res.IsError || !strings.Contains(txt, curated) || !strings.Contains(txt, "Basalt -owns-> Orion | document_id=d-owner chunk=0") {
+		t.Fatalf("paths: %v\n%s", res.IsError, txt)
+	}
+	if first, _, _ := strings.Cut(txt, "\n"); first != UntrustedNotice {
+		t.Fatalf("first line = %q", first)
+	}
+	if !strings.Contains(txt, "curated = written by an operator") {
+		t.Fatalf("no explanation of the marker:\n%s", txt)
+	}
+	for _, l := range strings.Split(txt, "\n") {
+		if strings.Contains(l, "curated:") && strings.Contains(l, "document_id=") {
+			t.Fatalf("a curated fact claims a document: %s", l)
+		}
+	}
+	if strings.Contains(txt, "Supporting passages") && strings.Contains(txt, "[document_id= ") {
+		t.Fatalf("a curated fact got an empty passage:\n%s", txt)
+	}
+	out := structured[GraphPathsOutput](t, res)
+	var seen bool
+	for _, p := range out.Paths {
+		for _, e := range p.Edges {
+			if e.Curated {
+				seen = true
+				if e.FactsetID != "org-catalogue" || e.DocumentID != "" || e.Evidence != `Escalations go to "Priya"` {
+					t.Fatalf("edge = %+v", e)
+				}
+			}
+		}
+	}
+	if !seen {
+		t.Fatalf("no curated edge in %+v", out)
+	}
+
+	res = g.call(t, "kb_graph_entity", map[string]any{"name": "Basalt", "collection": "kg"})
+	if txt := text(t, res); res.IsError || !strings.Contains(txt, curated) || !strings.Contains(txt, "document_id=d-owner") {
+		t.Fatalf("entity: %v\n%s", res.IsError, txt)
+	}
+
+	res = g.call(t, "kb_graph_search", map[string]any{"query": "Who does the team that owns Orion escalate to?", "collection": "kg", "hops": 2})
+	if txt := text(t, res); res.IsError || !strings.Contains(txt, curated) || !strings.Contains(txt, "Orion <-owns- Basalt -escalates_to-> Priya Venkat") {
+		t.Fatalf("search: %v\n%s", res.IsError, txt)
+	}
+
+	// without curated facts in the answer the explanation is not added
+	res = g.call(t, "kb_graph_paths", map[string]any{"from": "Orion", "to": "Quill", "collection": "kg"})
+	if strings.Contains(text(t, res), "curated") {
+		t.Fatalf("explanation without curated facts:\n%s", text(t, res))
+	}
+}

@@ -183,7 +183,7 @@ What AX does better, egress lockdown and one-shot job semantics, matters most fo
 - We accept kagent's requirements: Kubernetes 1.37 or later, nodes that can run gVisor, PostgreSQL, and a multi-step install that our `install.sh` wraps.
 - We depend on Agent Substrate either way. Both candidates run on it.
 - Slower turns than AX showed: medians of 6.5 to 16 s per turn against 4 to 11 s. Acceptable for chat. The unexplained slow first runs and the size of the harness prompt are worth investigating before any latency-sensitive use.
-- The default token budget of 100,000 tokens per hour per agent is too low for tool-using agents: three or four tool questions exhaust it. The chart default should be raised.
+- The default token budget of 100,000 tokens per hour per agent is too low for tool-using agents: three or four tool questions exhaust it. The chart default should be raised. (Done: the default is now 1,000,000 tokens per hour.)
 - kagent's weak authorization becomes our problem to close before any shared deployment. It is also a natural place for the commercial layer.
 - Agents stay behind the model gateway, which gives us the "sandbox never holds the provider key" property that AX offers natively.
 - Because the bridge talks A2A, an AX backend can be added without changing the channel code. `bridges/ax-adapter/` proves this in principle; it is an experiment and not part of the install. The Telegram bridge was not pointed at it.

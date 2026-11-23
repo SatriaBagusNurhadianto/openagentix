@@ -12,10 +12,11 @@ import (
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 )
 
-type ekey struct{ collection, typ, norm string }
+type ekey struct{ collection, key string }
 
 type ent struct {
 	store.Entity
+	key     string // store.MergeKey
 	match   string
 	aliases []string // match form
 	emb     []float32
@@ -99,15 +100,25 @@ func (s *Store) upsertEntityLocked(in store.EntityInput) (*ent, error) {
 		return nil, errors.New("entity needs a collection, a name and a type")
 	}
 	g := &s.g
-	k := ekey{in.Collection, in.Type, store.NormalizeName(name)}
+	mk := store.MergeKey(name, in.Type, in.DocumentID)
+	k := ekey{in.Collection, mk}
 	aliases := store.MatchAliases(name, in.Aliases)
 	if id, ok := g.byKey[k]; ok {
 		e := g.entities[id]
 		if e.Description == "" {
 			e.Description = in.Description
 		}
-		e.aliases = unionSorted(e.aliases, aliases)
+		oldMatch := e.match
+		if e.Origin != store.OriginManual && store.BetterName(e.Name, name) {
+			e.Name, e.NormName, e.match = name, store.NormalizeName(name), store.MatchForm(name)
+		}
+		// every form seen is findable; the displayed one is not its own alias
+		all := unionSorted(unionSorted(e.aliases, aliases), []string{store.MatchForm(name), oldMatch})
+		e.aliases = slices.DeleteFunc(all, func(a string) bool { return a == "" || a == e.match })
 		e.Aliases = slices.Clone(e.aliases)
+		if in.Type != e.Type && !slices.Contains(e.OtherTypes, in.Type) {
+			e.OtherTypes = unionSorted(e.OtherTypes, []string{in.Type})
+		}
 		if len(e.emb) == 0 && len(in.NameEmbedding) > 0 {
 			e.emb = slices.Clone(in.NameEmbedding)
 		}
@@ -120,10 +131,10 @@ func (s *Store) upsertEntityLocked(in store.EntityInput) (*ent, error) {
 	g.nextEntity++
 	e := &ent{
 		Entity: store.Entity{
-			ID: g.nextEntity, Collection: in.Collection, Name: name, NormName: k.norm, Type: in.Type,
+			ID: g.nextEntity, Collection: in.Collection, Name: name, NormName: store.NormalizeName(name), Type: in.Type,
 			Description: in.Description, Aliases: slices.Clone(aliases), Origin: origin,
 		},
-		match: store.MatchForm(name), aliases: aliases, emb: slices.Clone(in.NameEmbedding),
+		key: mk, match: store.MatchForm(name), aliases: aliases, emb: slices.Clone(in.NameEmbedding),
 	}
 	g.entities[e.ID] = e
 	g.byKey[k] = e.ID
@@ -227,7 +238,7 @@ func (s *Store) collectLocked(collection string) {
 	}
 	for id, e := range g.entities {
 		if e.Collection == collection && e.Origin == store.OriginExtracted && !used[id] {
-			delete(g.byKey, ekey{e.Collection, e.Type, e.NormName})
+			delete(g.byKey, ekey{e.Collection, e.key})
 			delete(g.entities, id)
 		}
 	}
@@ -282,7 +293,8 @@ func topHits(hits []store.EntityHit, limit int) []store.EntityHit {
 
 func cloneEntity(e *ent) store.Entity {
 	c := e.Entity
-	c.Aliases = slices.Clone(e.Aliases)
+	c.Aliases = slices.Clone(e.aliases)
+	c.OtherTypes = slices.Clone(e.OtherTypes)
 	return c
 }
 
@@ -364,6 +376,9 @@ func (s *Store) Expand(_ context.Context, q store.ExpandQuery) ([]store.Path, er
 	defer s.mu.RUnlock()
 	ps := s.walk(q.Collection, q.SeedIDs, store.ClampHops(q.Hops), store.ClampFanOut(q.FanOut), 0)
 	store.SortPaths(ps)
+	if q.LongestFirst {
+		slices.SortStableFunc(ps, func(a, b store.Path) int { return len(b.Steps) - len(a.Steps) })
+	}
 	if lim := store.ClampLimit(q.Limit); len(ps) > lim {
 		ps = ps[:lim]
 	}
@@ -538,7 +553,7 @@ func (s *Store) ApplyExtraction(_ context.Context, res store.ExtractionResult) e
 	ids := make([]int64, len(res.Entities))
 	for i, x := range res.Entities {
 		e, err := s.upsertEntityLocked(store.EntityInput{
-			Collection: coll, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, NameEmbedding: x.NameEmbedding,
+			Collection: coll, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, NameEmbedding: x.NameEmbedding, DocumentID: doc,
 		})
 		if err != nil {
 			return err

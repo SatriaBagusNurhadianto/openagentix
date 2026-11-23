@@ -457,7 +457,7 @@ func TestGraphMigrationsApplyOnceAndAreIdempotent(t *testing.T) {
 				t.Fatalf("dim=%d: table %s missing (tables: %s)", dim, tbl, got)
 			}
 		}
-		if want := map[int]string{0: "1,3", 3: "1,2,3,4"}[dim]; migrationsIn(t, url, schema) != want {
+		if want := map[int]string{0: "1,3,5", 3: "1,2,3,4,5"}[dim]; migrationsIn(t, url, schema) != want {
 			t.Fatalf("dim=%d: migrations = %s, want %s", dim, migrationsIn(t, url, schema), want)
 		}
 	}
@@ -490,5 +490,74 @@ func TestNonGraphDocumentsStillCascadeGraphRows(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM "`+schema+`".`+tbl).Scan(&n); err != nil || n != 0 {
 			t.Fatalf("%s: %d rows left (%v)", tbl, n, err)
 		}
+	}
+}
+
+// TestGraphMigration5UpgradesAnOldGraphSchema starts from the schema migrations
+// 3 and 4 made (entities unique on type and name, no canon_name) holding what an
+// old kb extracted, and checks what migration 5 does: extracted rows and jobs are
+// cleared once, manual rows survive with a canonical name, the merge key becomes
+// (collection, canon_name), and a second start changes nothing.
+func TestGraphMigration5UpgradesAnOldGraphSchema(t *testing.T) {
+	url := testURL(t)
+	ctx := context.Background()
+	s, schema := openAt(t, url, 0, true)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := s.pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	q := `"` + schema + `".`
+	// back to the schema of migration 3
+	exec(`DROP INDEX ` + q + `entities_canon_name_key`)
+	exec(`ALTER TABLE ` + q + `entities DROP COLUMN canon_name, DROP COLUMN other_types`)
+	exec(`ALTER TABLE ` + q + `entities ADD CONSTRAINT entities_collection_type_norm_name_key UNIQUE (collection, type, norm_name)`)
+	exec(`DELETE FROM ` + q + `schema_migrations WHERE version = 5`)
+	exec(`INSERT INTO ` + q + `documents (collection, id, text) VALUES ('c', 'd1', 'x')`)
+	ent := func(name, typ, origin string) {
+		exec(`INSERT INTO `+q+`entities (collection, name, norm_name, match_name, type, origin) VALUES ('c', $1, lower($1), lower($1), $2, $3)`, name, typ, origin)
+	}
+	ent("Basalt", "team", "extracted")
+	ent("Team Basalt", "team", "extracted")
+	ent("Orion", "service", "extracted")
+	ent("Team Manual", "team", "manual")
+	ent("Kept Peer", "team", "extracted") // referenced by a manual relation below
+	exec(`INSERT INTO ` + q + `relations (collection, src_id, dst_id, predicate, document_id, chunk_index, origin)
+	      SELECT 'c', a.id, b.id, 'owns', 'd1', 0, 'extracted' FROM ` + q + `entities a, ` + q + `entities b WHERE a.name = 'Basalt' AND b.name = 'Orion'`)
+	exec(`INSERT INTO ` + q + `relations (collection, src_id, dst_id, predicate, document_id, chunk_index, origin)
+	      SELECT 'c', a.id, b.id, 'peer_of', 'd1', 0, 'manual' FROM ` + q + `entities a, ` + q + `entities b WHERE a.name = 'Team Manual' AND b.name = 'Kept Peer'`)
+	exec(`INSERT INTO ` + q + `entity_chunks (entity_id, collection, document_id, chunk_index) SELECT id, 'c', 'd1', 0 FROM ` + q + `entities WHERE name = 'Orion'`)
+	exec(`INSERT INTO ` + q + `extraction_jobs (collection, document_id, window_idx, window_hash, first_chunk, chunk_count, prompt_version, state)
+	      VALUES ('c', 'd1', 0, 'h', 0, 1, 'v1', 'done')`)
+	s.Close()
+
+	for i := 0; i < 2; i++ { // the second start must not clear again
+		s2, err := Open(ctx, Options{URL: url, Schema: schema, Graph: true})
+		if err != nil {
+			t.Fatalf("reopen #%d: %v", i, err)
+		}
+		st, err := s2.GraphStats(ctx, "c")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.Entities != 2+i || st.Relations != 1 || st.Mentions != 0 || st.JobsDone+st.JobsPending+st.JobsFailed != 0 {
+			t.Fatalf("start #%d: stats after the upgrade = %+v, want only the manual relation and its two entities (plus what was extracted since)", i, st)
+		}
+		if i == 0 { // new extractions after the upgrade survive the next start
+			e, err := s2.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "Team Basalt", Type: "team"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			e2, _ := s2.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "Basalt", Type: "service"})
+			if e.ID != e2.ID || e2.Name != "Team Basalt" || len(e2.OtherTypes) != 1 {
+				t.Fatalf("merge after the upgrade: %+v %+v", e, e2)
+			}
+			m, err := s2.UpsertEntity(ctx, store.EntityInput{Collection: "c", Name: "Manual", Type: "team"})
+			if err != nil || m.Name != "Team Manual" || m.Origin != "manual" {
+				t.Fatalf("manual entity canonical name backfilled: %+v %v", m, err)
+			}
+		}
+		s2.Close()
 	}
 }

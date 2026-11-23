@@ -31,7 +31,7 @@ type Options struct {
 	URL       string
 	Schema    string // PostgreSQL schema holding the tables; created if missing
 	VectorDim int    // > 0 enables pgvector with this dimension
-	// Graph creates the knowledge-graph tables (migrations 3 and 4) and enables
+	// Graph creates the knowledge-graph tables (migrations 3 to 5) and enables
 	// the graph methods. With false no graph table is created and those methods
 	// return store.ErrGraphDisabled.
 	Graph bool
@@ -114,11 +114,13 @@ func (s *Store) migrate(ctx context.Context, rawSchema string) error {
 		file    string
 		enabled bool
 		pre     func(context.Context, pgx.Tx) error
+		post    func(context.Context, pgx.Tx) error
 	}{
-		{1, "migrations/0001_init.sql", true, nil},
-		{2, "migrations/0002_vector.sql", s.dim > 0, s.prepareVector},
-		{3, "migrations/0003_graph.sql", s.graph, nil},
-		{4, "migrations/0004_graph_vector.sql", s.graph && s.dim > 0, nil},
+		{1, "migrations/0001_init.sql", true, nil, nil},
+		{2, "migrations/0002_vector.sql", s.dim > 0, s.prepareVector, nil},
+		{3, "migrations/0003_graph.sql", s.graph, nil, nil},
+		{4, "migrations/0004_graph_vector.sql", s.graph && s.dim > 0, nil, nil},
+		{5, "migrations/0005_graph_canonical.sql", s.graph, nil, s.backfillCanonNames},
 	}
 	for _, st := range steps {
 		if !st.enabled {
@@ -135,6 +137,11 @@ func (s *Store) migrate(ctx context.Context, rawSchema string) error {
 		}
 		if _, err := tx.Exec(ctx, s.render(string(sql))); err != nil {
 			return fmt.Errorf("migration %s: %w", st.file, err)
+		}
+		if st.post != nil {
+			if err := st.post(ctx, tx); err != nil {
+				return fmt.Errorf("migration %s: %w", st.file, err)
+			}
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO "+s.schema+".schema_migrations (version) VALUES ($1) ON CONFLICT DO NOTHING", st.version); err != nil {
 			return err

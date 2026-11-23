@@ -68,7 +68,7 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	t.Cleanup(cancel)
 
-	run("graph: upsert merges by normalised name within one collection and type", func(t *testing.T, s store.Store) {
+	run("graph: upsert merges by canonical name within one collection, whatever the type", func(t *testing.T, s store.Store) {
 		g := graphFixture{t, ctx, s}
 		a, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Payments  Service", Type: "service", Aliases: []string{"Payments Svc"}})
 		if err != nil {
@@ -94,14 +94,113 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 		if c.Description != "Handles payments" {
 			t.Fatalf("existing description overwritten: %+v", c)
 		}
-		if d := g.ent("g", "payments service", "team"); d.ID == a.ID {
-			t.Fatal("different type merged")
+		if d := g.ent("g", "payments service", "team"); d.ID != a.ID || d.Type != "service" || !slices.Equal(d.OtherTypes, []string{"team"}) {
+			t.Fatalf("the type is not part of the merge key: the first type stays primary and the other is recorded: %+v", d)
 		}
 		if d := g.ent("other", "payments service", "service"); d.ID == a.ID || d.Collection != "other" {
 			t.Fatal("entities shared across collections")
 		}
 		if _, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "  ", Type: "service"}); err == nil {
 			t.Fatal("blank name accepted")
+		}
+	})
+
+	run("graph: entity resolution merges category-word variants and keeps the most specific name", func(t *testing.T, s store.Store) {
+		a, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Basalt", Type: "team", Description: "Owns Orion"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Team Basalt", Type: "organization", Aliases: []string{"the Basalt squad"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.ID != a.ID || b.Name != "Team Basalt" || b.NormName != "team basalt" || b.Type != "team" || !slices.Equal(b.OtherTypes, []string{"organization"}) {
+			t.Fatalf("merged = %+v", b)
+		}
+		if !slices.Equal(b.Aliases, []string{"basalt", "the basalt squad"}) || b.Description != "Owns Orion" {
+			t.Fatalf("the shorter form must become an alias: %+v", b)
+		}
+		// arrival order does not matter: the less specific form later changes nothing but the aliases
+		c, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "basalt", Type: "team"})
+		if c.ID != a.ID || c.Name != "Team Basalt" {
+			t.Fatalf("name replaced by a less specific form: %+v", c)
+		}
+		for _, q := range []string{"basalt", "team basalt", "the basalt squad"} {
+			hits, _ := s.FindEntitiesByName(ctx, "g", q, 5)
+			if len(hits) == 0 || hits[0].Entity.ID != a.ID || hits[0].Score < 0.95 {
+				t.Fatalf("%q does not find the merged entity by name or alias: %+v", q, hits)
+			}
+		}
+		st, _ := s.GraphStats(ctx, "g")
+		if st.Entities != 1 {
+			t.Fatalf("entities = %d", st.Entities)
+		}
+		// the reverse arrival order gives the same displayed name
+		x, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "h", Name: "cluster Teal", Type: "system"})
+		y, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "h", Name: "Teal", Type: "system"})
+		if x.ID != y.ID || y.Name != "cluster Teal" {
+			t.Fatalf("cluster Teal / Teal: %+v %+v", x, y)
+		}
+	})
+
+	run("graph: entity resolution merges different types, never different names", func(t *testing.T, s store.Store) {
+		g := graphFixture{t, ctx, s}
+		ink := g.ent("g", "Ink", "service")
+		if e := g.ent("g", "Ink", "system"); e.ID != ink.ID || e.Type != "service" || !slices.Equal(e.OtherTypes, []string{"system"}) {
+			t.Fatalf("Ink as service and as system: %+v", e)
+		}
+		for _, pair := range [][2]string{{"Mira Okafor", "Mira Lindqvist"}, {"Vane-1", "Vane-2"}, {"Vane-2", "Vane-3"}, {"Quill", "Quire"}} {
+			a, b := g.ent("g", pair[0], "person"), g.ent("g", pair[1], "person")
+			if a.ID == b.ID {
+				t.Fatalf("%q and %q were merged", pair[0], pair[1])
+			}
+		}
+	})
+
+	run("graph: an event without a date is scoped to its document", func(t *testing.T, s store.Store) {
+		up := func(name, doc string) store.Entity {
+			e, err := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: name, Type: "event", DocumentID: doc})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return e
+		}
+		a, b, a2 := up("disk outage", "d1"), up("disk outage", "d2"), up("Disk outage", "d1")
+		if a.ID == b.ID || a.ID != a2.ID {
+			t.Fatalf("events: d1=%d d2=%d d1 again=%d", a.ID, b.ID, a2.ID)
+		}
+		p, q := up("Power outage on 3 March", "d1"), up("power outage on 3 march", "d2")
+		if p.ID != q.ID {
+			t.Fatal("an event with a date must merge across documents")
+		}
+		// the stored name is the one the model used, scoping is not visible in it
+		if a.Name != "disk outage" {
+			t.Fatalf("name = %q", a.Name)
+		}
+	})
+
+	run("graph: a manual entity keeps its name when an extraction merges into it", func(t *testing.T, s store.Store) {
+		m, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Basalt", Type: "team", Origin: "manual"})
+		e, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Team Basalt", Type: "team"})
+		if e.ID != m.ID || e.Name != "Basalt" || e.Origin != "manual" || !slices.Equal(e.Aliases, []string{"team basalt"}) {
+			t.Fatalf("entity = %+v", e)
+		}
+	})
+
+	run("graph: expand with LongestFirst cuts the shortest paths, not the longest", func(t *testing.T, s store.Store) {
+		g := graphFixture{t, ctx, s}
+		g.doc("g", "d1", "c")
+		a, b, c, d := g.ent("g", "A", "concept"), g.ent("g", "B", "concept"), g.ent("g", "C", "concept"), g.ent("g", "D", "concept")
+		g.rel("g", a, b, "x", "d1", 0)
+		g.rel("g", b, c, "x", "d1", 0)
+		g.rel("g", c, d, "x", "d1", 0)
+		ps, err := s.Expand(ctx, store.ExpandQuery{Collection: "g", SeedIDs: []int64{a.ID}, Hops: 3, Limit: 2})
+		if err != nil || !slices.Equal(pathNames(ps), []string{"A>B", "A>B>C"}) {
+			t.Fatalf("shortest first: %v %v", pathNames(ps), err)
+		}
+		ps, err = s.Expand(ctx, store.ExpandQuery{Collection: "g", SeedIDs: []int64{a.ID}, Hops: 3, Limit: 2, LongestFirst: true})
+		if err != nil || !slices.Equal(pathNames(ps), []string{"A>B>C>D", "A>B>C"}) {
+			t.Fatalf("longest first: %v %v", pathNames(ps), err)
 		}
 	})
 
@@ -311,7 +410,7 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 	run("graph: find entities by name or alias", func(t *testing.T, s store.Store) {
 		g := graphFixture{t, ctx, s}
 		pay, _ := s.UpsertEntity(ctx, store.EntityInput{Collection: "g", Name: "Payments Service", Type: "service", Aliases: []string{"Pay Svc"}})
-		g.ent("g", "Payments", "concept")
+		g.ent("g", "Today", "concept") // "Payments" would now merge into "Payments Service"
 		g.ent("g", "Billing Team", "team")
 		g.ent("g", "x", "concept") // one character: never a containment match
 		hits, err := s.FindEntitiesByName(ctx, "g", "Payments Service", 10)
@@ -319,7 +418,7 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 			t.Fatalf("exact: %+v %v", hits, err)
 		}
 		hits, _ = s.FindEntitiesByName(ctx, "g", "who owns the payments service today?", 10)
-		if len(hits) != 2 || hits[0].Entity.ID != pay.ID || hits[1].Entity.Name != "Payments" || hits[0].Score <= hits[1].Score {
+		if len(hits) != 2 || hits[0].Entity.ID != pay.ID || hits[1].Entity.Name != "Today" || hits[0].Score <= hits[1].Score {
 			t.Fatalf("entity named in a question: %+v", hits)
 		}
 		hits, _ = s.FindEntitiesByName(ctx, "g", "pay svc", 10)

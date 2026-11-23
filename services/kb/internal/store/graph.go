@@ -32,6 +32,7 @@ const (
 	MaxFanOut     = 100
 
 	OriginExtracted = "extracted"
+	OriginManual    = "manual"
 )
 
 // Job states.
@@ -48,22 +49,28 @@ func NormalizeName(s string) string {
 }
 
 // Entity is a node of the knowledge graph. Entities are never shared across
-// collections. Aliases are stored in MatchForm.
+// collections. Aliases are stored in MatchForm. Type is the first type the
+// entity was seen with; OtherTypes are the other types it was seen with (a model
+// may call one thing a service in one document and a system in another).
 type Entity struct {
 	ID          int64
 	Collection  string
-	Name        string
-	NormName    string
+	Name        string // the displayed name; see BetterName
+	NormName    string // NormalizeName(Name)
 	Type        string
+	OtherTypes  []string
 	Description string
 	Aliases     []string
 	Origin      string
 }
 
 // EntityInput creates or merges an entity. The merge key is
-// (Collection, Type, NormalizeName(Name)). On merge the existing name and
-// origin win, an empty description is filled, aliases are united and a missing
-// name embedding is set.
+// (Collection, MergeKey(Name, Type, DocumentID)): the canonical form of the
+// name, whatever the type. On merge the existing origin and type stay, the
+// displayed name becomes the more specific of the two (BetterName; never for a
+// manual entity), the other form becomes an alias, an empty description is
+// filled, aliases and other types are united and a missing name embedding is
+// set.
 type EntityInput struct {
 	Collection    string
 	Name          string
@@ -72,6 +79,9 @@ type EntityInput struct {
 	Aliases       []string
 	Origin        string // default OriginExtracted
 	NameEmbedding []float32
+	// DocumentID is the document that mentions the entity. It only matters for an
+	// event whose name has no digit, which is scoped to it (see MergeKey).
+	DocumentID string
 }
 
 // Relation is a directed, typed edge with the evidence it was extracted from.
@@ -124,6 +134,11 @@ type ExpandQuery struct {
 	Hops       int // 1..MaxHops; larger values are clamped, <= 0 means 1
 	Limit      int // max paths; <= 0 means DefaultPathLimit, clamped to MaxPathLimit
 	FanOut     int // edges followed per entity, lowest edge ids first; <= 0 means DefaultFanOut, clamped to MaxFanOut
+	// LongestFirst orders the paths by decreasing length instead of increasing
+	// before Limit cuts them off. A search wants the longest chains and drops
+	// the ones that are only the start of another; cutting the longest first
+	// would lose exactly the multi-hop chains it looks for.
+	LongestFirst bool
 }
 
 // PathQuery asks for the shortest paths between two entities.

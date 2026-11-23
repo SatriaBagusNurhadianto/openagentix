@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -57,13 +58,16 @@ func (s *Store) checkEmbedding(v []float32) error {
 
 func (s *Store) q(sql string) string { return strings.ReplaceAll(sql, "{{schema}}", s.schema) }
 
-const entityColumns = `id, collection, name, norm_name, type, description, aliases, origin`
+const entityColumns = `id, collection, name, norm_name, type, other_types, description, aliases, origin`
 
 func scanEntity(row pgx.Row) (store.Entity, error) {
 	var e store.Entity
-	err := row.Scan(&e.ID, &e.Collection, &e.Name, &e.NormName, &e.Type, &e.Description, &e.Aliases, &e.Origin)
+	err := row.Scan(&e.ID, &e.Collection, &e.Name, &e.NormName, &e.Type, &e.OtherTypes, &e.Description, &e.Aliases, &e.Origin)
 	if e.Aliases == nil {
 		e.Aliases = []string{}
+	}
+	if e.OtherTypes == nil {
+		e.OtherTypes = []string{}
 	}
 	return e, err
 }
@@ -91,23 +95,84 @@ func (s *Store) upsertEntity(ctx context.Context, q querier, in store.EntityInpu
 	if aliases == nil {
 		aliases = []string{}
 	}
-	args := []any{in.Collection, name, store.NormalizeName(name), store.MatchForm(name), in.Type, in.Description, aliases, origin}
+	args := []any{in.Collection, name, store.NormalizeName(name), store.MatchForm(name), in.Type, in.Description, aliases, origin, store.MergeKey(name, in.Type, in.DocumentID)}
 	cols, vals, setEmb := "", "", ""
 	if s.dim > 0 {
-		cols, vals = ", name_embedding", ", $9::"+s.vecSchema+".vector"
+		cols, vals = ", name_embedding", ", $10::"+s.vecSchema+".vector"
 		setEmb = ", name_embedding = coalesce({{schema}}.entities.name_embedding, EXCLUDED.name_embedding)"
 		args = append(args, s.vecArg(in.NameEmbedding))
 	}
-	// A merge keeps the existing name and origin, fills an empty description,
-	// unites the aliases and fills a missing embedding.
+	// A merge keeps the existing type and origin, fills an empty description,
+	// unites the aliases (every form seen stays findable, the displayed one is
+	// not its own alias), records a different type and, unless the entity is
+	// manual, displays the more specific name (store.BetterName, in SQL).
+	const takeNew = `({{schema}}.entities.origin <> 'manual' AND (
+		  cardinality(string_to_array(EXCLUDED.match_name, ' ')) > cardinality(string_to_array({{schema}}.entities.match_name, ' '))
+		  OR (cardinality(string_to_array(EXCLUDED.match_name, ' ')) = cardinality(string_to_array({{schema}}.entities.match_name, ' '))
+		      AND EXCLUDED.name COLLATE "C" < {{schema}}.entities.name COLLATE "C")))`
 	return scanEntity(q.QueryRow(ctx, s.q(`
-		INSERT INTO {{schema}}.entities (collection, name, norm_name, match_name, type, description, aliases, origin`+cols+`)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8`+vals+`)
-		ON CONFLICT (collection, type, norm_name) DO UPDATE SET
+		INSERT INTO {{schema}}.entities (collection, name, norm_name, match_name, type, description, aliases, origin, canon_name`+cols+`)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9`+vals+`)
+		ON CONFLICT (collection, canon_name) DO UPDATE SET
 		  description = CASE WHEN {{schema}}.entities.description = '' THEN EXCLUDED.description ELSE {{schema}}.entities.description END,
 		  aliases = (SELECT coalesce(array_agg(DISTINCT a COLLATE "C" ORDER BY a COLLATE "C"), '{}')
-		             FROM unnest({{schema}}.entities.aliases || EXCLUDED.aliases) AS a)`+setEmb+`
+		             FROM unnest({{schema}}.entities.aliases || EXCLUDED.aliases || ARRAY[{{schema}}.entities.match_name, EXCLUDED.match_name]) AS a
+		             WHERE a <> '' AND a <> CASE WHEN `+takeNew+` THEN EXCLUDED.match_name ELSE {{schema}}.entities.match_name END),
+		  other_types = (SELECT coalesce(array_agg(DISTINCT t COLLATE "C" ORDER BY t COLLATE "C"), '{}')
+		                 FROM unnest({{schema}}.entities.other_types || ARRAY[EXCLUDED.type]) AS t WHERE t <> {{schema}}.entities.type),
+		  name = CASE WHEN `+takeNew+` THEN EXCLUDED.name ELSE {{schema}}.entities.name END,
+		  norm_name = CASE WHEN `+takeNew+` THEN EXCLUDED.norm_name ELSE {{schema}}.entities.norm_name END,
+		  match_name = CASE WHEN `+takeNew+` THEN EXCLUDED.match_name ELSE {{schema}}.entities.match_name END`+setEmb+`
 		RETURNING `+entityColumns), args...))
+}
+
+// backfillCanonNames gives every entity row without a canonical name its
+// canon_name and then makes the column mandatory and unique. It runs inside the
+// migration transaction. Only rows that survived the one-time clearing of
+// migration 5 (manual ones) can be without one. Should two of them share a
+// canonical form, the later one keeps its own id in its key and is not merged.
+func (s *Store) backfillCanonNames(ctx context.Context, tx pgx.Tx) error {
+	rows, err := tx.Query(ctx, s.q(`SELECT id, collection, name, type FROM {{schema}}.entities WHERE canon_name IS NULL ORDER BY id`))
+	if err != nil {
+		return err
+	}
+	type row struct {
+		id             int64
+		coll, name, ty string
+	}
+	var todo []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.coll, &r.name, &r.ty); err != nil {
+			rows.Close()
+			return err
+		}
+		todo = append(todo, r)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	seen := map[[2]string]bool{}
+	for _, r := range todo {
+		k := store.MergeKey(r.name, r.ty, "")
+		if seen[[2]string{r.coll, k}] {
+			k += "\x1f#" + strconv.FormatInt(r.id, 10)
+		}
+		seen[[2]string{r.coll, k}] = true
+		if _, err := tx.Exec(ctx, s.q(`UPDATE {{schema}}.entities SET canon_name = $2 WHERE id = $1`), r.id, k); err != nil {
+			return err
+		}
+	}
+	for _, stmt := range []string{
+		`ALTER TABLE {{schema}}.entities ALTER COLUMN canon_name SET NOT NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS entities_canon_name_key ON {{schema}}.entities (collection, canon_name)`,
+	} {
+		if _, err := tx.Exec(ctx, s.q(stmt)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) AddRelation(ctx context.Context, r store.Relation) (int64, error) {
@@ -298,7 +363,7 @@ func (s *Store) FindEntitiesByName(ctx context.Context, collection, text string,
 	}
 	rows, err := s.pool.Query(ctx, s.q(`
 		SELECT `+entityColumns+`, score FROM (
-		  SELECT e.id, e.collection, e.name, e.norm_name, e.type, e.description, e.aliases, e.origin, `+nameScoreSQL+` AS score
+		  SELECT e.id, e.collection, e.name, e.norm_name, e.type, e.other_types, e.description, e.aliases, e.origin, `+nameScoreSQL+` AS score
 		  FROM {{schema}}.entities e WHERE e.collection = $1
 		) x WHERE score > 0 ORDER BY score DESC, id LIMIT $3`), collection, q, limit)
 	if err != nil {
@@ -313,11 +378,14 @@ func scanEntityHits(rows pgx.Rows) ([]store.EntityHit, error) {
 	for rows.Next() {
 		var h store.EntityHit
 		e := &h.Entity
-		if err := rows.Scan(&e.ID, &e.Collection, &e.Name, &e.NormName, &e.Type, &e.Description, &e.Aliases, &e.Origin, &h.Score); err != nil {
+		if err := rows.Scan(&e.ID, &e.Collection, &e.Name, &e.NormName, &e.Type, &e.OtherTypes, &e.Description, &e.Aliases, &e.Origin, &h.Score); err != nil {
 			return nil, err
 		}
 		if e.Aliases == nil {
 			e.Aliases = []string{}
+		}
+		if e.OtherTypes == nil {
+			e.OtherTypes = []string{}
 		}
 		out = append(out, h)
 	}
@@ -493,8 +561,9 @@ func (s *Store) Expand(ctx context.Context, q store.ExpandQuery) ([]store.Path, 
 		return nil, nil
 	}
 	rows, err := s.pool.Query(ctx, s.q(walkSQL+`
-		SELECT nodes, edges, fwds FROM walk WHERE depth > 0 ORDER BY depth, nodes, edges LIMIT $5`),
-		q.Collection, q.SeedIDs, store.ClampHops(q.Hops), int64(0), store.ClampLimit(q.Limit), store.ClampFanOut(q.FanOut))
+		SELECT nodes, edges, fwds FROM walk WHERE depth > 0
+		ORDER BY CASE WHEN $7 THEN -depth ELSE depth END, nodes, edges LIMIT $5`),
+		q.Collection, q.SeedIDs, store.ClampHops(q.Hops), int64(0), store.ClampLimit(q.Limit), store.ClampFanOut(q.FanOut), q.LongestFirst)
 	if err != nil {
 		return nil, err
 	}
@@ -502,7 +571,11 @@ func (s *Store) Expand(ctx context.Context, q store.ExpandQuery) ([]store.Path, 
 	if err != nil {
 		return nil, err
 	}
-	return s.collectPaths(ctx, q.Collection, raw)
+	ps, err := s.collectPaths(ctx, q.Collection, raw)
+	if q.LongestFirst {
+		slices.SortStableFunc(ps, func(a, b store.Path) int { return len(b.Steps) - len(a.Steps) })
+	}
+	return ps, err
 }
 
 func (s *Store) ShortestPaths(ctx context.Context, q store.PathQuery) ([]store.Path, error) {
@@ -698,7 +771,7 @@ func (s *Store) ApplyExtraction(ctx context.Context, res store.ExtractionResult)
 		ids := make([]int64, len(res.Entities))
 		for i, x := range res.Entities {
 			e, err := s.upsertEntity(ctx, tx, store.EntityInput{
-				Collection: coll, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, NameEmbedding: x.NameEmbedding,
+				Collection: coll, Name: x.Name, Type: x.Type, Description: x.Description, Aliases: x.Aliases, NameEmbedding: x.NameEmbedding, DocumentID: doc,
 			})
 			if err != nil {
 				return err

@@ -10,6 +10,10 @@
 # Optional env:
 #   TELEGRAM_ALLOWED_CHAT_IDS  comma-separated chat ids allowed to talk to the agent (the bridge refuses to start without it, unless bridge.allowlist.enabled=false)
 #   GOOGLE_API_KEY             creates agentgateway-system/gemini-api-key (for a gemini model you add to values)
+#   NOTIFY_TELEGRAM_CHAT_ID    only with notify.enabled: creates (when absent, never printed, kept on re-runs) the Secret holding the
+#                              destination `owner-telegram` (this chat) and copies the bridge's bot token next to it. This is the opt-in:
+#                              installing never creates a way for agents to message someone without it.
+#   NOTIFY_OWNER_TELEGRAM=1    the same, using the FIRST id of TELEGRAM_ALLOWED_CHAT_IDS when NOTIFY_TELEGRAM_CHAT_ID is not set
 # Switches (all optional):
 #   CLUSTER=openagentix  CREATE_CLUSTER=1  KUBE_CONTEXT=kind-$CLUSTER
 #   SKIP_PREREQS=1       never touch kagent/Substrate/agentgateway/ToolHive
@@ -20,6 +24,7 @@
 #   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
 #   SKIP_A2A_CALL_IMAGE=1  do not build/load the schedule caller image (tools/a2a-call); it is only built when `schedules` is not empty
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
+#   SKIP_NOTIFY_IMAGE=1  do not build/load the notify image (services/notify); it is only built when notify.enabled is true
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart, space-separated, applied in order (maps are merged, lists
 #                        such as agents[] or schedules[] are REPLACED by the later file) (e.g. more agents, schedules, networkPolicy.extraA2ACallers for a
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
@@ -116,6 +121,7 @@ NAMESPACES=$(jq -r 'select(.metadata.namespace!=null)|.metadata.namespace' <<<"$
 BRIDGE_IMAGE=$(jq -r 'select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].image' <<<"$RENDERED")
 KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDERED")   # empty when knowledge.enabled=false
 # Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
+NOTIFY_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="notify")' <<<"$RENDERED")   # empty when notify.enabled=false
 KB_KEY=$(jq -r 'select(.kind=="Deployment" and (.metadata.annotations["openagentix.io/gateway-user"]//"")!="")|[.metadata.annotations["openagentix.io/gateway-user"],.metadata.annotations["openagentix.io/gateway-key-secret"],.metadata.namespace]|@tsv' <<<"$RENDERED")
 [ -z "$KB_KEY" ] || AGENT_KEYS=$(printf '%s\n%s' "$AGENT_KEYS" "$KB_KEY")
 
@@ -186,6 +192,49 @@ fi
 
 # One virtual key per agent (and per other gateway consumer, the kb), so gateway logs/metrics/budgets are attributed per agent. The raw key lives only in
 # Secret <ns>/<agent>-virtual-key; the gateway ConfigMap llm-api-keys holds SHA-256 hashes.
+NOTIFY_NO_DEST=0
+if [ -n "$NOTIFY_DEP" ]; then
+  log "notify destinations"
+  N_NS=$(jq -r '.metadata.namespace' <<<"$NOTIFY_DEP")
+  N_DEST_S=$(jq -r '.spec.template.spec.volumes[]|select(.name=="destinations")|.secret.secretName' <<<"$NOTIFY_DEP")
+  N_DEST_K=$(jq -r '.spec.template.spec.volumes[]|select(.name=="destinations")|.secret.items[0].key' <<<"$NOTIFY_DEP")
+  IFS=$'\t' read -r N_TOK_S N_TOK_K <<<"$(jq -r '.spec.template.spec.containers[0].env[]|select(.name=="NOTIFY_TELEGRAM_TOKEN")|.valueFrom.secretKeyRef|[.name,.key]|@tsv' <<<"$NOTIFY_DEP")"
+  # The owner's chat id is personal data: it goes only into the destinations Secret, from the environment, never to output or files.
+  # Creating a way for agents to message someone is deliberate: an explicit NOTIFY_TELEGRAM_CHAT_ID, or NOTIFY_OWNER_TELEGRAM=1
+  # (use the first id of TELEGRAM_ALLOWED_CHAT_IDS). Without either, nothing is created.
+  N_CREATED=0
+  if $K get secret -n "$N_NS" "$N_DEST_S" >/dev/null 2>&1; then
+    echo "secret $N_NS/$N_DEST_S: kept"
+  else
+    N_CHAT=${NOTIFY_TELEGRAM_CHAT_ID:-}
+    if [ -z "$N_CHAT" ] && [ "${NOTIFY_OWNER_TELEGRAM:-0}" = 1 ]; then
+      N_CHAT=${TELEGRAM_ALLOWED_CHAT_IDS:-$($K get secret -n $BRIDGE_NS $BRIDGE_SECRET -o jsonpath='{.data.TELEGRAM_ALLOWED_CHAT_IDS}' 2>/dev/null | base64 -d 2>/dev/null || true)}
+      N_CHAT=${N_CHAT%%,*}; N_CHAT=${N_CHAT// /}
+    fi
+    if [ -z "$N_CHAT" ]; then
+      echo "notify: no destination configured (set NOTIFY_TELEGRAM_CHAT_ID, or NOTIFY_OWNER_TELEGRAM=1 to use the first TELEGRAM_ALLOWED_CHAT_IDS entry). The service runs and refuses every notify call."
+    elif [ -z "$N_TOK_S" ]; then
+      echo "WARN: notify has no NOTIFY_TELEGRAM_TOKEN env var in these values (notify.tokens): not creating the owner-telegram destination"
+    else
+      [[ "$N_CHAT" =~ ^-?[0-9]+$ ]] || die "the notify chat id must be a number (NOTIFY_TELEGRAM_CHAT_ID)"
+      $K create secret generic "$N_DEST_S" -n "$N_NS" --from-file="$N_DEST_K"=<(printf 'destinations:\n  - name: owner-telegram\n    description: "The platform owner'"'"'s Telegram chat"\n    platform: telegram\n    chatId: "%s"\n    tokenEnv: NOTIFY_TELEGRAM_TOKEN\n' "$N_CHAT") >/dev/null \
+        && { echo "secret $N_NS/$N_DEST_S key $N_DEST_K: created with destination owner-telegram"; N_CREATED=1; }
+    fi
+    unset N_CHAT
+  fi
+  # The bot token is copied (a Secret cannot be mounted across namespaces) when this run created the destination, or when an
+  # existing destinations file has owner-telegram and the copy is missing. Never printed.
+  N_DEST_YAML=$($K get secret -n "$N_NS" "$N_DEST_S" -o json 2>/dev/null | jq -r --arg k "$N_DEST_K" '.data[$k]//""' | base64 -d 2>/dev/null || true)
+  if [ -n "$N_TOK_S" ] && ! $K get secret -n "$N_NS" "$N_TOK_S" >/dev/null 2>&1 \
+     && { [ "$N_CREATED" = 1 ] || yq -e '.destinations[]|select(.name=="owner-telegram")' >/dev/null 2>&1 <<<"$N_DEST_YAML"; }; then
+    N_TOKEN=$($K get secret -n $BRIDGE_NS $BRIDGE_SECRET -o jsonpath='{.data.TELEGRAM_BOT_TOKEN}' | base64 -d)
+    $K create secret generic "$N_TOK_S" -n "$N_NS" --from-file="$N_TOK_K"=<(printf '%s' "$N_TOKEN") >/dev/null && echo "secret $N_NS/$N_TOK_S key $N_TOK_K: copied from $BRIDGE_NS/$BRIDGE_SECRET"
+    unset N_TOKEN
+  fi
+  [ "$(yq '.destinations|length' <<<"${N_DEST_YAML:-}" 2>/dev/null || echo 0)" -gt 0 ] 2>/dev/null || NOTIFY_NO_DEST=1
+  unset N_DEST_YAML
+fi
+
 CM_ARGS=()
 while IFS=$'\t' read -r agent secret ns; do
   [ -n "$agent" ] || continue
@@ -259,6 +308,12 @@ if [ "${SKIP_KB_IMAGE:-0}" != 1 ] && [[ "$KB_IMAGE" == openagentix/kb:* ]]; then
   docker build -q -t "$KB_IMAGE" services/kb >/dev/null
   kind load docker-image "$KB_IMAGE" --name "$CLUSTER"
 fi
+NOTIFY_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${NOTIFY_DEP:-null}" 2>/dev/null || true)
+if [ "${SKIP_NOTIFY_IMAGE:-0}" != 1 ] && [[ "$NOTIFY_IMAGE" == openagentix/notify:* ]]; then
+  log "notify image $NOTIFY_IMAGE"
+  docker build -q -t "$NOTIFY_IMAGE" services/notify >/dev/null
+  kind load docker-image "$NOTIFY_IMAGE" --name "$CLUSTER"
+fi
 if [ -n "$BRIDGE_IMAGE" ]; then
   # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
   BRIDGE_HASH=$(cd bridges/telegram && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
@@ -273,6 +328,13 @@ if [ -n "$KB_DEP" ]; then
   # unchanged code = identical pod template = no restart; changed code = new hash = the pod is replaced.
   KB_HASH=$(cd services/kb && find . -type f ! -path './bin/*' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
   SET+=(--set-string "knowledge.kb.sourceHash=$KB_HASH")
+fi
+if [ -n "$NOTIFY_DEP" ]; then
+  # Same for notify: a hash of services/notify rolls the pod on a code change although the tag stays "dev".
+  NOTIFY_HASH=$(cd services/notify && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name '*_test.go' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "notify.sourceHash=$NOTIFY_HASH")
+  # No destination yet: the service is not Ready by design (it fails closed), and `helm --wait` must not wait for that.
+  [ "$NOTIFY_NO_DEST" = 0 ] || SET+=(--set notify.requireReady=false)
 fi
 if [ "${SKIP_SKILL:-0}" != 1 ] && jq -e 'select(.kind=="AgentTemplate")|.spec.skills[]?|select(.source.oci|test("/skills/openagentix-canary@"))' <<<"$RENDERED" >/dev/null; then
   log "example skill openagentix-canary"
@@ -340,6 +402,12 @@ if [ -n "$KB_DEP" ]; then
 fi
 
 # --- 7. wait for the agents ---------------------------------------------------------------------------------
+if [ -n "$NOTIFY_DEP" ]; then
+  log "notify"
+  $K rollout status deployment/notify -n "$N_NS" --timeout=180s
+  [ "$NOTIFY_NO_DEST" = 0 ] || echo "notify has no destination: calls are refused until you create Secret $N_NS/$N_DEST_S (README "Notifications") and run: $K rollout restart deployment/notify -n $N_NS"
+fi
+
 log "waiting for agents (first start builds a golden snapshot, ~1-2 min each)"
 for a in $(jq -r 'select(.kind=="Agent")|.metadata.name' <<<"$RENDERED"); do
   $K wait "agent/$a" -n $KAGENT_NS --for=condition=Ready --timeout="$AGENT_WAIT" || echo "WARN: agent $a not Ready yet: $K get agent $a -n $KAGENT_NS -o yaml"

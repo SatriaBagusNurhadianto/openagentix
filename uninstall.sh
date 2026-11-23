@@ -4,6 +4,7 @@
 # (provider keys, virtual keys, llm-api-keys, telegram-bridge), so a later ./install.sh reuses them.
 # PURGE_SECRETS=1 additionally deletes the Secrets/ConfigMap that install.sh created for this release (except the
 # knowledge base database credentials: they must stay as long as its volume does).
+# PURGE_SECRETS=1 also deletes the notify service's Secrets (the destinations file with the chat ids, and the copied bot token).
 # PURGE_DATA=1 deletes the knowledge base volumes (database, model cache), the memory embedding model cache and the database credentials.
 # Agent Kourier (installed by install.sh when channels.kourier.enabled): its Helm release is removed too (after the openagentix
 # release, which owns the connections and bindings). PURGE_SECRETS=1 also deletes the webhook connection Secrets install.sh generated
@@ -18,6 +19,7 @@ VKEYS=""
 if [ "${PURGE_SECRETS:-0}" = 1 ]; then   # read per-agent virtual key secret names before the release is removed
   VKEYS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="ModelConfig")|.metadata.namespace+"/"+.spec.apiKeySecret' 2>/dev/null || true)
 fi
+NOTIFYSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="Deployment" and .metadata.name=="notify")|.metadata.namespace as $ns|([.spec.template.spec.volumes[]?.secret.secretName]+[.spec.template.spec.containers[0].env[]?.valueFrom.secretKeyRef.name])|map(select(.!=null))|unique|.[]|$ns+"/"+.' 2>/dev/null || true)
 WHSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="ChatConnection" and .spec.platform=="webhook")|.metadata.namespace+"/"+.spec.credentialsSecretRef.name' 2>/dev/null || true)
 if helm status openagentix -n "$RELEASE_NS" >/dev/null 2>&1; then
   helm uninstall openagentix -n "$RELEASE_NS" --wait
@@ -30,6 +32,7 @@ if [ "${PURGE_SECRETS:-0}" = 1 ]; then
   for row in $VKEYS; do $K delete secret -n "${row%%/*}" "${row##*/}" --ignore-not-found; done
   $K delete configmap llm-api-keys -n agentgateway-system --ignore-not-found
   $K delete secret kb-admin kb-virtual-key -n openagentix-knowledge --ignore-not-found
+  for row in $NOTIFYSECRETS; do $K delete secret -n "${row%%/*}" "${row##*/}" --ignore-not-found; done   # notify destinations (chat ids) and the copied bot token
   $K delete secret telegram-bridge -n openagentix-gateway --ignore-not-found
   $K delete secret anthropic-api-key gemini-api-key -n agentgateway-system --ignore-not-found
 fi

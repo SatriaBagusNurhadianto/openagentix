@@ -26,6 +26,10 @@ const (
 	// DefaultPathLimit and MaxPathLimit bound the number of paths returned.
 	DefaultPathLimit = 50
 	MaxPathLimit     = 500
+	// DefaultFanOut and MaxFanOut bound how many edges a traversal follows out
+	// of one entity, so a hub cannot blow a query up.
+	DefaultFanOut = 25
+	MaxFanOut     = 100
 
 	OriginExtracted = "extracted"
 )
@@ -119,6 +123,7 @@ type ExpandQuery struct {
 	SeedIDs    []int64
 	Hops       int // 1..MaxHops; larger values are clamped, <= 0 means 1
 	Limit      int // max paths; <= 0 means DefaultPathLimit, clamped to MaxPathLimit
+	FanOut     int // edges followed per entity, lowest edge ids first; <= 0 means DefaultFanOut, clamped to MaxFanOut
 }
 
 // PathQuery asks for the shortest paths between two entities.
@@ -128,6 +133,7 @@ type PathQuery struct {
 	ToID       int64
 	MaxHops    int // 1..MaxHops, as ExpandQuery.Hops
 	Limit      int
+	FanOut     int // as ExpandQuery.FanOut
 }
 
 // EntityHit is a seed candidate. Higher Score is better.
@@ -198,6 +204,9 @@ type ExtractionResult struct {
 type GraphStats struct {
 	Entities, Relations, Mentions     int
 	JobsPending, JobsDone, JobsFailed int
+	// LastErrorCode is the error code of the most recently updated job of the
+	// collection that has one (never a message), or empty.
+	LastErrorCode string
 }
 
 // ClampHops maps a requested hop count into 1..MaxHops.
@@ -209,6 +218,17 @@ func ClampHops(h int) int {
 		return MaxHops
 	}
 	return h
+}
+
+// ClampFanOut maps a requested per-entity edge cap into 1..MaxFanOut.
+func ClampFanOut(f int) int {
+	switch {
+	case f <= 0:
+		return DefaultFanOut
+	case f > MaxFanOut:
+		return MaxFanOut
+	}
+	return f
 }
 
 // ClampLimit maps a requested path limit into 1..MaxPathLimit.

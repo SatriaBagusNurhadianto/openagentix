@@ -384,7 +384,11 @@ const walkSQL = `
 	  UNION ALL
 	  SELECT w.seed, o.other, w.depth + 1, w.nodes || o.other, w.edges || r.id, w.fwds || (r.src_id = w.node)
 	  FROM walk w
-	  JOIN {{schema}}.relations r ON r.collection = $1 AND (r.src_id = w.node OR r.dst_id = w.node)
+	  CROSS JOIN LATERAL (
+	    SELECT r2.id, r2.src_id, r2.dst_id FROM {{schema}}.relations r2
+	    WHERE r2.collection = $1 AND (r2.src_id = w.node OR r2.dst_id = w.node)
+	    ORDER BY r2.id LIMIT $6
+	  ) r
 	  CROSS JOIN LATERAL (SELECT CASE WHEN r.src_id = w.node THEN r.dst_id ELSE r.src_id END AS other) o
 	  WHERE w.depth < $3 AND w.node <> $4 AND NOT o.other = ANY(w.nodes)
 	)`
@@ -490,7 +494,7 @@ func (s *Store) Expand(ctx context.Context, q store.ExpandQuery) ([]store.Path, 
 	}
 	rows, err := s.pool.Query(ctx, s.q(walkSQL+`
 		SELECT nodes, edges, fwds FROM walk WHERE depth > 0 ORDER BY depth, nodes, edges LIMIT $5`),
-		q.Collection, q.SeedIDs, store.ClampHops(q.Hops), int64(0), store.ClampLimit(q.Limit))
+		q.Collection, q.SeedIDs, store.ClampHops(q.Hops), int64(0), store.ClampLimit(q.Limit), store.ClampFanOut(q.FanOut))
 	if err != nil {
 		return nil, err
 	}
@@ -511,8 +515,8 @@ func (s *Store) ShortestPaths(ctx context.Context, q store.PathQuery) ([]store.P
 	rows, err := s.pool.Query(ctx, s.q(walkSQL+`
 		SELECT nodes, edges, fwds FROM walk
 		WHERE node = $5 AND depth > 0 AND depth = (SELECT min(depth) FROM walk WHERE node = $5 AND depth > 0)
-		ORDER BY nodes, edges LIMIT $6`),
-		q.Collection, []int64{q.FromID}, store.ClampHops(q.MaxHops), q.ToID, q.ToID, store.ClampLimit(q.Limit))
+		ORDER BY nodes, edges LIMIT $7`),
+		q.Collection, []int64{q.FromID}, store.ClampHops(q.MaxHops), q.ToID, q.ToID, store.ClampFanOut(q.FanOut), store.ClampLimit(q.Limit))
 	if err != nil {
 		return nil, err
 	}
@@ -536,6 +540,13 @@ func (s *Store) GraphStats(ctx context.Context, collection string) (store.GraphS
 		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'done'),
 		       (SELECT count(*) FROM {{schema}}.extraction_jobs WHERE collection = $1 AND state = 'failed')`), collection).
 		Scan(&st.Entities, &st.Relations, &st.Mentions, &st.JobsPending, &st.JobsDone, &st.JobsFailed)
+	if err != nil {
+		return st, err
+	}
+	err = s.pool.QueryRow(ctx, s.q(`
+		SELECT coalesce((SELECT last_error_code FROM {{schema}}.extraction_jobs
+		                 WHERE collection = $1 AND state <> 'done' AND last_error_code <> ''
+		                 ORDER BY updated_at DESC, created_seq DESC LIMIT 1), '')`), collection).Scan(&st.LastErrorCode)
 	return st, err
 }
 

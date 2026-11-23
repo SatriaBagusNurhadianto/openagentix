@@ -215,6 +215,38 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 		}
 	})
 
+	run("graph: expand follows at most FanOut edges per entity, lowest edge ids first", func(t *testing.T, s store.Store) {
+		g := graphFixture{t, ctx, s}
+		g.doc("g", "d1", "x")
+		start, hub := g.ent("g", "Start", "service"), g.ent("g", "Hub", "service")
+		g.rel("g", start, hub, "uses", "d1", 0)
+		for i := 1; i <= 6; i++ {
+			g.rel("g", hub, g.ent("g", fmt.Sprintf("N%d", i), "service"), "uses", "d1", 0)
+		}
+		// From Start, Hub is at depth 1 and its edges are the capped fan-out: the
+		// edge back to Start counts, so FanOut 3 keeps Start, N1 and N2.
+		ps, err := s.Expand(ctx, store.ExpandQuery{Collection: "g", SeedIDs: []int64{start.ID}, Hops: 2, FanOut: 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := pathNames(ps); !slices.Equal(got, []string{"Start>Hub", "Start>Hub>N1", "Start>Hub>N2"}) {
+			t.Fatalf("capped expand = %v", got)
+		}
+		// Seeded at the hub itself, the cap applies to the hub's own edges.
+		ps, _ = s.Expand(ctx, store.ExpandQuery{Collection: "g", SeedIDs: []int64{hub.ID}, Hops: 1, FanOut: 2})
+		if got := pathNames(ps); !slices.Equal(got, []string{"Hub>Start", "Hub>N1"}) {
+			t.Fatalf("capped one-hop expand = %v", got)
+		}
+		// Without a value the default applies, which is larger than this graph.
+		ps, _ = s.Expand(ctx, store.ExpandQuery{Collection: "g", SeedIDs: []int64{hub.ID}, Hops: 1})
+		if len(ps) != 7 {
+			t.Fatalf("default fan-out cut a small graph: %d paths", len(ps))
+		}
+		if store.ClampFanOut(0) != store.DefaultFanOut || store.ClampFanOut(1<<20) != store.MaxFanOut || store.ClampFanOut(5) != 5 {
+			t.Fatal("ClampFanOut")
+		}
+	})
+
 	run("graph: every graph query is scoped to its collection", func(t *testing.T, s store.Store) {
 		g := graphFixture{t, ctx, s}
 		g.doc("g", "d1", "c")
@@ -485,8 +517,11 @@ func runGraph(t *testing.T, f Factory, run func(string, func(*testing.T, store.S
 		if _, ok, _ := s.ClaimJob(ctx, time.Minute); ok {
 			t.Fatal("failed job claimed")
 		}
-		if st, _ := s.GraphStats(ctx, "g"); st.JobsFailed != 1 || st.JobsPending != 0 {
+		if st, _ := s.GraphStats(ctx, "g"); st.JobsFailed != 1 || st.JobsPending != 0 || st.LastErrorCode != "malformed_output" {
 			t.Fatalf("stats = %+v", st)
+		}
+		if st, _ := s.GraphStats(ctx, "elsewhere"); st.LastErrorCode != "" {
+			t.Fatalf("error code leaked across collections: %+v", st)
 		}
 		if err := s.ApplyExtraction(ctx, store.ExtractionResult{Job: j.JobKey}); !errors.Is(err, store.ErrJobGone) {
 			t.Fatalf("apply to a failed job: %v", err)

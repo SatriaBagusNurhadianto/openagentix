@@ -294,7 +294,7 @@ type adj struct {
 
 // walk enumerates the simple paths of 1..hops edges from each seed. Edges are
 // followed in both directions. stop, if set, ends a path at an entity.
-func (s *Store) walk(collection string, seeds []int64, hops int, stop int64) []store.Path {
+func (s *Store) walk(collection string, seeds []int64, hops, fanOut int, stop int64) []store.Path {
 	g := &s.g
 	next := map[int64][]adj{}
 	for _, r := range g.relations {
@@ -303,6 +303,12 @@ func (s *Store) walk(collection string, seeds []int64, hops int, stop int64) []s
 		}
 		next[r.SrcID] = append(next[r.SrcID], adj{r, r.DstID, true})
 		next[r.DstID] = append(next[r.DstID], adj{r, r.SrcID, false})
+	}
+	for id, as := range next {
+		slices.SortFunc(as, func(a, b adj) int { return int(a.rel.ID - b.rel.ID) })
+		if len(as) > fanOut {
+			next[id] = as[:fanOut]
+		}
 	}
 	var out []store.Path
 	var nodes []int64
@@ -356,7 +362,7 @@ func (s *Store) buildPath(nodes []int64, steps []adj) store.Path {
 func (s *Store) Expand(_ context.Context, q store.ExpandQuery) ([]store.Path, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	ps := s.walk(q.Collection, q.SeedIDs, store.ClampHops(q.Hops), 0)
+	ps := s.walk(q.Collection, q.SeedIDs, store.ClampHops(q.Hops), store.ClampFanOut(q.FanOut), 0)
 	store.SortPaths(ps)
 	if lim := store.ClampLimit(q.Limit); len(ps) > lim {
 		ps = ps[:lim]
@@ -371,7 +377,7 @@ func (s *Store) ShortestPaths(_ context.Context, q store.PathQuery) ([]store.Pat
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var found []store.Path
-	for _, p := range s.walk(q.Collection, []int64{q.FromID}, store.ClampHops(q.MaxHops), q.ToID) {
+	for _, p := range s.walk(q.Collection, []int64{q.FromID}, store.ClampHops(q.MaxHops), store.ClampFanOut(q.FanOut), q.ToID) {
 		if p.Entities[len(p.Entities)-1].ID == q.ToID {
 			found = append(found, p)
 		}
@@ -406,9 +412,13 @@ func (s *Store) GraphStats(_ context.Context, collection string) (store.GraphSta
 			st.Mentions++
 		}
 	}
+	var lastErrAt time.Time
 	for k, j := range s.g.jobs {
 		if k.Collection != collection {
 			continue
+		}
+		if j.State != store.JobDone && j.LastErrorCode != "" && !j.UpdatedAt.Before(lastErrAt) {
+			st.LastErrorCode, lastErrAt = j.LastErrorCode, j.UpdatedAt
 		}
 		switch j.State {
 		case store.JobPending:

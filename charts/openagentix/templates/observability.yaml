@@ -72,11 +72,17 @@ spec:
 {{- end }}
 {{- /* ---- targets, shared by the PodMonitors and the bundled VictoriaMetrics ---- */}}
 {{- $targets := list }}
-{{- range $t := $o.metrics.scrape.targets }}
+{{- range $t0 := $o.metrics.scrape.targets }}
+{{- $t := deepCopy $t0 }}
 {{- $keep := true }}
 {{- if eq (default "" $t.when) "gateway" }}{{ $keep = $.Values.gateway.enabled }}{{ end }}
 {{- if eq (default "" $t.when) "mcp" }}{{ $keep = $mcpOn }}{{ end }}
 {{- if eq (default "" $t.when) "channels" }}{{ $keep = $.Values.channels.kourier.enabled }}{{ end }}
+{{- /* our own services: namespace and port follow the service's own settings unless the entry sets them */}}
+{{- if eq (default "" $t.when) "knowledge" }}{{ $keep = $.Values.knowledge.enabled }}
+{{- if $keep }}{{ $_ := set $t "namespace" (default $.Values.knowledge.namespace $t.namespace) }}{{ $_ = set $t "port" (default (int (include "oa.obsMetricsPort" (dict "root" $ "svc" "knowledge"))) $t.port) }}{{ end }}{{ end }}
+{{- if eq (default "" $t.when) "notify" }}{{ $keep = $.Values.notify.enabled }}
+{{- if $keep }}{{ $_ := set $t "namespace" (default $.Values.notify.namespace $t.namespace) }}{{ $_ = set $t "port" (default (int (include "oa.obsMetricsPort" (dict "root" $ "svc" "notify"))) $t.port) }}{{ end }}{{ end }}
 {{- if $keep }}{{ $targets = append $targets $t }}{{ end }}
 {{- end }}
 {{- if and $o.metrics.scrape.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}

@@ -112,8 +112,17 @@ spec:
           imagePullPolicy: {{ $kb.image.pullPolicy }}
           ports:
             - {name: http, containerPort: 8080}
+            {{- if include "oa.obsOn" . }}
+            - {name: metrics, containerPort: {{ include "oa.obsMetricsPort" (dict "root" . "svc" "knowledge") }}}
+            {{- end }}
           env:
             - {name: KB_ADDR, value: ":8080"}
+            {{- if include "oa.obsOn" . }}
+            - {name: KB_METRICS_ADDR, value: {{ printf ":%s" (include "oa.obsMetricsPort" (dict "root" . "svc" "knowledge")) | quote }}}
+            {{- if $kb.metrics.collectionLabels }}
+            - {name: KB_METRICS_COLLECTION_LABELS, value: "true"}
+            {{- end }}
+            {{- end }}
             - {name: KB_STORE, value: postgres}
             - {name: KB_DB_SCHEMA, value: {{ $kb.schema | quote }}}
             - {name: KB_REQUEST_TIMEOUT, value: {{ $kb.requestTimeout | quote }}}
@@ -458,6 +467,25 @@ spec:
         {{- end }}
     {{- else }} []
     {{- end }}
+{{- if and (include "oa.obsOn" .) .Values.observability.bundled.enabled }}
+---
+# The bundled VictoriaMetrics scrapes the kb's metrics port (no authentication, counts and timings only). Nothing else may reach it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: kb-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: kb}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: {{ include "oa.obsMetricsPort" (dict "root" . "svc" "knowledge") }}}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.observability.namespace }}}}
+          podSelector: {matchLabels: {app: victoria-metrics}}
+{{- end }}
 {{- if $pg.enabled }}
 ---
 apiVersion: networking.k8s.io/v1

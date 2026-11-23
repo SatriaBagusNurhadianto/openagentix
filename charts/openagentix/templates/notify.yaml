@@ -50,8 +50,14 @@ spec:
           imagePullPolicy: {{ $n.image.pullPolicy }}
           ports:
             - {name: http, containerPort: 8080}
+            {{- if include "oa.obsOn" . }}
+            - {name: metrics, containerPort: {{ include "oa.obsMetricsPort" (dict "root" . "svc" "notify") }}}
+            {{- end }}
           env:
             - {name: NOTIFY_ADDR, value: ":8080"}
+            {{- if include "oa.obsOn" . }}
+            - {name: NOTIFY_METRICS_ADDR, value: {{ printf ":%s" (include "oa.obsMetricsPort" (dict "root" . "svc" "notify")) | quote }}}
+            {{- end }}
             - {name: NOTIFY_CONFIG, value: {{ printf "/etc/notify/%s" $dest.key | quote }}}
             - {name: NOTIFY_MCP_STATELESS, value: "true"}
             {{- range $k, $v := $n.settings }}
@@ -149,6 +155,25 @@ spec:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mcp.namespace }}}}
           podSelector:
             matchLabels: {app: virtualmcpserver, toolhive-name: {{ .Values.mcp.virtual.name | quote }}}
+{{- if and (include "oa.obsOn" .) .Values.observability.bundled.enabled }}
+---
+# The bundled VictoriaMetrics scrapes the notify metrics port (no authentication, counts and timings by platform kind only).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: notify}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: {{ include "oa.obsMetricsPort" (dict "root" . "svc" "notify") }}}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.observability.namespace }}}}
+          podSelector: {matchLabels: {app: victoria-metrics}}
+{{- end }}
 ---
 # Egress: DNS and HTTPS to public addresses only (private ranges, link-local and cloud metadata excluded). NetworkPolicy
 # matches IPs, not host names, so "api.telegram.org only" needs an FQDN-aware policy or an egress proxy. kindnet does not

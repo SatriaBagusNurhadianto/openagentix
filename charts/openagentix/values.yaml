@@ -248,6 +248,11 @@ knowledge:
     replicas: 1
     sourceHash: ""                                              # install.sh sets it to a hash of services/kb; see README
     adminSecret: {name: kb-admin, key: KB_ADMIN_TOKEN}          # bearer token of the ingest API; required
+    # Prometheus metrics, only while observability.enabled: /metrics on this port, a listener separate from the API (:8080) with no
+    # authentication, so the NetworkPolicy opens it only to the bundled VictoriaMetrics. Counts and timings, never text or ids.
+    metrics:
+      port: 9090
+      collectionLabels: false                                   # true adds the collection NAME to the graph size gauges (names are operator-chosen and unbounded; capped at 50)
     databaseSecret: {name: kb-database, key: KB_DATABASE_URL}   # full PostgreSQL URL
     schema: kb
     requestTimeout: 30s                                         # per request (search, get, list)
@@ -366,6 +371,11 @@ notify:
   namespace: openagentix-notify
   image: {repository: openagentix/notify, tag: dev, pullPolicy: IfNotPresent}   # built from services/notify and loaded into kind by install.sh
   sourceHash: ""                                  # install.sh sets it to a hash of services/notify; see README
+  # Prometheus metrics, only while observability.enabled: /metrics on this port, a listener separate from the MCP port (:8080) with no
+  # authentication, so the NetworkPolicy opens it only to the bundled VictoriaMetrics. Counts and timings by platform kind, never text,
+  # destination names or addresses.
+  metrics:
+    port: 9090
   # ONE replica, always: rate limits, the in-flight cap and idempotency keys live in the process, so a second replica
   # would double every limit. The Deployment strategy is Recreate for the same reason.
   destinations:
@@ -467,7 +477,7 @@ observability:
       namespace: ""                          # where the PodMonitors go (default observability.namespace)
       interval: 30s
       # What gets scraped (PodMonitors and the bundled VictoriaMetrics). `when` limits an entry to a block that is enabled:
-      # gateway | mcp | channels. port is a container port NUMBER; the pods need not declare it.
+      # gateway | mcp | channels | knowledge | notify. port is a container port NUMBER; the pods need not declare it.
       targets:
         - {job: model-gateway,      namespace: agentgateway-system, selector: {gateway.networking.k8s.io/gateway-name: model-gateway}, port: 15020, when: gateway}
         - {job: agentgateway,       namespace: agentgateway-system, selector: {app.kubernetes.io/name: agentgateway}, port: 9092, when: gateway}
@@ -478,6 +488,11 @@ observability:
         - {job: ate-controller,     namespace: ate-system, selector: {app: ate-controller}, port: 8080}
         - {job: vmcp,               namespace: mcp-tools, selector: {app: virtualmcpserver}, port: 9464, when: mcp}
         - {job: agent-kourier,      namespace: agent-kourier, selector: {app.kubernetes.io/name: agent-kourier}, port: 8080, when: channels}
+        # Our own services. Their namespace and port come from knowledge.namespace / knowledge.kb.metrics.port and
+        # notify.namespace / notify.metrics.port (set `namespace` or `port` here only to override them). The services serve
+        # /metrics on a SEPARATE port, only while observability is on; see ADR 0003, round 2.
+        - {job: kb,                 selector: {app: kb}, when: knowledge}
+        - {job: notify,             selector: {app: notify}, when: notify}
   audit:
     enabled: true                            # vMCP audit log: tool name, outcome, caller subject, ids and sizes. Never arguments or results (see capture)
   baggage: false                             # true lets agent/conversation ids ride in the W3C `baggage` header to MCP servers AND model providers; leave off

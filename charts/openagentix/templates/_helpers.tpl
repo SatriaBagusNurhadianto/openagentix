@@ -110,6 +110,19 @@ numbers, month/weekday names, ranges, steps and lists. The API server validates 
 {{- $_ := include "oa.obsEndpoint" . -}}
 {{- end -}}
 
+{{/* The metrics port of our own services ("knowledge" for the kb, "notify"), checked. Prints nothing while observability is off. Call: include "oa.obsMetricsPort" (dict "root" . "svc" "knowledge") */}}
+{{- define "oa.obsMetricsPort" -}}
+{{- if include "oa.obsOn" .root -}}
+{{- $m := dict -}}
+{{- if eq .svc "knowledge" }}{{ $m = .root.Values.knowledge.kb.metrics }}{{ else }}{{ $m = .root.Values.notify.metrics }}{{ end -}}
+{{- $key := ternary "knowledge.kb.metrics.port" "notify.metrics.port" (eq .svc "knowledge") -}}
+{{- if not (regexMatch "^[0-9]+$" (toString $m.port)) }}{{ fail (printf "%s must be a port number, got %v" $key $m.port) }}{{ end -}}
+{{- $p := int $m.port -}}
+{{- if or (lt $p 1024) (gt $p 65535) (eq $p 8080) }}{{ fail (printf "%s must be 1024..65535 and different from the API port 8080, got %d" $key $p) }}{{ end -}}
+{{- $p -}}
+{{- end -}}
+{{- end -}}
+
 {{/* Propagators: tracecontext only (no baggage) unless observability.baggage. */}}
 {{- define "oa.obsPropagators" -}}
 {{- if .Values.observability.baggage -}}tracecontext,baggage{{- else -}}tracecontext{{- end -}}

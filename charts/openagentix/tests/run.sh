@@ -880,7 +880,7 @@ eq "capture.content=true: runtime traces on (the operator asked for content)" "$
 echo "# observability: monitors only when the CRD API exists"
 eq "no PodMonitor without the monitoring.coreos.com/v1 API" "$(count "$D" '.kind=="PodMonitor" or .kind=="ServiceMonitor"')" 0
 DM=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1)
-eq "with the API: one PodMonitor per target"           "$(count "$DM" '.kind=="PodMonitor"')" 8
+eq "with the API: one PodMonitor per target"           "$(count "$DM" '.kind=="PodMonitor"')" 9
 eq "PodMonitor for the gateway proxy"                  "$(q "$DM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-model-gateway")|.spec.namespaceSelector.matchNames[0]+" "+(.spec.podMetricsEndpoints[0].portNumber|tostring)')" "agentgateway-system 15020"
 eq "PodMonitors live in the observability namespace"   "$(q "$DM" '[.[]|select(.kind=="PodMonitor")|.metadata.namespace]|unique|join(",")')" openagentix-observability
 eq "PodMonitor selects pods by label"                  "$(q "$DM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-atenet-egress")|.spec.selector.matchLabels.app')" atenet-egress
@@ -892,6 +892,56 @@ DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set channels.kou
 eq "kourier target appears only with channels.kourier"  "$(count "$DM" '.kind=="PodMonitor" and .metadata.name=="openagentix-agent-kourier"')+$(count "$DM2" '.kind=="PodMonitor" and .metadata.name=="openagentix-agent-kourier"')" "0+1"
 DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set gateway.enabled=false --set mcp.enabled=false --set agents=null --set knowledge.enabled=false)
 eq "gateway/mcp targets drop with their blocks"         "$(count "$DM2" '.kind=="PodMonitor"')" 5
+
+echo "# observability round 2: kb and notify expose Prometheus metrics on their own port"
+NS='.metadata.namespace=="openagentix-observability"'
+NT='.[]|select(.kind=="Deployment" and .metadata.name=="notify")'
+NTC="$NT|.spec.template.spec.containers[0]"
+NTE="$NTC|.env[]"
+NTV=(--set notify.enabled=true --set mcp.enabled=true)
+DOFF=$(docs "${NTV[@]}")
+eq "off: no KB_METRICS_ADDR, no NOTIFY_METRICS_ADDR"   "$(q "$DOFF" "[($KE|select(.name|test(\"METRICS\"))), ($NTE|select(.name|test(\"METRICS\")))]|length")" 0
+eq "off: no container port named metrics"              "$(q "$DOFF" "[($KC|.ports[]|select(.name==\"metrics\")), ($NTC|.ports[]|select(.name==\"metrics\"))]|length")" 0
+eq "off: no metrics NetworkPolicy"                     "$(count "$DOFF" '.kind=="NetworkPolicy" and (.metadata.name|test("-metrics$"))')" 0
+H0=$(helm template openagentix "$CHART" -n openagentix-system "${NTV[@]}" 2>&1 | shasum -a 256)
+H1=$(helm template openagentix "$CHART" -n openagentix-system "${NTV[@]}" --set observability.enabled=false --set observability.bundled.enabled=true --set knowledge.kb.metrics.port=9191 --set knowledge.kb.metrics.collectionLabels=true --set notify.metrics.port=9292 2>&1 | shasum -a 256)
+eq "off: the metrics settings change nothing (byte-identical render)" "$H1" "$H0"
+DK=$(docs "${OB[@]}" "${NTV[@]}")
+eq "on: kb serves metrics on :9090 (own listener)"     "$(q "$DK" "$KE|select(.name==\"KB_METRICS_ADDR\")|.value")" ":9090"
+eq "on: kb metrics container port is named metrics"    "$(q "$DK" "$KC|.ports[]|select(.name==\"metrics\")|.containerPort")" 9090
+eq "on: the kb API port and Service are unchanged"     "$(q "$DK" "$KC|[.ports[]|select(.name==\"http\")|.containerPort]|join(\",\")")+$(q "$DK" '.[]|select(.kind=="Service" and .metadata.name=="kb")|[.spec.ports[].port]|join(",")')" "8080+8080"
+eq "on: the Services never expose the metrics ports"   "$(count "$DK" '.kind=="Service" and ([.spec.ports[]?.port]|any(.==9090))')" 0
+eq "on: per-collection labels off unless asked"        "$(q "$DK" "[$KE|select(.name==\"KB_METRICS_COLLECTION_LABELS\")]|length")" 0
+eq "on: collectionLabels=true sets the kb flag"        "$(q "$(docs "${OB[@]}" --set knowledge.kb.metrics.collectionLabels=true)" "$KE|select(.name==\"KB_METRICS_COLLECTION_LABELS\")|.value")" true
+eq "on: notify serves metrics on :9090 (own listener)" "$(q "$DK" "$NTE|select(.name==\"NOTIFY_METRICS_ADDR\")|.value")" ":9090"
+eq "on: notify metrics container port is named metrics" "$(q "$DK" "$NTC|.ports[]|select(.name==\"metrics\")|.containerPort")" 9090
+eq "on: the notify Service exposes only 8080"          "$(q "$DK" '.[]|select(.kind=="Service" and .metadata.name=="notify")|[.spec.ports[].port]|join(",")')" 8080
+eq "on: no scrape annotations on the pods (as in round 1)" "$(q "$DK" "[($KB|.spec.template.metadata.annotations//{}|keys[]|select(test(\"prometheus\"))), ($NT|.spec.template.metadata.annotations//{}|keys[]|select(test(\"prometheus\")))]|length")" 0
+eq "on: metrics port override reaches env and container port" "$(q "$(docs "${OB[@]}" --set knowledge.kb.metrics.port=9191)" "[($KE|select(.name==\"KB_METRICS_ADDR\")|.value), ($KC|.ports[]|select(.name==\"metrics\")|.containerPort|tostring)]|join(\" \")")" ":9191 9191"
+eq "on: a metrics port equal to the API port is rejected" "$(render_err "${OB[@]}" --set knowledge.kb.metrics.port=8080 | grep -c 'metrics.port')" 1
+eq "on: a non-numeric metrics port is rejected"        "$(render_err "${OB[@]}" "${NTV[@]}" --set notify.metrics.port=abc | grep -c 'metrics.port')" 1
+DKM=$(docs "${OE[@]}" "${NTV[@]}" --api-versions monitoring.coreos.com/v1)
+eq "PodMonitors: kb"                                   "$(q "$DKM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-kb")|[.spec.namespaceSelector.matchNames[0],.spec.selector.matchLabels.app,(.spec.podMetricsEndpoints[0].portNumber|tostring),.spec.podMetricsEndpoints[0].path]|join(" ")')" "openagentix-knowledge kb 9090 /metrics"
+eq "PodMonitors: notify"                               "$(q "$DKM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-notify")|[.spec.namespaceSelector.matchNames[0],.spec.selector.matchLabels.app,(.spec.podMetricsEndpoints[0].portNumber|tostring),.spec.podMetricsEndpoints[0].path]|join(" ")')" "openagentix-notify notify 9090 /metrics"
+eq "PodMonitors: 10 targets with notify on (8 + kb + notify)" "$(count "$DKM" '.kind=="PodMonitor"')" 10
+eq "PodMonitors: no notify target while notify is off" "$(count "$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1)" '.kind=="PodMonitor" and .metadata.name=="openagentix-notify"')" 0
+eq "PodMonitors: no kb target while knowledge is off"  "$(count "$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set knowledge.enabled=false)" '.kind=="PodMonitor" and .metadata.name=="openagentix-kb"')" 0
+eq "PodMonitors: the kb target follows knowledge.namespace and the port override" "$(q "$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set knowledge.namespace=kb-ns --set knowledge.kb.metrics.port=9191)" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-kb")|.spec.namespaceSelector.matchNames[0]+" "+(.spec.podMetricsEndpoints[0].portNumber|tostring)')" "kb-ns 9191"
+SCK=$(q "$DK" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\")|.data[\"scrape.yml\"]")
+eq "bundled scrape: kb and notify jobs"                "$(yq -r '[.scrape_configs[].job_name]|map(select(.=="kb" or .=="notify"))|sort|join(",")' <<<"$SCK")" kb,notify
+eq "bundled scrape: the kb job targets pod IP :9090 in the knowledge namespace" "$(yq -r '.scrape_configs[]|select(.job_name=="kb")|[.kubernetes_sd_configs[0].namespaces.names[0], .kubernetes_sd_configs[0].selectors[0].label, (.relabel_configs|tostring|contains(":9090"))]|join(" ")' <<<"$SCK")" "openagentix-knowledge app=kb true"
+eq "bundled scrape: the notify job targets pod IP :9090 in the notify namespace" "$(yq -r '.scrape_configs[]|select(.job_name=="notify")|[.kubernetes_sd_configs[0].namespaces.names[0], .kubernetes_sd_configs[0].selectors[0].label, (.relabel_configs|tostring|contains(":9090"))]|join(" ")' <<<"$SCK")" "openagentix-notify app=notify true"
+eq "bundled scrape: no notify job while notify is off" "$(yq -r '[.scrape_configs[].job_name]|index("notify")' <<<"$(q "$(docs "${OB[@]}")" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\")|.data[\"scrape.yml\"]")")" null
+eq "bundled scrape: the VictoriaMetrics pod restarts when the targets change" "$([ "$(q "$DK" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"victoria-metrics\")|.spec.template.metadata.annotations[\"checksum/scrape\"]")" != "$(q "$(docs "${OB[@]}")" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"victoria-metrics\")|.spec.template.metadata.annotations[\"checksum/scrape\"]")" ] && echo differs || echo same)" differs
+KM='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-metrics")'
+NM='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="notify-metrics")'
+eq "NetworkPolicy kb-metrics: only the bundled scraper, only the metrics port" "$(q "$DK" "$KM|[.metadata.namespace,(.spec.podSelector.matchLabels.app),(.spec.ingress|length|tostring),(.spec.ingress[0].ports|map(.port|tostring)|join(\",\")),(.spec.ingress[0].from|length|tostring),.spec.ingress[0].from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.spec.ingress[0].from[0].podSelector.matchLabels.app]|join(\" \")")" "openagentix-knowledge kb 1 9090 1 openagentix-observability victoria-metrics"
+eq "NetworkPolicy notify-metrics: only the bundled scraper, only the metrics port" "$(q "$DK" "$NM|[.metadata.namespace,(.spec.podSelector.matchLabels.app),(.spec.ingress|length|tostring),(.spec.ingress[0].ports|map(.port|tostring)|join(\",\")),(.spec.ingress[0].from|length|tostring),.spec.ingress[0].from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.spec.ingress[0].from[0].podSelector.matchLabels.app]|join(\" \")")" "openagentix-notify notify 1 9090 1 openagentix-observability victoria-metrics"
+eq "the API policies do not open the metrics port"     "$(q "$DK" '[.[]|select(.kind=="NetworkPolicy" and (.metadata.name=="kb-ingress" or .metadata.name=="notify-ingress"))|.spec.ingress[]?.ports[]?.port]|map(tostring)|unique|join(",")')" 8080
+eq "no metrics NetworkPolicy without the bundled profile" "$(count "$(docs "${OE[@]}" "${NTV[@]}")" '.kind=="NetworkPolicy" and (.metadata.name=="kb-metrics" or .metadata.name=="notify-metrics")')" 0
+eq "no metrics NetworkPolicy with networkPolicy.enabled=false" "$(count "$(docs "${OB[@]}" "${NTV[@]}" --set networkPolicy.enabled=false)" '.kind=="NetworkPolicy" and (.metadata.name=="kb-metrics" or .metadata.name=="notify-metrics")')" 0
+eq "no notify-metrics NetworkPolicy while notify is off" "$(count "$(docs "${OB[@]}")" '.kind=="NetworkPolicy" and .metadata.name=="notify-metrics"')" 0
+eq "the metrics settings render no Secret and no literal credential" "$(count "$DK" '.kind=="Secret"')" 0
 
 echo "# observability: privacy, one switch"
 DC=$(docs "${OE[@]}" --set observability.capture.content=true)
@@ -920,7 +970,7 @@ eq "victoria-metrics: own ServiceAccount, token mounted (pod discovery needs it)
 eq "victoria-metrics: retention and PVC"               "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"victoria-metrics\")|.spec.template.spec.containers[0].args|index(\"-retentionPeriod=7d\")!=null")" true
 eq "victoria-metrics: scrape config comes from a ConfigMap" "$(count "$D" "$NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\"")" 1
 SC=$(q "$D" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\")|.data[\"scrape.yml\"]")
-eq "scrape config: one job per target"                 "$(yq -r '[.scrape_configs[].job_name]|sort|join(",")' <<<"$SC")" "agentgateway,ate-api-server,ate-controller,atelet,atenet-egress,atenet-router,model-gateway,victoria-metrics,vmcp"
+eq "scrape config: one job per target"                 "$(yq -r '[.scrape_configs[].job_name]|sort|join(",")' <<<"$SC")" "agentgateway,ate-api-server,ate-controller,atelet,atenet-egress,atenet-router,kb,model-gateway,victoria-metrics,vmcp"
 eq "scrape config: the gateway job targets pod IP :15020 in its namespace" "$(yq -r '.scrape_configs[]|select(.job_name=="model-gateway")|[.kubernetes_sd_configs[0].role, .kubernetes_sd_configs[0].namespaces.names[0], (.relabel_configs|tostring|contains("15020"))]|join(" ")' <<<"$SC")" "pod agentgateway-system true"
 eq "ClusterRole: only get/list/watch on pods"          "$(q "$D" '.[]|select(.kind=="ClusterRole" and .metadata.name=="openagentix-observability-discovery")|.rules|tojson')" '[{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","watch"]}]'
 eq "bundled: no Secret objects"                        "$(count "$D" '.kind=="Secret"')" 0

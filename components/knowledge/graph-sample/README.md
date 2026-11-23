@@ -43,3 +43,36 @@ documents.
 
 Ingest it with `hack/kb-ingest.sh components/knowledge/graph-sample/docs graph-canary` (the script does this for you).
 The README is outside `docs/` on purpose: it states the answer and must not be ingested.
+
+## Curated facts: `org-catalogue.yaml`
+
+A small hand-written catalogue (19 entities, 12 relations) that goes with the corpus: the manager each team escalates to, the
+service tier of five services, and a team (Cobalt, with its service Halyard) that no document mentions. It is loaded with no model
+call:
+
+```sh
+hack/kb-graph-load.sh graph-canary org-catalogue components/knowledge/graph-sample/org-catalogue.yaml
+```
+
+It states none of the five chain links above (not who owns Orion, what Orion calls, where Quill stores data, who is on call for
+Basalt, or where Teal runs), so it cannot answer the canary question and does not change its answer. It adds facts the corpus lacks.
+
+### The question that needs both
+
+> Which service calls the ledger API Quill, which team owns it, and who is that team's escalation manager?
+
+Expected answer: **Orion**, owned by **Basalt**, whose escalation manager is **Priya Venkat**.
+
+```
+Quill <-calls- Orion <-owns- Basalt -escalates_to-> Priya Venkat
+ (extracted: orion-dependencies) (extracted: orion-ownership) (curated: factset org-catalogue)
+```
+
+Two links come from documents and are extracted by the model; the last one exists only in the catalogue. In the tool answer it
+is marked `curated: factset=org-catalogue source=https://example.com/openagentix/org-catalogue` with its note, and it has no
+document id. Without the catalogue the same question reaches Basalt and stops. The look-alike chain stays apart: for the other
+ledger API (Quire, called by Sparrow, owned by Granite) the manager is Hana Mori. A second question needs only the catalogue:
+"What tier is the service Orion?" answers Tier 1.
+
+An offline test covers this pair (`services/kb/internal/kb/factset_sample_test.go`, on the stored extraction of the canary run). It
+has not been run against the cluster or a live model.

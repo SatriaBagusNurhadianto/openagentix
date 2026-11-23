@@ -1,0 +1,42 @@
+# A small, fictional, hand-written catalogue for the knowledge graph: who escalates to whom, how critical a service is, and
+# a team the canary corpus never mentions. Everything here is invented. Load it with
+#
+#   hack/kb-graph-load.sh graph-canary org-catalogue components/knowledge/graph-sample/org-catalogue.yaml
+#
+# It complements the canary corpus (docs/): it does NOT state any link of the canary's answer chain (who owns Orion, what
+# Orion calls, where Quill stores data, who is on call for Basalt, where Teal runs), so a question that needs both a curated
+# fact and extracted facts can only be answered by combining the two. See README.md.
+source_uri: https://example.com/openagentix/org-catalogue
+entities:
+  - {name: Basalt, type: team}
+  - {name: Granite, type: team}
+  - {name: Slate, type: team}
+  - {name: Marrow, type: team}
+  - {name: Tern, type: team}
+  - {name: Cobalt, type: team, description: "Developer experience team; not mentioned in any corpus document"}
+  - {name: Priya Venkat, type: person, description: "Engineering manager of the platform group"}
+  - {name: Hana Mori, type: person}
+  - {name: Luis Ortega, type: person}
+  - {name: Jonas Weber, type: person}
+  - {name: Ines Duarte, type: person}
+  - {name: Omar Haddad, type: person}
+  - {name: Orion, type: service}
+  - {name: Ember, type: service}
+  - {name: Sparrow, type: service}
+  - {name: Lantern, type: service}
+  - {name: Halyard, type: service, description: "Internal build cache; only known from this catalogue"}
+  - {name: Tier 1, type: concept, aliases: [critical tier], description: "Customer-facing and revenue-critical; paged around the clock"}
+  - {name: Tier 2, type: concept, aliases: [standard tier], description: "Business-critical; paged during business hours"}
+relations:
+  - {source: Basalt, predicate: escalates_to, target: Priya Venkat, note: "Escalations of team Basalt that its on-call engineer cannot resolve go to Priya Venkat"}
+  - {source: Granite, predicate: escalates_to, target: Hana Mori, note: "Escalations of team Granite go to Hana Mori"}
+  - {source: Slate, predicate: escalates_to, target: Luis Ortega, note: "Escalations of team Slate go to Luis Ortega"}
+  - {source: Marrow, predicate: escalates_to, target: Jonas Weber, note: "Escalations of team Marrow go to Jonas Weber"}
+  - {source: Tern, predicate: escalates_to, target: Ines Duarte, note: "Escalations of team Tern go to Ines Duarte"}
+  - {source: Cobalt, predicate: escalates_to, target: Omar Haddad, note: "Escalations of team Cobalt go to Omar Haddad"}
+  - {source: Cobalt, predicate: owns, target: Halyard, note: "Team Cobalt owns the Halyard build cache"}
+  - {source: Orion, predicate: has_tier, target: Tier 1, note: "Orion is a tier 1 service"}
+  - {source: Ember, predicate: has_tier, target: Tier 2}
+  - {source: Sparrow, predicate: has_tier, target: Tier 2}
+  - {source: Lantern, predicate: has_tier, target: Tier 2}
+  - {source: Halyard, predicate: has_tier, target: Tier 2}

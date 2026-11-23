@@ -70,3 +70,14 @@ numbers, month/weekday names, ranges, steps and lists. The API server validates 
 {{- end -}}
 {{- end -}}
 {{- end -}}
+
+{{/* Tool names of the notify service as the vMCP exposes them: <prefix of the entry><service tool>. JSON list. */}}
+{{- define "oa.notifyTools" -}}
+{{- $pfx := replace "{workload}" .Values.notify.mcp.entryName .Values.mcp.virtual.prefixFormat -}}
+{{- list (printf "%snotify_send" $pfx) (printf "%snotify_list_destinations" $pfx) | toJson -}}
+{{- end -}}
+
+{{- define "oa.notifyAgentPrompt" -}}
+{{- $t := include "oa.notifyTools" . | fromJsonArray -}}
+{{- .Values.notify.agentPrompt | replace "{send}" (index $t 0) | replace "{list}" (index $t 1) -}}
+{{- end -}}

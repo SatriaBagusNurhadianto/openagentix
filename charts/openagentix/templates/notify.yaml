@@ -1,0 +1,180 @@
+{{- if .Values.notify.enabled }}
+{{- $n := .Values.notify }}
+{{- $ns := $n.namespace }}
+{{- $dest := $n.destinations.existingSecret }}
+{{- $_ := required "notify.destinations.existingSecret.name is required" $dest.name }}
+{{- $_ = required "notify.destinations.existingSecret.key is required" $dest.key }}
+{{- range $t := $n.tokens }}
+{{- if not (regexMatch "^[A-Z_][A-Z0-9_]*$" (toString $t.env)) }}{{ fail (printf "notify.tokens: env %q must be an upper-case environment variable name" (toString $t.env)) }}{{ end }}
+{{- $_ = required (printf "notify.tokens: %s needs a secret name" $t.env) $t.secret }}
+{{- $_ = required (printf "notify.tokens: %s needs a secret key" $t.env) $t.key }}
+{{- end }}
+# One replica (Recreate): rate limits, the in-flight cap and idempotency keys live in the process.
+# The destinations file (chat ids) and the tokens come from existing Secrets; the chart never contains their values.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notify
+  namespace: {{ $ns }}
+  labels:
+    app: notify
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: notify}
+  template:
+    metadata:
+      labels:
+        app: notify
+        {{- include "oa.labels" . | nindent 8 }}
+      {{- if $n.sourceHash }}
+      annotations:
+        # set by install.sh from the content of services/notify: a code change rolls the pod although the image tag stays "dev"
+        openagentix.io/source-hash: {{ $n.sourceHash | quote }}
+      {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: notify
+          image: {{ printf "%s:%s" $n.image.repository (toString $n.image.tag) | quote }}
+          imagePullPolicy: {{ $n.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: NOTIFY_ADDR, value: ":8080"}
+            - {name: NOTIFY_CONFIG, value: {{ printf "/etc/notify/%s" $dest.key | quote }}}
+            - {name: NOTIFY_MCP_STATELESS, value: "true"}
+            {{- range $k, $v := $n.settings }}
+            - {name: {{ $k }}, value: {{ $v | toString | quote }}}
+            {{- end }}
+            {{- range $t := $n.tokens }}
+            - name: {{ $t.env }}
+              valueFrom:
+                secretKeyRef: {name: {{ $t.secret | quote }}, key: {{ $t.key | quote }}, optional: true}
+            {{- end }}
+          volumeMounts:
+            - {name: destinations, mountPath: /etc/notify, readOnly: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet: {path: {{ ternary "/readyz" "/healthz" (ne ($n.requireReady | toString) "false") }}, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml $n.resources | nindent 12 }}
+      volumes:
+        - name: destinations
+          secret:
+            secretName: {{ $dest.name | quote }}
+            optional: true   # absent Secret = no destinations: the service starts, fails closed and is not ready
+            defaultMode: 0440
+            items:
+              - {key: {{ $dest.key | quote }}, path: {{ $dest.key | quote }}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notify
+  namespace: {{ $ns }}
+  labels:
+    app: notify
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: notify}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- if .Values.mcp.enabled }}
+---
+# The service is one more backend of the vMCP group. MCPServerEntry creates no pods: the vMCP itself connects to the
+# remote URL. `unauthenticated` must be stated explicitly (with outgoingAuth.source=discovered an entry without an auth
+# reference is dropped). The entry name is the tool prefix: see notify.mcp.entryName.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPExternalAuthConfig
+metadata:
+  name: {{ $n.mcp.entryName }}-noauth
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  type: unauthenticated
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServerEntry
+metadata:
+  name: {{ $n.mcp.entryName }}
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  groupRef: {name: {{ .Values.mcp.groupName }}}
+  remoteUrl: {{ printf "http://notify.%s.svc.cluster.local:8080/mcp" $ns }}
+  transport: streamable-http
+  allowPrivateEndpoint: true
+  externalAuthConfigRef: {name: {{ $n.mcp.entryName }}-noauth}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# /mcp has no authentication, so it must be reachable only from the ToolHive component that proxies it: the vMCP pod.
+# Kubelet probes come from the node and are not affected by ingress policy on kindnet.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: notify}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 8080}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mcp.namespace }}}}
+          podSelector:
+            matchLabels: {app: virtualmcpserver, toolhive-name: {{ .Values.mcp.virtual.name | quote }}}
+---
+# Egress: DNS and HTTPS to public addresses only (private ranges, link-local and cloud metadata excluded). NetworkPolicy
+# matches IPs, not host names, so "api.telegram.org only" needs an FQDN-aware policy or an egress proxy. kindnet does not
+# enforce egress rules at all: see README "Notifications".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-egress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: notify}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports:
+        - {protocol: TCP, port: 443}
+{{- end }}
+{{- end }}

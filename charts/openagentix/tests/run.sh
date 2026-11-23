@@ -700,6 +700,98 @@ H1=$(helm template openagentix "$CHART" -n openagentix-system --set schedules=nu
 eq "schedules=null is byte-identical to the default"   "$H1" "$H0"
 rm -f "$SCF"
 
+echo "# notify service (agents deliver a result to a chat)"
+NNS=openagentix-notify
+NV="$(dirname "$0")/.notify-values.yaml"
+# the enabled render: the first agent opts in; tokens: the default Telegram one plus a second, made-up name
+yq -y '{agents: (.agents|.[0].notify={enabled: true})}' "$CHART/values.yaml" > "$NV"
+cat >> "$NV" <<'YAML'
+notify:
+  enabled: true
+  tokens:
+    - {env: NOTIFY_TELEGRAM_TOKEN, secret: notify-credentials, key: NOTIFY_TELEGRAM_TOKEN}
+    - {env: NOTIFY_SLACK_TOKEN, secret: slack-creds, key: tok}
+YAML
+D=$(docs)
+eq "notify is OFF by default"                          "$(yq -c .notify.enabled "$CHART/values.yaml")" false
+eq "default render has nothing in the notify namespace" "$(count "$D" '.metadata.namespace=="openagentix-notify"')" 0
+eq "default render has no delivery MCPServerEntry"     "$(count "$D" '.kind=="MCPServerEntry" and .metadata.name=="delivery"')" 0
+DA=$(docs -f "$NV")
+NP='.[]|select(.kind=="Deployment" and .metadata.name=="notify")'
+NC="$NP|.spec.template.spec.containers[0]"
+eq "enabled: kinds in the notify namespace"            "$(q "$DA" '[.[]|select(.metadata.namespace=="openagentix-notify")|.kind]|sort|join(",")')" Deployment,NetworkPolicy,NetworkPolicy,Service
+eq "enabled: one MCPServerEntry and one auth config"   "$(count "$DA" '(.kind=="MCPServerEntry" or .kind=="MCPExternalAuthConfig") and (.metadata.name|startswith("delivery"))')" 2
+eq "entry lives in mcp-tools, in the vMCP group"       "$(q "$DA" '.[]|select(.kind=="MCPServerEntry" and .metadata.name=="delivery")|.metadata.namespace+" "+.spec.groupRef.name')" "mcp-tools tools"
+eq "entry points at the notify /mcp endpoint"          "$(q "$DA" '.[]|select(.kind=="MCPServerEntry" and .metadata.name=="delivery")|.spec.remoteUrl')" http://notify.openagentix-notify.svc.cluster.local:8080/mcp
+eq "entry is unauthenticated (explicitly)"             "$(q "$DA" '.[]|select(.kind=="MCPExternalAuthConfig" and .metadata.name=="delivery-noauth")|.spec.type')" unauthenticated
+eq "entry references that auth config"                 "$(q "$DA" '.[]|select(.kind=="MCPServerEntry" and .metadata.name=="delivery")|.spec.externalAuthConfigRef.name')" delivery-noauth
+eq "exactly one replica, Recreate (limits are per replica)" "$(q "$DA" "$NP|(.spec.replicas|tostring)+\" \"+.spec.strategy.type")" "1 Recreate"
+eq "image from values"                                 "$(q "$DA" "$NC|.image")" openagentix/notify:dev
+eq "config path env"                                   "$(q "$DA" "$NC|.env[]|select(.name==\"NOTIFY_CONFIG\")|.value")" /etc/notify/destinations.yaml
+eq "destinations come from an existing Secret volume"  "$(q "$DA" "$NP|.spec.template.spec.volumes[0].secret|.secretName+\" \"+(.optional|tostring)+\" \"+(.items[0].key)")" "notify-destinations true destinations.yaml"
+eq "the volume is mounted read-only at /etc/notify"    "$(q "$DA" "$NC|.volumeMounts[0]|.mountPath+\" \"+(.readOnly|tostring)")" "/etc/notify true"
+eq "token env vars are wired from the values list (2)" "$(q "$DA" "$NC|[.env[]|select(.valueFrom.secretKeyRef!=null)|.name+\"=\"+.valueFrom.secretKeyRef.name+\"/\"+.valueFrom.secretKeyRef.key]|sort|join(\",\")")" "NOTIFY_SLACK_TOKEN=slack-creds/tok,NOTIFY_TELEGRAM_TOKEN=notify-credentials/NOTIFY_TELEGRAM_TOKEN"
+eq "token env vars are optional (pod starts without them)" "$(q "$DA" "$NC|[.env[]|select(.valueFrom.secretKeyRef!=null)|.valueFrom.secretKeyRef.optional]|unique|join(\",\")")" true
+eq "no env var carries a literal value that looks like a secret" "$(q "$DA" "$NC|[.env[]|select((.name|test(\"TOKEN|SECRET|CHAT\")) and has(\"value\"))]|length")" 0
+eq "hardened pod: non-root, no token, read-only root" "$(q "$DA" "$NP|.spec.template.spec|[.automountServiceAccountToken,.securityContext.runAsNonRoot,.containers[0].securityContext.readOnlyRootFilesystem,.containers[0].securityContext.allowPrivilegeEscalation]|map(tostring)|join(\",\")")" false,true,true,false
+eq "readiness is /readyz by default"                   "$(q "$DA" "$NC|.readinessProbe.httpGet.path")" /readyz
+eq "pod template carries no source hash by default"    "$(q "$DA" "$NP|.spec.template.metadata|has(\"annotations\")")" false
+D1=$(docs -f "$NV" --set-string notify.sourceHash=abc123)
+eq "notify.sourceHash is stamped on the pod template"  "$(q "$D1" "$NP|.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" abc123
+D1=$(docs -f "$NV" --set notify.requireReady=false)
+eq "requireReady=false: readiness is /healthz (empty config must not block helm --wait)" "$(q "$D1" "$NC|.readinessProbe.httpGet.path")" /healthz
+eq "the Service selects the pod, port 8080"             "$(q "$DA" '.[]|select(.kind=="Service" and .metadata.name=="notify")|(.spec.selector|tojson)+" "+(.spec.ports[0].port|tostring)')" '{"app":"notify"} 8080'
+echo "# notify: network policy"
+NI='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="notify-ingress")'
+NE='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="notify-egress")'
+eq "ingress: only the vMCP pods of mcp-tools, MCP port only" "$(q "$DA" "$NI|.spec.ingress|map(.from|map(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]+\" \"+(.podSelector.matchLabels|tojson))|join(\";\"))|join(\"|\")")" 'mcp-tools {"app":"virtualmcpserver","toolhive-name":"tools"}'
+eq "ingress: one rule, TCP 8080"                       "$(q "$DA" "$NI|.spec.ingress|length|tostring")+$(q "$DA" "$NI|.spec.ingress[0].ports|map(.protocol+(.port|tostring))|join(\",\")")" "1+TCP8080"
+eq "ingress policy selects the notify pods"            "$(q "$DA" "$NI|.spec.podSelector.matchLabels|tojson")" '{"app":"notify"}'
+eq "egress: Egress only, two rules (DNS, public 443)"  "$(q "$DA" "$NE|(.spec.policyTypes|join(\",\"))+\" \"+(.spec.egress|length|tostring)")" "Egress 2"
+eq "egress: DNS to kube-dns"                           "$(q "$DA" "$NE|.spec.egress[0]|[.to[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.to[0].podSelector.matchLabels[\"k8s-app\"],(.ports|map(.protocol+(.port|tostring))|sort|join(\"+\"))]|join(\" \")")" "kube-system kube-dns TCP53+UDP53"
+eq "egress: 443 to public addresses, private ranges excluded" "$(q "$DA" "$NE|.spec.egress[1]|[.ports[0].port,(.to[0].ipBlock.cidr),(.to[0].ipBlock.except|length)]|map(tostring)|join(\" \")")" "443 0.0.0.0/0 5"
+D1=$(docs -f "$NV" --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no notify policies"   "$(count "$D1" '.kind=="NetworkPolicy"')" 0
+D1=$(docs -f "$NV" --set mcp.virtual.name=gw)
+eq "ingress follows mcp.virtual.name"                  "$(q "$D1" "$NI|.spec.ingress[0].from[0].podSelector.matchLabels[\"toolhive-name\"]")" gw
+echo "# notify: agent opt-in"
+AT='.[]|select(.kind=="AgentTemplate" and .metadata.name=="assistant-template")'
+eq "tool names: entry name prefix + the service's tool names" "$(q "$DA" "$AT|[.spec.tools[0].mcp.tools[]|select(test(\"^delivery_\"))]|sort|join(\",\")")" delivery_notify_list_destinations,delivery_notify_send
+eq "the opted-in agent keeps its other tools (5 + 3 kb + 2)" "$(q "$DA" "$AT|.spec.tools[0].mcp.tools|length")" 10
+eq "prompt names both tools and the rules"             "$(q "$DA" "$AT|.spec.systemPrompt|test(\"delivery_notify_send\") and test(\"delivery_notify_list_destinations\") and test(\"explicitly asks\") and test(\"exactly as\") and test(\"secret\")")" true
+eq "original prompt text is kept"                      "$(q "$DA" "$AT|.spec.systemPrompt|test(\"say when you used one\")")" true
+DB=$(docs -f "$NV" --set 'agents[0].notify.enabled=false')
+cat > "$(dirname "$0")/.nonotify-agent.yaml" <<'YAML'
+notify: {enabled: true}
+agents:
+  - name: plain
+    model: claude-haiku
+    systemPrompt: "You are plain."
+    tools: [{tools: [fetch_fetch]}]
+YAML
+D2=$(docs -f "$(dirname "$0")/.nonotify-agent.yaml"); rm -f "$(dirname "$0")/.nonotify-agent.yaml"
+eq "agent without notify keeps its tools"              "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|join(",")')" fetch_fetch
+eq "agent without notify keeps its prompt"             "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt')" "You are plain."
+eq "enabled but no agent opted in: AgentTemplate is identical to the default render" "$(q "$D2" '.[]|select(.kind=="AgentTemplate")|tojson'|shasum -a 256)" "$(docs -f /dev/stdin <<<'agents: [{name: plain, model: claude-haiku, systemPrompt: "You are plain.", tools: [{tools: [fetch_fetch]}]}]' | jq -r '.[]|select(.kind=="AgentTemplate")|tojson'|shasum -a 256)"
+D3=$(docs -f "$NV" --set notify.enabled=false)
+eq "notify.enabled=false with an agent opt-in: no notify tools, no notify prompt" "$(q "$D3" "$AT|(.spec.tools[0].mcp.tools|length|tostring)+\" \"+(.spec.systemPrompt|test(\"delivery_\")|tostring)")" "8 false"
+D3=$(docs -f "$NV" --set mcp.enabled=false)
+eq "mcp.enabled=false: no entry, and the agent gets no notify tools" "$(count "$D3" '.kind=="MCPServerEntry"')+$(q "$D3" "$AT|.spec.systemPrompt|test(\"delivery_\")")" "0+false"
+echo "# notify: hygiene"
+eq "no Secret objects, no data/stringData anywhere"    "$(count "$DA" '.kind=="Secret" or has("data") or has("stringData")')" 0
+eq "no chat id, URL or token looking value is rendered in the notify namespace" "$(q "$DA" '[.[]|select(.metadata.namespace=="openagentix-notify")|tojson|select(test("api\\.telegram|chatId|chat_id|[0-9]{8,}"))]|length')" 0
+H0=$(helm template openagentix "$CHART" -n openagentix-system 2>&1 | shasum -a 256)
+H1=$(helm template openagentix "$CHART" -n openagentix-system --set notify.enabled=false 2>&1 | shasum -a 256)
+eq "notify.enabled=false is byte-identical to the default render" "$H1" "$H0"
+if [ -n "${OA_BASELINE_RENDER:-}" ]; then   # set to the output of `helm template openagentix <chart at the previous commit> -n openagentix-system`
+  eq "default render is byte-identical to the baseline render (OA_BASELINE_RENDER)" "$H0" "$(shasum -a 256 < "$OA_BASELINE_RENDER")"
+fi
+E=$(render_err -f "$NV" --set notify.tokens[0].env=lower-case)
+eq "an invalid token env var name fails the render"    "$([ -n "$E" ] && echo failed || echo rendered)" failed
+E=$(render_err -f "$NV" --set notify.destinations.existingSecret.name=)
+eq "enabled without a destinations Secret name fails the render" "$([ -n "$E" ] && echo failed || echo rendered)" failed
+rm -f "$NV"
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

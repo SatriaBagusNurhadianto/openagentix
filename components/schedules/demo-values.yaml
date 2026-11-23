@@ -1,7 +1,9 @@
 # Demo for the local kind cluster: ONE schedule for the `assistant` agent, SUSPENDED so it never spends tokens unattended.
 # Combine it with other values files (install.sh takes several, space-separated, in this order; maps merge, lists are replaced):
 #   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml" ./install.sh
-# Run it once on demand (this is one real model call):
+# Its prompt ends by delivering the result to the destination `owner-telegram`, which exists only with
+# components/notify/demo-values.yaml (and NOTIFY_TELEGRAM_CHAT_ID, see there). Without it the agent has no notify tool and says so.
+# Run it once on demand (this is one real model call, and one Telegram message when notify is configured):
 #   kubectl create job -n openagentix-schedules --from=cronjob/demo-brief demo-brief-manual-1
 #   kubectl logs -n openagentix-schedules job/demo-brief-manual-1
 # To let it fire, set `suspend: false` (it then runs every weekday at 08:00 UTC and every firing costs tokens).
@@ -14,4 +16,6 @@ schedules:
     # userId defaults to schedule:demo-brief: its own memory scope, shared by every run of this schedule.
     prompt: |
       Check the vulnerability database for known vulnerabilities of the npm package lodash 4.17.20 and answer in
-      two sentences: how many you found and which one is the most severe.
+      two sentences: how many you found and which one is the most severe. Only after you have that answer, deliver those two
+      sentences as a short message, with the title "demo-brief", to the destination owner-telegram. The message must start with
+      "OpenAgentix demo:".

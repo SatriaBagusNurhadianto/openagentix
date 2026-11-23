@@ -1,0 +1,29 @@
+# Demo for the local kind cluster: the notify service ON, and the `assistant` agent opted in to its two tools.
+# Combine it with the other demo files (order matters only for lists, which are REPLACED, never merged):
+#   TELEGRAM_ALLOWED_CHAT_IDS=<your chat id> NOTIFY_TELEGRAM_CHAT_ID=<your chat id> \
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml" ./install.sh
+# install.sh then creates (only when absent, from the environment, never printed) the Secret notify-destinations with ONE
+# destination, `owner-telegram`, and the Secret notify-credentials with the bridge's bot token. Without NOTIFY_TELEGRAM_CHAT_ID
+# (or NOTIFY_OWNER_TELEGRAM=1) the service runs with no destination and every notify call is refused. README "Notifications".
+notify:
+  enabled: true
+
+# `agents` is a list, so a values file cannot add one field to the default `assistant`: this is the default entry from
+# charts/openagentix/values.yaml again, plus `notify`. Keep the two in sync when you change the default agent.
+agents:
+  - name: assistant
+    description: General assistant reachable from messaging channels
+    model: claude-haiku
+    modelConfigName: gateway-claude-haiku
+    systemPrompt: |
+      You are a concise, helpful assistant running on a Kubernetes-native agent
+      platform. Answers are read in a chat app, so keep them short and use plain text.
+      Use the available tools when they help; say when you used one.
+    tools:
+      - tools: [execute_tool_script, fetch_fetch, osv_get_vulnerability, osv_query_vulnerabilities_batch, osv_query_vulnerability]
+    skills: [openagentix-canary]
+    knowledge: true
+    notify: {enabled: true}              # the only difference: adds delivery_notify_send and delivery_notify_list_destinations
+    memory:
+      enabled: true
+      ttlDays: 30

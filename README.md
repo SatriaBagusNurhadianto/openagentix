@@ -62,7 +62,7 @@ export TELEGRAM_ALLOWED_CHAT_IDS=111111111       # required: the bridge refuses 
 
 A cold install from an empty cluster (images already in the local Docker cache) took about 10 minutes (604 s) on a 5 CPU / 7.7 GiB VM; allow longer when every image has to be pulled. If a required variable is missing the script says which one and changes nothing. Re-running is safe.
 
-Useful switches: `CREATE_CLUSTER=0`, `SKIP_PREREQS=1`, `FORCE_PREREQS=1`, `SKIP_SKILL=1`, `SKIP_BRIDGE_IMAGE=1`, `SKIP_KB_IMAGE=1`, `SKIP_KB_INGEST=1`, `VALUES_FILE="my-values.yaml"`. They are documented at the top of `install.sh`.
+Useful switches: `CREATE_CLUSTER=0`, `SKIP_PREREQS=1`, `FORCE_PREREQS=1`, `SKIP_SKILL=1`, `SKIP_BRIDGE_IMAGE=1`, `SKIP_KB_IMAGE=1`, `SKIP_KB_INGEST=1`, `SKIP_NOTIFY_IMAGE=1`, `VALUES_FILE="my-values.yaml"`. They are documented at the top of `install.sh`.
 
 Check it works from inside the cluster:
 
@@ -225,7 +225,7 @@ After a fresh install the binding can stay `Ready=False` (reason `AgentNotReady`
 **Limits (read before relying on it).**
 
 - Upstream is experimental and 0.x with one maintainer; the webhook platform is the newest part. Pin and re-run the spike checks (`spikes/kourier/NOTES.md`) when you upgrade.
-- A webhook has **no reply route**: the binding's `output` must be `none`, and the answer is visible only in kagent's store. The agent has to act through its own tools (see `docs/decisions/0002-schedules-and-trigger-delivery.md`).
+- A webhook has **no reply route**: the binding's `output` must be `none`, and the answer is visible only in kagent's store. The agent has to act through its own tools (see `docs/decisions/0002-schedules-and-trigger-delivery.md`); with the notify service one of those tools can post the result to a chat (see [Notifications](#notifications); the demo binding `demo-assistant-notify` does it for an event whose `deliver_to` field names a destination).
 - **No direct messages**: Kourier serves channels and mentions, so Telegram (which is chat-by-DM) stays on our own bridge.
 - **One memory scope per Binding.** Every conversation of a binding runs as the binding's fixed `userId`; kagent's long-term memory is keyed by agent and user id, so all of a binding's conversations share it. Give different teams different bindings.
 - **Anyone in a bound Slack channel can use the agent** (and spend its budget); the channel is the access control.
@@ -268,7 +268,7 @@ Pass the file to the installer like any values file; several can be combined (sp
 
 **User id and memory.** The pod sends `X-User-Id: <userId>`, default `schedule:<name>`. kagent keys sessions and long-term memory by it, so **one schedule is one memory scope**: every run of `daily-brief` sees what earlier runs saved with `save_memory`, and no other schedule, chat or binding does. Give two schedules the same `userId` to share a scope. Each run is a new conversation (a new kagent session owned by that user id); runs do not continue each other's session.
 
-**Where results go today: nowhere but kagent's store.** The job log has a one-line summary (state, task id, duration, length of the answer), never the answer text: answers can contain private data and job logs are widely readable. The answer is in kagent (the session of that user id, `kagent.session_task`, or the UI). Delivery to Telegram or Slack is the planned notify tool (ADR 0002); until it lands a schedule is useful for agents that act through their own tools, or whose memory you read later.
+**Where results go.** By default nowhere but kagent's store. The job log has a one-line summary (state, task id, duration, length of the answer), never the answer text: answers can contain private data and job logs are widely readable. The answer is in kagent (the session of that user id, `kagent.session_task`, or the UI). To get it into a chat, enable the notify service (see [Notifications](#notifications)) and end the prompt with an instruction such as "deliver the result to owner-telegram": the agent then calls `delivery_notify_send` itself. `components/schedules/demo-values.yaml` does that for the suspended `demo-brief`.
 
 **Do not put secrets in prompts.** The prompt is stored in a ConfigMap (`schedule-<name>`) that anyone who can read ConfigMaps in `openagentix-schedules` can read, and it is sent to the model provider. The chart renders no Secret values for schedules.
 
@@ -285,6 +285,55 @@ A failed run (failed task, input required, HTTP or JSON-RPC error, timeout) make
 **Cost.** Every firing is at least one model call and often several (tool calls, memory preload); a `* * * * *` schedule spends tokens every minute. Use `suspend: true` while testing (`kubectl patch cronjob <name> -n openagentix-schedules --type=merge -p '{"spec":{"suspend":true}}'` for a quick stop; the next install restores the values). The gateway's token budget per virtual key still applies. The demo schedule is suspended.
 
 **Security.** The pods are non-root with a read-only root filesystem, no capabilities, seccomp `RuntimeDefault` and no service-account token. Two NetworkPolicies: the kagent controller's A2A port admits the namespace `openagentix-schedules` **and** the pod label `openagentix.io/component=schedule` (a pod in that namespace without the label times out), and an egress policy lets those pods reach only CoreDNS and the controller on 8083 (the knowledge base and the model gateway time out). Anyone who can create pods in `openagentix-schedules` with that label can call any agent, so keep that namespace's RBAC tight. `X-User-Id` is an unauthenticated claim on port 8083 like for every caller (see Security). Verified on kind: **kindnet enforces the egress policy for cluster destinations but not for destinations outside the cluster** (a labelled pod still reached example.com); on a CNI that enforces egress fully (Calico, Cilium) the pods also have no internet.
+
+## Notifications
+
+Agents started by a webhook or a schedule have no reply route. The **notify service** (`services/notify`, a small MCP server) gives them one without giving them the keys: an operator lists **named destinations** (a Telegram chat, a Slack channel, a signed webhook) and an agent can only say "send this text to `owner-telegram`". It never sees, and cannot choose, a chat id, channel id, URL or token. The service is one more backend of the vMCP, attached exactly like the knowledge base (an `MCPServerEntry` plus an `unauthenticated` `MCPExternalAuthConfig`, no extra pods for the entry). It is **off by default** (`notify.enabled: false`; the default render is byte-identical to before): enabling it adds a pod with internet egress and lets opted-in agents post messages, which should be a deliberate act.
+
+```
+trigger (schedule / webhook / chat) -> agent -> vMCP -> notify (checks, cleans text) -> Telegram | Slack | webhook
+```
+
+**What agents see.** The entry name is the tool prefix (`notify.mcp.entryName`, default `delivery`), so the tools are `delivery_notify_send` (arguments `destination`, `text`, optional `title` and `idempotency_key`) and `delivery_notify_list_destinations` (names, platform, description; never ids). An entry named `notify` would give `notify_notify_send`. The agent has the tools only when it opts in and the chart adds a short instruction to its system prompt (use the tool only when the task explicitly asks to deliver a result, name the destination exactly as given, keep it short, never include secrets):
+
+```yaml
+notify: {enabled: true}                  # top level: the service and its vMCP entry (needs mcp.enabled for the entry)
+agents:
+  - name: assistant
+    ...
+    notify: {enabled: true}              # per agent; agents without it render exactly as before
+```
+
+**Destinations live in a Secret, not in values.** The chart only references them: `notify.destinations.existingSecret` (default `notify-destinations`, key `destinations.yaml`, in `openagentix-notify`) is mounted at `/etc/notify/destinations.yaml`, and each token comes from an existing Secret through the `notify.tokens` list (`env`, `secret`, `key`; the env var name must match the `tokenEnv` of the destination). The chart renders no chat id, channel id, URL or token. To add a destination, edit the Secret and restart the pod (the file is read once at start):
+
+```sh
+kubectl get secret notify-destinations -n openagentix-notify -o jsonpath='{.data.destinations\.yaml}' | base64 -d > destinations.yaml   # holds chat ids: use a scratch dir, delete it afterwards
+# add an entry (format: services/notify/README.md "Destinations file"), then:
+kubectl create secret generic notify-destinations -n openagentix-notify --from-file=destinations.yaml --dry-run=client -o yaml | kubectl apply -f -
+kubectl rollout restart deployment/notify -n openagentix-notify
+```
+
+**The installer and the owner's chat.** With `notify.enabled`, `install.sh` builds and loads `openagentix/notify:dev` (`SKIP_NOTIFY_IMAGE=1` to skip), stamps a hash of `services/notify` on the pod, and creates the two Secrets **only when absent**, from the environment, never printing them. If `NOTIFY_TELEGRAM_CHAT_ID` is set it writes one destination, `owner-telegram` ("The platform owner's Telegram chat"), and copies the bridge's bot token into `notify-credentials` in the notify namespace (a Secret cannot be mounted across namespaces). `NOTIFY_OWNER_TELEGRAM=1` does the same with the first id of `TELEGRAM_ALLOWED_CHAT_IDS`. **Without one of the two nothing is created**: installing never silently creates a way for agents to message someone, so a chat id that happens to be on the bridge allowlist is not used implicitly. Re-runs keep the Secrets and do not restart the pod; `PURGE_SECRETS=1 ./uninstall.sh` removes them. With no destination the service starts, refuses every call ("notifications are disabled") and reports not-ready, and the installer sets `notify.requireReady=false` so that `helm --wait` does not wait for it; set the same value yourself if you install with Helm alone and no destination yet.
+
+```sh
+TELEGRAM_ALLOWED_CHAT_IDS=<id> NOTIFY_TELEGRAM_CHAT_ID=<id> \
+VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml" ./install.sh
+```
+
+The bot that sends is the bridge's bot. Sending (`sendMessage`) and the bridge's long polling (`getUpdates`) do not conflict: no 409 appeared in the bridge's log while messages were sent.
+
+**Guardrails (in the service, covered by its unit tests).** Only configured names are accepted (an unknown name returns an error that lists the valid ones; nothing is sent). Every message starts with a line saying it comes from an automated agent. Text is cleaned (control, bidirectional and invisible characters removed; `@mentions`, `/commands`, `#hashtags` and links neutralised on Telegram, escaped on Slack), size-limited, and rate limited per destination and globally (defaults 6 per minute and 60 per hour per destination). `idempotency_key` makes a retry safe. The message text is never logged; logs carry the destination name, outcome, sizes and durations. Redirects and proxies are not followed. Details and the threat model: `services/notify/README.md`.
+
+**Network.** The pod takes port 8080 only from the vMCP pods (namespace `mcp-tools`, labels `app=virtualmcpserver`, `toolhive-name=<mcp.virtual.name>`); a pod in `default` or a non-vMCP pod in `mcp-tools` times out (checked). Egress is DNS and TCP 443 to public addresses. NetworkPolicy matches addresses, not host names, so "api.telegram.org only" needs an FQDN-aware policy or an egress proxy.
+
+**Limits (read before relying on it).**
+
+- **This cluster's CNI (kindnet) does not enforce egress rules for destinations outside the cluster**, so the egress policy has no effect towards the internet here; Calico or Cilium enforce it.
+- **Whoever can edit the destinations Secret decides where agents can post**, and whoever can read it learns the chat ids. Keep RBAC on `openagentix-notify` tight.
+- The vMCP's Cedar policy is permit-all by default and kagent's identity is per session, not per agent: the per-agent opt-in limits which agents are *offered* the tools, not who can call the vMCP. `mcp.virtual.incomingAuth.toolAccess` can restrict the tool names per atespace.
+- One replica by design: rate limits and idempotency keys live in the process and a restart forgets them. Callers are not told apart, so one agent can use up a destination's budget for the others.
+- A prompt-injected agent can still send a misleading message to an allowed destination; the header tells the reader it was automated, the content is the agent's.
+- Telegram bare domains, e-mail addresses and phone numbers are not touched and may still be tappable (see the service README). I cannot see a Telegram client: "delivered" means Telegram's API accepted the message.
 
 ## Add an agent
 
@@ -374,6 +423,7 @@ install.sh, uninstall.sh        installer and release-only uninstaller
 charts/openagentix/             the Helm chart (values.yaml, templates/, tests/run.sh)
 bridges/telegram/               Go Telegram -> A2A bridge, Dockerfile, deploy/ reference manifests
 services/kb/                    Go knowledge base service (tests, Dockerfile, reference manifests in deploy/)
+services/notify/                Go notify service: agents deliver a result to a named chat (tests, Dockerfile, reference manifests in deploy/)
 components/knowledge/sample/    sample corpus install.sh ingests
 hack/kb-ingest.sh               ingest a directory of markdown into a kb collection
 components/model-gateway/       agentgateway install script, original manifests and NOTES
@@ -382,6 +432,7 @@ components/agents/              the original hand-applied assistant agent (now r
 hack/kind-config.yaml           kind cluster config (node image pin) used by install.sh
 components/channels/            Agent Kourier install script, its values, a demo webhook values file
 components/schedules/           a demo values file with one suspended schedule
+components/notify/              a demo values file: notify on, `assistant` opted in
 tools/a2a-call/                 Go A2A caller run by the schedule CronJobs (tests, Dockerfile)
 docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented)
 spikes/kourier/                 Agent Kourier spike (evidence; superseded by the integration)

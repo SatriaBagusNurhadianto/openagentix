@@ -1,6 +1,6 @@
 # ADR 0002: Scheduled runs and delivery of results from triggered agents
 
-- **Status:** Accepted (schedules: option A implemented; result delivery: notify tool in progress)
+- **Status:** Accepted (schedules: option A implemented; result delivery: notify service implemented, see the note at the end)
 - **Update 2026-11-23:** the owner kept the recommendation (the CronJob approach, column B of the schedules table). Schedules are implemented as a `schedules[]` values block rendered into CronJobs that call the agent over A2A with `X-User-Id: schedule:<name>` (`tools/a2a-call`, README "Schedules"). On the live cluster a manual run, a memory-scoped pair of runs and a real cron firing completed against the memory-enabled `assistant`, which is the case kagent's own scheduler failed. The delivery part (notify tool) is not built yet. The record below is unchanged evidence; where it says nothing is implemented or proposes the `kagent` namespace for the CronJobs, read it as of 2026-11-22: the implementation uses its own namespace `openagentix-schedules` and a pod-scoped policy peer.
 - **Original status:** Proposed. Nothing in the record below was implemented when it was written; it is what was found and what we recommend.
 - **Date:** 2026-11-22
@@ -105,3 +105,7 @@ The Telegram bridge stays our own component (Kourier has no DMs). The default re
 - Does kagent plan a CRD for scheduled runs? If so, option A becomes a values-to-CRD render and the best choice.
 - Is `X-User-Id` absent mapped to a shared principal? (Answered `200` here; not traced.) If so, all unlabelled callers share one schedule list.
 - Alerting: Kourier exposes metrics for turn outcomes; a CronJob exposes failed jobs. Where do failed schedule runs surface to a human, if delivery itself is by the agent?
+
+## Implementation note (2026-11-23)
+
+Delivery is implemented as the "notify" MCP tool (option 1 of "Delivery of results"): `services/notify`, deployed by the chart block `notify` (off by default), attached to the vMCP as the entry `delivery` (tools `delivery_notify_send`, `delivery_notify_list_destinations`), opt-in per agent with `agents[].notify`. Destinations are named entries in a Secret, never model-chosen ids; rate limits, text cleaning and a header marking automated messages answer the open question about spam and injection. Verified on kind with the real Telegram API (a direct tool call, an A2A question, the demo schedule and a signed webhook all delivered to the owner's chat); see README "Notifications" and CHANGELOG. Not done: a Slack destination run, alerting for failed schedule runs, per-agent authorization at the vMCP.

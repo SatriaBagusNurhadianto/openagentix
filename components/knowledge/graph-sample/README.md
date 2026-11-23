@@ -21,7 +21,7 @@ No document contains more than one link of the chain.
 
 ## The canary question
 
-> Who is on call for the team that owns the service whose backend suffered the Vane-3 outage?
+> A cluster in region Vane-3 had a disk outage. Which service calls the API that stores its data in that cluster, and who is the on-call engineer of the team that owns that service?
 
 Expected answer: **Mira Okafor**.
 

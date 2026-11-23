@@ -69,7 +69,8 @@ Two layers. `install.sh` creates the kind cluster, installs the upstream release
 | [Runtime](./features/runtime.md) | kagent on Agent Substrate, A2A, why not Google AX |
 | [Model gateway](./features/model-gateway.md) | agentgateway, virtual keys, budgets, cost, embedding aliases |
 | [Tools](./features/tools.md) | ToolHive vMCP, code mode, skills, tool-layer identity |
-| [Knowledge base](./features/knowledge-base.md) | Hybrid search service and the knowledge graph status |
+| [Knowledge base](./features/knowledge-base.md) | Hybrid search service |
+| [Knowledge graph](./features/knowledge-graph.md) | Entities and relations for questions that need several documents |
 | [Memory](./features/memory.md) | kagent long-term memory per agent and user |
 | [Channels](./features/channels.md) | Telegram bridge, Agent Kourier, webhooks, bindings |
 | [Schedules](./features/schedules.md) | CronJobs that call an agent over A2A |

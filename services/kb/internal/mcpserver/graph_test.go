@@ -140,7 +140,7 @@ func TestGraphToolsOnlyWhenGraphEnabled(t *testing.T) {
 func TestGraphSearchReturnsCitedPathsAndChunks(t *testing.T) {
 	g := setupGraph(t, true, embed.None{})
 	g.seedChain(t)
-	res := g.call(t, "kb_graph_search", map[string]any{"query": "Who is on call for the team that owns the service whose backend suffered the Vane-3 outage?", "collection": "kg", "hops": 3})
+	res := g.call(t, "kb_graph_search", map[string]any{"query": "A cluster in region Vane-3 had a disk outage. Which service calls the API that stores its data in that cluster, and who is the on-call engineer of the team that owns that service?", "collection": "kg", "hops": 3})
 	if res.IsError {
 		t.Fatal(text(t, res))
 	}

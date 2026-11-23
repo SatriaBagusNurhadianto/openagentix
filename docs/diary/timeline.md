@@ -82,6 +82,15 @@ What was learned and what went wrong:
 - VictoriaMetrics was killed once for memory at a 192 Mi limit; the limit is now 256 Mi.
 - VictoriaMetrics counts the first value of a new counter as an increase, so the first hour after install reads high.
 
-### In progress
+## 2026-11-23: knowledge graph
 
-The knowledge graph feature is being built (not committed). See [knowledge base](./features/knowledge-base.md).
+Added an optional knowledge graph inside the knowledge base service (`knowledge.kb.graph`, off by default). At ingest a background worker sends each document window to a model through the gateway, validates the answer and stores entities and relations as plain tables in the knowledge base PostgreSQL. Three tools read it: `knowledge_kb_graph_search`, `knowledge_kb_graph_entity`, `knowledge_kb_graph_paths`. See [knowledge graph](./features/knowledge-graph.md) and ADR 0004.
+
+What was learned and what went wrong:
+- The first run against a real model failed every job with HTTP 400. The model rejects `temperature`, and the gateway turned `json_object` into an open schema that the provider rejects. The request now carries a strict JSON schema and no sampling parameters. A fake model in tests could not have shown this.
+- The second run extracted well (26 documents, 42,359 tokens) but the multi-hop question failed. The same thing was stored under several names (`Basalt` and `Team Basalt`, `Teal` and `cluster Teal`), so chains broke. Entities now merge by a canonical name, generic unnamed things are dropped, and chains that span more documents rank first.
+- The third run passed: 47,073 tokens, 33 entities, 29 relations, and the path from the Vane-3 outage to the on-call engineer was found through five documents.
+- The first canary question was ambiguous. The agent read "the service whose backend had the outage" as the API and refused to guess an owner. That was a fair reading. The question was reworded and the agent then answered correctly with all five citations.
+- One wrong relation was stored (`Basalt owns Mira Okafor`) with a real but unrelated sentence as evidence. Literal evidence does not prove the relation is right.
+- A VM restart changed the node address and broke Agent Kourier, whose network policy pins the API server address at install time. Re-running the installer fixed it.
+- A test helper connected to a database it did not start. Executors may now only use databases they start themselves.

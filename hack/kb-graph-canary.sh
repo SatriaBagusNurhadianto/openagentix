@@ -33,7 +33,7 @@ TIMEOUT=${CANARY_TIMEOUT:-900}
 NS=${KB_NAMESPACE:-openagentix-knowledge}; SVC=${KB_SERVICE:-kb}
 SECRET=${KB_ADMIN_SECRET:-kb-admin}; SKEY=${KB_ADMIN_KEY:-KB_ADMIN_TOKEN}
 K=${KUBECTL:-kubectl}; KARGS=(); [ -z "${KUBE_CONTEXT:-}" ] || KARGS+=(--context "$KUBE_CONTEXT")
-QUESTION="Who is on call for the team that owns the service whose backend suffered the Vane-3 outage?"
+QUESTION="A cluster in region Vane-3 had a disk outage. Which service calls the API that stores its data in that cluster, and who is the on-call engineer of the team that owns that service?"
 CHAIN_DOCS="orion-ownership orion-dependencies quill-storage basalt-on-call teal-region-incident"
 
 die(){ echo "ERROR: $*" >&2; exit 2; }

@@ -105,7 +105,7 @@ func chainHit(entities []string, want ...string) bool {
 	return match(entities) || match(rev)
 }
 
-const canaryQuestion = "Who is on call for the team that owns the service whose backend suffered the Vane-3 outage?"
+const canaryQuestion = "A cluster in region Vane-3 had a disk outage. Which service calls the API that stores its data in that cluster, and who is the on-call engineer of the team that owns that service?"
 
 func TestCanaryQuestionReachesOrionThroughTheMergedGraph(t *testing.T) {
 	s := loadCanary(t)

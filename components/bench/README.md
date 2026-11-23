@@ -69,7 +69,7 @@ The ax-registry volume `ax-registry-data` must still hold the images (`ax-server
 ```sh
 S=<scratch dir>; export PATH=$HOME/.local/bin:$PATH      # a real kubectl first on PATH
 # 1. AX source copy (never the checkout) and the ax CLI
-git clone /Users/gshah/work/agentix/ax $S/ax-src && git -C $S/ax-src checkout --detach 0b44e971e802554e000bb7ca047bc9cef87b6691
+git clone <path to your google/ax clone> $S/ax-src && git -C $S/ax-src checkout --detach 0b44e971e802554e000bb7ca047bc9cef87b6691
 ( cd $S/ax-src && GOWORK=off go build -trimpath -o bin/ax ./cmd/ax )
 # 2. AX server, Postgres, worker pool, registry, Substrate authz overlay (reuses the images in the volume)
 SKIP_BUILD=1 SKIP_TASKS=1 AX_SRC=$S/ax-src OUT_DIR=$S/out RENDER_DIR=$S/render spikes/ax/up.sh

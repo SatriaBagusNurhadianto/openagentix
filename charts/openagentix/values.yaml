@@ -108,6 +108,48 @@ bridge:
     requests: {cpu: 10m, memory: 16Mi}
     limits: {cpu: 200m, memory: 64Mi}
 
+# ---- Schedules (CronJobs that call an agent over A2A) -------------------------------------------
+# Declarative schedules: each entry of `schedules` renders a ConfigMap (the prompt) and a CronJob whose pod runs the
+# a2a-call image (tools/a2a-call): one A2A SendMessage to the agent with X-User-Id = userId, then exit 0 only if the task
+# completed. Empty by default: nothing renders. Why not kagent's own scheduler: docs/decisions/0002. See README "Schedules".
+# Fields per entry:
+#   name (DNS label, max 40 chars, unique), agent (an agents[].name, else the render fails), schedule (5-field cron),
+#   prompt (configuration, NOT a secret: it is stored in a ConfigMap), and optional:
+#   timeZone (IANA name, default: the controller's, usually UTC), userId (default schedule:<name>: ONE memory scope per
+#   schedule), timeout (e.g. 300s or 5m, how long the call waits for the agent), suspend (default false),
+#   concurrencyPolicy (Forbid|Allow|Replace), historyLimits {successful, failed}, backoffLimit, startingDeadlineSeconds,
+#   ttlSecondsAfterFinished, resources. Defaults are in scheduling.defaults.
+schedules: []
+#  - name: daily-brief
+#    agent: assistant
+#    schedule: "0 8 * * 1-5"
+#    timeZone: Europe/Berlin
+#    prompt: Summarise ...
+
+# Shared settings of the schedule pods. Rendered only when `schedules` is not empty.
+scheduling:
+  namespace: openagentix-schedules       # its own namespace: the controller NetworkPolicy admits ONLY pods here with the label below
+  podLabel: {openagentix.io/component: schedule}   # selected by both NetworkPolicies; whoever can create such a pod there can call agents
+  image:
+    repository: openagentix/a2a-call
+    tag: dev                              # built from tools/a2a-call and loaded into kind by install.sh (only when schedules exist)
+    pullPolicy: IfNotPresent
+  sourceHash: ""                          # install.sh sets it to a hash of tools/a2a-call, stamped on the pod template
+  dns:                                    # the only other egress the schedule pods get
+    namespace: kube-system
+    podLabels: {k8s-app: kube-dns}
+  defaults:
+    timeout: 300s                         # activeDeadlineSeconds of the Job = timeout + 60s
+    concurrencyPolicy: Forbid
+    # A failed run is not retried: the agent may already have acted (tools, memory writes) and a retry repeats the cost.
+    backoffLimit: 0
+    startingDeadlineSeconds: 300          # a firing that could not start within 5 minutes is skipped, not run late
+    ttlSecondsAfterFinished: 86400        # finished Jobs (and their logs) are removed after a day
+    historyLimits: {successful: 3, failed: 3}
+    resources:
+      requests: {cpu: 5m, memory: 16Mi}
+      limits: {cpu: 100m, memory: 32Mi}
+
 # ---- Model gateway (agentgateway) --------------------------------------------------------------
 # Needs the Gateway API CRDs and the agentgateway release (installed by install.sh).
 gateway:

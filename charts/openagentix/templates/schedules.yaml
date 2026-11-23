@@ -1,0 +1,132 @@
+{{- /*
+Schedules: one prompt ConfigMap and one CronJob per entry of .Values.schedules, plus the egress policy of the pods.
+Nothing renders for an empty list. The controller's ingress peer for these pods is in networkpolicy.yaml.
+*/ -}}
+{{- if .Values.schedules }}
+{{- $sc := .Values.scheduling }}
+{{- $d := $sc.defaults }}
+{{- if not .Values.kagent.enabled }}{{ fail "schedules[] needs kagent.enabled=true (the CronJobs call kagent agents)" }}{{ end }}
+{{- $agents := list }}{{ range .Values.agents }}{{ $agents = append $agents .name }}{{ end }}
+{{- $seen := list }}
+{{- range $i, $s := .Values.schedules }}
+{{- if not $s.name }}{{ fail (printf "schedules[%d]: name is required" $i) }}{{ end }}
+{{- if or (not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString $s.name))) (gt (len (toString $s.name)) 40) }}{{ fail (printf "schedule %q: name must be a DNS label of at most 40 characters (lower case letters, digits, '-')" (toString $s.name)) }}{{ end }}
+{{- if has $s.name $seen }}{{ fail (printf "schedule %q: name is used twice" $s.name) }}{{ end }}
+{{- $seen = append $seen $s.name }}
+{{- if not (has $s.agent $agents) }}{{ fail (printf "schedule %q: agent %q is not in agents[] (have: %s)" $s.name (toString $s.agent) (join ", " $agents)) }}{{ end }}
+{{- if not (trim (toString (default "" $s.prompt))) }}{{ fail (printf "schedule %q: prompt is required" $s.name) }}{{ end }}
+{{- include "oa.validateCron" (dict "name" $s.name "cron" (toString (default "" $s.schedule))) }}
+{{- if and $s.timeZone (not (regexMatch "^[A-Za-z0-9_+/-]+$" (toString $s.timeZone))) }}{{ fail (printf "schedule %q: timeZone %q is not an IANA time zone name such as Europe/Berlin" $s.name (toString $s.timeZone)) }}{{ end }}
+{{- $cp := default $d.concurrencyPolicy $s.concurrencyPolicy }}
+{{- if not (has $cp (list "Forbid" "Allow" "Replace")) }}{{ fail (printf "schedule %q: concurrencyPolicy must be Forbid, Allow or Replace, got %q" $s.name (toString $cp)) }}{{ end }}
+{{- $timeout := toString (default $d.timeout $s.timeout) }}
+{{- if not (regexMatch "^[1-9][0-9]*[sm]$" $timeout) }}{{ fail (printf "schedule %q: timeout %q must be a positive number of seconds or minutes such as 300s or 5m" $s.name $timeout) }}{{ end }}
+{{- $secs := mul (int (trimSuffix "m" (trimSuffix "s" $timeout))) (ternary 60 1 (hasSuffix "m" $timeout)) }}
+{{- $userId := default (printf "schedule:%s" $s.name) $s.userId }}
+{{- $hist := default $d.historyLimits $s.historyLimits }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "schedule-%s" $s.name }}
+  namespace: {{ $sc.namespace }}
+  labels:
+    openagentix.io/schedule: {{ $s.name }}
+    {{- include "oa.labels" $ | nindent 4 }}
+data:
+  # The prompt is configuration, not a secret: anyone who can read ConfigMaps here can read it.
+  prompt.txt: {{ trim (toString $s.prompt) | toJson }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $s.name }}
+  namespace: {{ $sc.namespace }}
+  labels:
+    openagentix.io/schedule: {{ $s.name }}
+    {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  schedule: {{ $s.schedule | quote }}
+  {{- if $s.timeZone }}
+  timeZone: {{ $s.timeZone | quote }}
+  {{- end }}
+  suspend: {{ if $s.suspend }}true{{ else }}false{{ end }}
+  concurrencyPolicy: {{ $cp }}
+  startingDeadlineSeconds: {{ int (dig "startingDeadlineSeconds" $d.startingDeadlineSeconds $s) }}
+  successfulJobsHistoryLimit: {{ int (dig "successful" $d.historyLimits.successful $hist) }}
+  failedJobsHistoryLimit: {{ int (dig "failed" $d.historyLimits.failed $hist) }}
+  jobTemplate:
+    spec:
+      backoffLimit: {{ int (dig "backoffLimit" $d.backoffLimit $s) }}
+      activeDeadlineSeconds: {{ add $secs 60 }}
+      ttlSecondsAfterFinished: {{ int (dig "ttlSecondsAfterFinished" $d.ttlSecondsAfterFinished $s) }}
+      template:
+        metadata:
+          labels:
+            {{- toYaml $sc.podLabel | nindent 12 }}
+            openagentix.io/schedule: {{ $s.name }}
+            {{- include "oa.labels" $ | nindent 12 }}
+          {{- if $sc.sourceHash }}
+          annotations:
+            # set by install.sh from the content of tools/a2a-call
+            openagentix.io/source-hash: {{ $sc.sourceHash | quote }}
+          {{- end }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: a2a-call
+              image: {{ printf "%s:%s" $sc.image.repository (toString $sc.image.tag) | quote }}
+              imagePullPolicy: {{ $sc.image.pullPolicy }}
+              env:
+                - {name: A2A_URL, value: {{ printf "http://kagent-controller.%s.svc.cluster.local:%v/agents/%s/%s" $.Values.kagent.namespace $.Values.networkPolicy.controllerPort $.Values.kagent.namespace $s.agent | quote }}}
+                - {name: A2A_USER_ID, value: {{ $userId | quote }}}
+                - {name: A2A_TIMEOUT, value: {{ $timeout | quote }}}
+                - {name: PROMPT_FILE, value: /etc/schedule/prompt.txt}
+              volumeMounts:
+                - {name: prompt, mountPath: /etc/schedule, readOnly: true}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              resources:
+                {{- toYaml (default $d.resources $s.resources) | nindent 16 }}
+          volumes:
+            - name: prompt
+              configMap: {name: {{ printf "schedule-%s" $s.name }}}
+{{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+# The schedule pods may resolve names and call the kagent controller's A2A port, nothing else (no other service, no
+# internet). Ingress is not restricted: the pods listen on nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-schedules-egress
+  namespace: {{ $sc.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- toYaml $sc.podLabel | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $sc.dns.namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml $sc.dns.podLabels | nindent 14 }}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.kagent.namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.networkPolicy.controllerPodLabels | nindent 14 }}
+      ports:
+        - {protocol: TCP, port: {{ .Values.networkPolicy.controllerPort }}}
+{{- end }}
+{{- end }}

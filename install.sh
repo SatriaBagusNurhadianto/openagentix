@@ -18,8 +18,10 @@
 #   SKIP_SKILL=1         do not build/push the example skill; use the digest in values.yaml
 #   SKIP_BRIDGE_IMAGE=1  do not build/load the bridge image
 #   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
+#   SKIP_A2A_CALL_IMAGE=1  do not build/load the schedule caller image (tools/a2a-call); it is only built when `schedules` is not empty
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
-#   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart (e.g. more agents, networkPolicy.extraA2ACallers for a
+#   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart, space-separated, applied in order (maps are merged, lists
+#                        such as agents[] or schedules[] are REPLACED by the later file) (e.g. more agents, schedules, networkPolicy.extraA2ACallers for a
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
 #                        same files on every run, or the extras disappear.
 #   KOURIER_VALUES_FILE="k.yaml"  extra values for the Agent Kourier release (see components/channels/kourier-values.yaml)
@@ -243,6 +245,14 @@ if [ "${SKIP_BRIDGE_IMAGE:-0}" != 1 ] && [[ "$BRIDGE_IMAGE" == openagentix/teleg
   docker build -q -t "$BRIDGE_IMAGE" bridges/telegram >/dev/null
   kind load docker-image "$BRIDGE_IMAGE" --name "$CLUSTER"
 fi
+# Schedules: the CronJobs run tools/a2a-call. The image is built only when the chart renders a CronJob for it (empty `schedules` = no
+# build, no namespace, no pods), then keyed on the source hash like the bridge and the kb.
+A2A_CALL_IMAGE=$(jq -r 'select(.kind=="CronJob")|.spec.jobTemplate.spec.template.spec.containers[0].image' <<<"$RENDERED" | sort -u | head -1)
+if [ "${SKIP_A2A_CALL_IMAGE:-0}" != 1 ] && [[ "$A2A_CALL_IMAGE" == openagentix/a2a-call:* ]]; then
+  log "a2a-call image $A2A_CALL_IMAGE (schedules)"
+  docker build -q -t "$A2A_CALL_IMAGE" tools/a2a-call >/dev/null
+  kind load docker-image "$A2A_CALL_IMAGE" --name "$CLUSTER"
+fi
 KB_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${KB_DEP:-null}" 2>/dev/null || true)
 if [ "${SKIP_KB_IMAGE:-0}" != 1 ] && [[ "$KB_IMAGE" == openagentix/kb:* ]]; then
   log "kb image $KB_IMAGE"
@@ -253,6 +263,10 @@ if [ -n "$BRIDGE_IMAGE" ]; then
   # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
   BRIDGE_HASH=$(cd bridges/telegram && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
   SET+=(--set-string "bridge.sourceHash=$BRIDGE_HASH")
+fi
+if [ -n "$A2A_CALL_IMAGE" ]; then
+  A2A_HASH=$(cd tools/a2a-call && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "scheduling.sourceHash=$A2A_HASH")
 fi
 if [ -n "$KB_DEP" ]; then
   # The image tag is "dev" and image ids change with every build, so key the rollout on the source content instead:

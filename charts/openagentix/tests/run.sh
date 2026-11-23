@@ -573,6 +573,133 @@ D4=$(docs -f "$CHF" $KAPI --set channels.connections=null --set channels.binding
 eq "no connections: no Role, no Kourier connection/binding" "$(count "$D4" '.kind=="Role" or .kind=="ChatConnection" or .kind=="Binding"')" 0
 rm -f "$CHF"
 
+echo "# schedules (CronJobs that call an agent over A2A)"
+SCF="$(dirname "$0")/.schedules.yaml"
+cat > "$SCF" <<'YAML'
+schedules:
+  - name: daily-brief
+    agent: assistant
+    schedule: "0 8 * * 1-5"
+    timeZone: Europe/Berlin
+    prompt: |
+      Summarise the open vulnerabilities in lodash 4.17.20.
+      Keep it short.
+  - name: quarter-hour
+    agent: assistant
+    schedule: "*/15 * * * *"
+    prompt: "Say ok."
+    userId: custom-user
+    timeout: 2m
+    suspend: true
+    concurrencyPolicy: Replace
+    historyLimits: {successful: 1, failed: 5}
+    backoffLimit: 1
+    startingDeadlineSeconds: 120
+    resources:
+      requests: {cpu: 10m, memory: 20Mi}
+      limits: {cpu: 50m, memory: 40Mi}
+YAML
+D=$(docs)
+eq "schedules default to an empty list"                "$(yq -c .schedules "$CHART/values.yaml")" '[]'
+eq "default render has no CronJob"                     "$(count "$D" '.kind=="CronJob"')" 0
+eq "default render has no schedules namespace objects" "$(count "$D" '.metadata.namespace=="openagentix-schedules"')" 0
+eq "default controller policy has no schedule peer"    "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")|[.spec.ingress[].from[]?|select(.namespaceSelector.matchLabels["kubernetes.io/metadata.name"]=="openagentix-schedules")]|length')" 0
+D=$(docs -f "$SCF")
+CJ='.[]|select(.kind=="CronJob" and .metadata.name=="daily-brief")'
+CJ2='.[]|select(.kind=="CronJob" and .metadata.name=="quarter-hour")'
+CP2='.template.spec'
+POD="$CJ|.spec.jobTemplate.spec.template.spec"
+eq "one CronJob per schedule"                          "$(count "$D" '.kind=="CronJob"')" 2
+eq "one prompt ConfigMap per schedule"                 "$(q "$D" '[.[]|select(.kind=="ConfigMap" and .metadata.namespace=="openagentix-schedules")|.metadata.name]|sort|join(",")')" schedule-daily-brief,schedule-quarter-hour
+eq "everything lives in openagentix-schedules"         "$(q "$D" '[.[]|select(.kind=="CronJob" or (.kind=="ConfigMap" and (.metadata.name|startswith("schedule-")))) |.metadata.namespace]|unique|join(",")')" openagentix-schedules
+eq "cron expression and time zone pass through"        "$(q "$D" "$CJ|.spec.schedule+\" \"+.spec.timeZone")" "0 8 * * 1-5 Europe/Berlin"
+eq "no timeZone key when none is set"                  "$(q "$D" "$CJ2|.spec|has(\"timeZone\")")" false
+eq "concurrencyPolicy defaults to Forbid"              "$(q "$D" "$CJ|.spec.concurrencyPolicy")" Forbid
+eq "concurrencyPolicy can be set"                      "$(q "$D" "$CJ2|.spec.concurrencyPolicy")" Replace
+eq "suspend defaults to false"                         "$(q "$D" "$CJ|.spec.suspend")" false
+eq "suspend can be set"                                "$(q "$D" "$CJ2|.spec.suspend")" true
+eq "history limits default to 3 and 3"                 "$(q "$D" "$CJ|[.spec.successfulJobsHistoryLimit,.spec.failedJobsHistoryLimit]|map(tostring)|join(\",\")")" 3,3
+eq "history limits can be set"                         "$(q "$D" "$CJ2|[.spec.successfulJobsHistoryLimit,.spec.failedJobsHistoryLimit]|map(tostring)|join(\",\")")" 1,5
+eq "startingDeadlineSeconds defaults to 300"           "$(q "$D" "$CJ|.spec.startingDeadlineSeconds")" 300
+eq "startingDeadlineSeconds can be set"                "$(q "$D" "$CJ2|.spec.startingDeadlineSeconds")" 120
+eq "backoffLimit defaults to 0 (a failed agent run is never retried blindly)" "$(q "$D" "$CJ|.spec.jobTemplate.spec.backoffLimit")" 0
+eq "backoffLimit can be set"                           "$(q "$D" "$CJ2|.spec.jobTemplate.spec.backoffLimit")" 1
+eq "finished Jobs are removed after a day"             "$(q "$D" "$CJ|.spec.jobTemplate.spec.ttlSecondsAfterFinished")" 86400
+eq "activeDeadlineSeconds is the timeout plus 60 (default 300s)" "$(q "$D" "$CJ|.spec.jobTemplate.spec.activeDeadlineSeconds")" 360
+eq "activeDeadlineSeconds follows a custom timeout (2m)" "$(q "$D" "$CJ2|.spec.jobTemplate.spec.activeDeadlineSeconds")" 180
+eq "pod never restarts in place"                       "$(q "$D" "$POD|.restartPolicy")" Never
+eq "image comes from scheduling.image"                 "$(q "$D" "$POD|.containers[0].image")" openagentix/a2a-call:dev
+eq "image is not pulled when present (kind-loaded)"    "$(q "$D" "$POD|.containers[0].imagePullPolicy")" IfNotPresent
+eq "A2A_URL targets the schedule's agent on the controller" "$(q "$D" "$POD|.containers[0].env[]|select(.name==\"A2A_URL\")|.value")" http://kagent-controller.kagent.svc.cluster.local:8083/agents/kagent/assistant
+eq "user id defaults to schedule:<name>"               "$(q "$D" "$POD|.containers[0].env[]|select(.name==\"A2A_USER_ID\")|.value")" schedule:daily-brief
+eq "user id can be set"                                "$(q "$D" "$CJ2|.spec.jobTemplate.spec.template.spec.containers[0].env[]|select(.name==\"A2A_USER_ID\")|.value")" custom-user
+eq "A2A_TIMEOUT defaults to 300s"                      "$(q "$D" "$POD|.containers[0].env[]|select(.name==\"A2A_TIMEOUT\")|.value")" 300s
+eq "A2A_TIMEOUT can be set"                            "$(q "$D" "$CJ2|.spec.jobTemplate.spec.template.spec.containers[0].env[]|select(.name==\"A2A_TIMEOUT\")|.value")" 2m
+eq "the answer is not printed (PRINT_ANSWER unset)"    "$(q "$D" "$POD|[.containers[0].env[]|select(.name==\"PRINT_ANSWER\")]|length")" 0
+eq "prompt is read from a file"                        "$(q "$D" "$POD|.containers[0].env[]|select(.name==\"PROMPT_FILE\")|.value")" /etc/schedule/prompt.txt
+eq "the prompt file comes from the schedule's ConfigMap" "$(q "$D" "$POD|.volumes[0].configMap.name")" schedule-daily-brief
+eq "the prompt volume is mounted read-only"            "$(q "$D" "$POD|.containers[0].volumeMounts[0]|[.mountPath,.readOnly]|map(tostring)|join(\" \")")" "/etc/schedule true"
+eq "ConfigMap holds the prompt text verbatim"          "$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="schedule-daily-brief")|.data["prompt.txt"]')" "$(printf 'Summarise the open vulnerabilities in lodash 4.17.20.\nKeep it short.')"
+eq "no service account token in the pod"               "$(q "$D" "$POD|.automountServiceAccountToken")" false
+eq "pod runs as non-root"                              "$(q "$D" "$POD|.securityContext|[.runAsNonRoot,.runAsUser,.runAsGroup]|map(tostring)|join(\",\")")" true,65532,65532
+eq "seccomp RuntimeDefault"                            "$(q "$D" "$POD|.securityContext.seccompProfile.type")" RuntimeDefault
+eq "container: no privilege escalation, read-only root, all caps dropped" "$(q "$D" "$POD|.containers[0].securityContext|[.allowPrivilegeEscalation,.readOnlyRootFilesystem,(.capabilities.drop|join(\",\"))]|map(tostring)|join(\" \")")" "false true ALL"
+eq "default resources are small"                       "$(q "$D" "$POD|.containers[0].resources|[.requests.memory,.limits.memory]|join(\",\")")" 16Mi,32Mi
+eq "resources can be set"                              "$(q "$D" "$CJ2|.spec.jobTemplate.spec.template.spec.containers[0].resources.limits.memory")" 40Mi
+eq "pods carry the label the network policies select"  "$(q "$D" "$CJ|.spec.jobTemplate.spec.template.metadata.labels[\"openagentix.io/component\"]")" schedule
+eq "pod template carries no source hash by default"    "$(q "$D" "$CJ|.spec.jobTemplate.spec.template.metadata|has(\"annotations\")")" false
+D1=$(docs -f "$SCF" --set-string scheduling.sourceHash=abc123)
+eq "scheduling.sourceHash is stamped on the pod template" "$(q "$D1" "$CJ|.spec.jobTemplate.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" abc123
+eq "no Secret objects, no stringData"                  "$(count "$D" '.kind=="Secret" or has("stringData")')" 0
+echo "# schedules: network policy"
+KP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
+eq "controller policy admits the schedule pods: namespace AND pod label" "$(q "$D" "$KP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"openagentix-schedules\")|.podSelector.matchLabels[\"openagentix.io/component\"]]|join(\",\")")" schedule
+eq "8083 has exactly one more source than the default (4)" "$(q "$D" "$KP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]|length")" 4
+eq "the other ports stay as before"                    "$(q "$D" "$KP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
+EP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-schedules-egress")'
+eq "egress policy selects exactly the schedule pods"   "$(q "$D" "$EP|.metadata.namespace+\" \"+(.spec.podSelector.matchLabels|tojson)")" 'openagentix-schedules {"openagentix.io/component":"schedule"}'
+eq "egress policy restricts Egress only"               "$(q "$D" "$EP|.spec.policyTypes|join(\",\")")" Egress
+eq "egress: DNS (udp+tcp 53) to CoreDNS in kube-system" "$(q "$D" "$EP|.spec.egress[0]|[(.to[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]),(.to[0].podSelector.matchLabels[\"k8s-app\"]),([.ports[]|.protocol+(.port|tostring)]|sort|join(\"+\"))]|join(\" \")")" "kube-system kube-dns TCP53+UDP53"
+eq "egress: the kagent controller pod on 8083 only"    "$(q "$D" "$EP|.spec.egress[1]|[.to[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.to[0].podSelector.matchLabels[\"app.kubernetes.io/component\"],(.ports|map(.protocol+(.port|tostring))|join(\"+\"))]|join(\" \")")" "kagent controller TCP8083"
+eq "egress policy has exactly two rules"               "$(q "$D" "$EP|.spec.egress|length")" 2
+D3=$(docs -f "$SCF" --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no policies for schedules either" "$(count "$D3" '.kind=="NetworkPolicy"')" 0
+eq "networkPolicy.enabled=false: the CronJobs still render" "$(count "$D3" '.kind=="CronJob"')" 2
+echo "# schedules: validation"
+bad_sched() { # <jq-free yq edit applied to the first schedule>  -> prints helm's error
+  local f="$(dirname "$0")/.sched-bad.yaml"
+  yq -y "$1" "$SCF" > "$f"; render_err -f "$f"; rm -f "$f"
+}
+fails() { [ -n "$1" ] && echo failed || echo rendered; }
+E=$(bad_sched '.schedules[0].agent="ghost"')
+eq "unknown agent fails the render"                    "$(fails "$E")" failed
+eq "the failure names the schedule, the agent and the valid agents" "$(printf '%s' "$E" | command grep -c 'schedule "daily-brief": agent "ghost" is not in agents\[\].*assistant')" 1
+for cron in "0 8 * *" "0 8 * * * *" "61 8 * * *" "* 24 * * *" "* * 0 * *" "* * 32 * *" "* * * 13 *" "* * * * 8" "every day" "*/0 * * * *" "0 8 * * 1-" "0 8 * * 1;2" ""; do
+  eq "invalid cron rejected: '$cron'"                  "$(fails "$(bad_sched ".schedules[0].schedule=\"$cron\"")")" failed
+done
+for cron in "0 8 * * 1-5" "*/15 * * * *" "0,30 9-17 * * mon-fri" "0 0 1 jan *" "5 4 * * 7" "0-59/10 * * * *" "0 0 29 2 *"; do
+  eq "valid cron accepted: '$cron'"                    "$(fails "$(bad_sched ".schedules[0].schedule=\"$cron\"")")" rendered
+done
+eq "missing prompt fails the render"                   "$(fails "$(bad_sched '.schedules[0].prompt=""')")" failed
+eq "missing name fails the render"                     "$(fails "$(bad_sched 'del(.schedules[0].name)')")" failed
+eq "an invalid name (upper case) fails the render"     "$(fails "$(bad_sched '.schedules[0].name="Daily"')")" failed
+eq "a name longer than 40 characters fails the render" "$(fails "$(bad_sched '.schedules[0].name="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"')")" failed
+eq "duplicate names fail the render"                   "$(fails "$(bad_sched '.schedules[1].name="daily-brief"')")" failed
+eq "an invalid timeout fails the render"               "$(fails "$(bad_sched '.schedules[0].timeout="soon"')")" failed
+eq "a zero timeout fails the render"                   "$(fails "$(bad_sched '.schedules[0].timeout="0s"')")" failed
+eq "an invalid concurrencyPolicy fails the render"     "$(fails "$(bad_sched '.schedules[0].concurrencyPolicy="Sometimes"')")" failed
+eq "a bad timeZone shape fails the render"             "$(fails "$(bad_sched '.schedules[0].timeZone="Europe/Berlin; rm"')")" failed
+eq "schedules without kagent fail the render"          "$(fails "$(render_err -f "$SCF" --set kagent.enabled=false)")" failed
+D4=$(docs -f "$SCF" --set scheduling.namespace=jobs-ns)
+eq "scheduling.namespace moves everything"             "$(q "$D4" '[.[]|select(.kind=="CronJob")|.metadata.namespace]|unique|join(",")')" jobs-ns
+eq "scheduling.namespace moves the controller peer"    "$(q "$D4" "$KP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels[\"openagentix.io/component\"]==\"schedule\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" jobs-ns
+D5=$(docs -f "$SCF" --set 'schedules=null')
+eq "schedules=null renders like the default"           "$(count "$D5" '.kind=="CronJob"')" 0
+H0=$(helm template openagentix "$CHART" -n openagentix-system 2>&1 | shasum -a 256)
+H1=$(helm template openagentix "$CHART" -n openagentix-system --set schedules=null 2>&1 | shasum -a 256)
+eq "schedules=null is byte-identical to the default"   "$H1" "$H0"
+rm -f "$SCF"
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

@@ -48,3 +48,25 @@ http://{{ .Values.memory.gatewayAlias }}.{{ .Values.gateway.namespace }}.svc.clu
 {{- $s := list -}}{{- range .Values.channels.connections }}{{ $s = append $s .existingSecret }}{{ end -}}
 {{- $s | uniq | sortAlpha | toJson -}}
 {{- end -}}
+
+{{/* Fails the render when .cron is not a 5-field cron expression (minute hour day-of-month month day-of-week) with in-range
+numbers, month/weekday names, ranges, steps and lists. The API server validates again when the CronJob is applied. */}}
+{{- define "oa.validateCron" -}}
+{{- $fields := regexSplit "\\s+" (trim .cron) -1 -}}
+{{- if ne (len $fields) 5 -}}{{ fail (printf "schedule %q: schedule %q must have 5 fields (minute hour day-of-month month day-of-week)" .name .cron) }}{{- end -}}
+{{- $min := list 0 0 1 1 0 -}}
+{{- $max := list 59 23 31 12 7 -}}
+{{- $names := list "" "" "" "jan feb mar apr may jun jul aug sep oct nov dec" "sun mon tue wed thu fri sat" -}}
+{{- range $i, $f := $fields -}}
+{{- range $e := splitList "," $f -}}
+{{- if not (regexMatch "^(\\*|([0-9]+|[A-Za-z]{3})(-([0-9]+|[A-Za-z]{3}))?)(/[1-9][0-9]*)?$" $e) -}}{{ fail (printf "schedule %q: field %d (%q) of schedule %q is not valid cron syntax" $.name (add $i 1) $e $.cron) }}{{- end -}}
+{{- $base := regexReplaceAll "/.*$" $e "" -}}
+{{- range $n := regexFindAll "[0-9]+" $base -1 -}}
+{{- if or (lt (int $n) (index $min $i)) (gt (int $n) (index $max $i)) -}}{{ fail (printf "schedule %q: %s in schedule %q is out of range %d-%d for field %d" $.name $n $.cron (index $min $i) (index $max $i) (add $i 1)) }}{{- end -}}
+{{- end -}}
+{{- range $w := regexFindAll "[A-Za-z]+" $base -1 -}}
+{{- if not (has (lower $w) (splitList " " (index $names $i))) -}}{{ fail (printf "schedule %q: %q is not valid in field %d of schedule %q" $.name $w (add $i 1) $.cron) }}{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

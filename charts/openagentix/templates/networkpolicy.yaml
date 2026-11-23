@@ -75,6 +75,11 @@ spec:
           podSelector:
             matchLabels: {{- toYaml .Values.channels.kourier.broker.podLabels | nindent 14 }}
         {{- end }}
+        {{- if .Values.schedules }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.scheduling.namespace | quote }}}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.scheduling.podLabel | nindent 14 }}
+        {{- end }}
         {{- range $n.extraA2ACallers }}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace | quote }}}}
           {{- if .podLabels }}

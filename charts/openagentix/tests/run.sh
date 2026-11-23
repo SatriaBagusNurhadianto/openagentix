@@ -954,6 +954,51 @@ D2=$(docs "${OB[@]}" --set observability.otlp.endpoint=http://mine:4318)
 eq "bundled with an explicit endpoint: the endpoint wins" "$(q "$D2" "$MK|.data.otlpEndpoint")" http://mine:4318
 eq "no secret-looking data anywhere in the bundled render" "$(count "$D" 'has("data") and (.kind!="ConfigMap")')" 0
 
+echo "# knowledge graph (kb.graph, off by default)"
+D=$(docs)
+GE="$KC|.env[]"
+eq "graph off by default: no KB_GRAPH_* env on the kb" "$(q "$D" "[$KE|select(.name|startswith(\"KB_GRAPH\"))]|length")" 0
+eq "graph off by default: nothing refers to the extraction key Secret" "$(q "$D" 'tostring|contains("kb-extract-key")')" false
+# every graph tunable set, but off: the render must be byte-identical to the default render
+DEFAULT_TXT=$(helm template openagentix "$CHART" -n openagentix-system 2>&1)
+OFF_TXT=$(helm template openagentix "$CHART" -n openagentix-system --set knowledge.kb.graph.enabled=false --set knowledge.kb.graph.extractModel=other \
+  --set knowledge.kb.graph.windowChars=100 --set knowledge.kb.graph.tokensPerHour=5 --set knowledge.kb.graph.keySecret.name=other-key 2>&1)
+eq "graph.enabled=false with tunables set renders byte-identical to the default" "$([ "$DEFAULT_TXT" = "$OFF_TXT" ] && echo identical || echo differs)" identical
+GR=(--set knowledge.kb.graph.enabled=true)
+D=$(docs "${GR[@]}")
+gv() { q "$D" "$KE|select(.name==\"$1\")|.value"; }
+eq "graph on: switch"                                  "$(gv KB_GRAPH_ENABLED)" true
+eq "graph on: extract model is a gateway alias (the default model)" "$(gv KB_GRAPH_EXTRACT_MODEL)" claude-haiku
+eq "graph on: gateway URL is the model gateway's base URL" "$(gv KB_GRAPH_GATEWAY_URL)" http://model-gateway.agentgateway-system.svc.cluster.local/v1
+eq "graph on: key comes from a Secret reference"       "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" kb-extract-key/OPENAI_API_KEY
+eq "graph on: key env has no literal value"            "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|has(\"value\")")" false
+eq "graph on: key Secret is required (a missing key is visible, not silent)" "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef.optional // false")" false
+eq "graph on: defaults window/entities/relations"      "$(gv KB_GRAPH_WINDOW_CHARS)/$(gv KB_GRAPH_MAX_ENTITIES_PER_CHUNK)/$(gv KB_GRAPH_MAX_RELATIONS_PER_WINDOW)" 2400/12/30
+eq "graph on: defaults budget/hops/prompt version"     "$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 300000/3/v1
+eq "graph on: exactly the 10 KB_GRAPH_* variables"     "$(q "$D" "[$KE|select(.name|startswith(\"KB_GRAPH\"))]|length")" 10
+eq "graph on: nothing else on the kb Deployment changed" "$(diff <(q "$D" "[$KE|.name]|map(select(startswith(\"KB_GRAPH\")|not))|join(\",\")") <(q "$(docs)" "[$KE|.name]|join(\",\")") >/dev/null && echo same || echo differs)" same
+eq "graph on: still exactly one gateway virtual-key annotation on the kb" "$(q "$D" "$KB|.metadata.annotations|keys|map(select(startswith(\"openagentix.io/gateway\")))|length")" 2
+eq "graph on: renders no extra object (same kinds as default)" "$(q "$D" '[.[]|.kind]|sort|join(",")')" "$(q "$(docs)" '[.[]|.kind]|sort|join(",")')"
+eq "graph on: the chart renders no Secret"             "$(count "$D" '.kind=="Secret"')" 0
+D=$(docs "${GR[@]}" --set knowledge.kb.graph.extractModel=gemini --set knowledge.kb.graph.windowChars=1800 --set knowledge.kb.graph.maxEntitiesPerChunk=8 \
+  --set knowledge.kb.graph.maxRelationsPerWindow=10 --set knowledge.kb.graph.tokensPerHour=50000 --set knowledge.kb.graph.maxHops=2 \
+  --set knowledge.kb.graph.promptVersion=v2 --set knowledge.kb.graph.keySecret.name=my-key --set knowledge.kb.graph.keySecret.key=K)
+eq "graph overrides: model"                            "$(gv KB_GRAPH_EXTRACT_MODEL)" gemini
+eq "graph overrides: numbers"                          "$(gv KB_GRAPH_WINDOW_CHARS)/$(gv KB_GRAPH_MAX_ENTITIES_PER_CHUNK)/$(gv KB_GRAPH_MAX_RELATIONS_PER_WINDOW)/$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 1800/8/10/50000/2/v2
+eq "graph overrides: key Secret reference"             "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" my-key/K
+D=$(docs "${GR[@]}" --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1)
+eq "graph.gatewayUrl overrides the gateway URL"        "$(gv KB_GRAPH_GATEWAY_URL)" http://gw.example/v1
+eq "graph on without gateway and without gatewayUrl fails to render" "$(render_err "${GR[@]}" --set gateway.enabled=false --set agents=null | grep -c 'knowledge.kb.graph.gatewayUrl')" 1
+D=$(docs "${GR[@]}" --set gateway.enabled=false --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1 --set agents=null)
+eq "graph on without the bundled gateway but with gatewayUrl renders" "$(q "$D" "$KE|select(.name==\"KB_GRAPH_GATEWAY_URL\")|.value")" http://gw.example/v1
+eq "graph maxHops above 3 is rejected"                 "$(render_err "${GR[@]}" --set knowledge.kb.graph.maxHops=4 | grep -c 'maxHops')" 1
+eq "graph windowChars below 1 is rejected"             "$(render_err "${GR[@]}" --set knowledge.kb.graph.windowChars=0 | grep -c 'windowChars')" 1
+eq "graph with an empty extractModel is rejected"      "$(render_err "${GR[@]}" --set knowledge.kb.graph.extractModel= | grep -c 'extractModel')" 1
+D=$(docs --set knowledge.enabled=false "${GR[@]}")
+eq "knowledge.enabled=false wins over graph.enabled"   "$(count "$D" '.metadata.namespace=="openagentix-knowledge"')" 0
+D=$(docs "${GR[@]}" --set knowledge.kb.graph.apiKey=SENTINEL-GRAPH-KEY --set knowledge.kb.graph.keySecret.value=SENTINEL-GRAPH-KEY)
+eq "a key value passed in values is never rendered"    "$(q "$D" 'tostring|contains("SENTINEL-GRAPH-KEY")')" false
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

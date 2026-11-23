@@ -25,6 +25,22 @@
 {{- end }}
 {{- if $embURL }}{{ if or (lt $embDim 1) (gt $embDim 2000) }}{{ fail (printf "embedding dimension must be 1..2000 (pgvector HNSW limit), got %d" $embDim) }}{{ end }}{{ end }}
 {{- $kbGwKey := and $viaGw (not $kb.embeddings.url) }}
+{{- /* Knowledge graph: entity and relation extraction through the model gateway. Off by default; nothing below renders then. */ -}}
+{{- $g := $kb.graph }}
+{{- $graphURL := "" }}
+{{- if $g.enabled }}
+{{- $graphURL = $g.gatewayUrl }}
+{{- if not $graphURL }}
+{{- if not .Values.gateway.enabled }}{{ fail "knowledge.kb.graph.gatewayUrl is required when knowledge.kb.graph.enabled=true and gateway.enabled=false: extraction calls an OpenAI-compatible endpoint" }}{{ end }}
+{{- $graphURL = include "oa.gatewayBaseUrl" . }}
+{{- end }}
+{{- $_ := required "knowledge.kb.graph.extractModel is required when knowledge.kb.graph.enabled=true (a gateway model alias)" $g.extractModel }}
+{{- $_ = required "knowledge.kb.graph.keySecret.name and .key are required when knowledge.kb.graph.enabled=true" (and $g.keySecret.name $g.keySecret.key) }}
+{{- range $f := list "windowChars" "maxEntitiesPerChunk" "maxRelationsPerWindow" "tokensPerHour" }}
+{{- if lt (int (index $g $f)) 1 }}{{ fail (printf "knowledge.kb.graph.%s must be >= 1, got %v" $f (index $g $f)) }}{{ end }}
+{{- end }}
+{{- if or (lt (int $g.maxHops) 1) (gt (int $g.maxHops) 3) }}{{ fail (printf "knowledge.kb.graph.maxHops must be 1..3, got %v" $g.maxHops) }}{{ end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -105,6 +121,20 @@ spec:
               valueFrom:
                 secretKeyRef: {name: {{ $embKey.name | quote }}, key: {{ $embKey.key | quote }}}
             {{- end }}
+            {{- end }}
+            {{- if $g.enabled }}
+            - {name: KB_GRAPH_ENABLED, value: "true"}
+            - {name: KB_GRAPH_EXTRACT_MODEL, value: {{ $g.extractModel | quote }}}
+            - {name: KB_GRAPH_GATEWAY_URL, value: {{ $graphURL | quote }}}
+            - name: KB_GRAPH_API_KEY
+              valueFrom:
+                secretKeyRef: {name: {{ $g.keySecret.name | quote }}, key: {{ $g.keySecret.key | quote }}}
+            - {name: KB_GRAPH_WINDOW_CHARS, value: {{ int $g.windowChars | quote }}}
+            - {name: KB_GRAPH_MAX_ENTITIES_PER_CHUNK, value: {{ int $g.maxEntitiesPerChunk | quote }}}
+            - {name: KB_GRAPH_MAX_RELATIONS_PER_WINDOW, value: {{ int $g.maxRelationsPerWindow | quote }}}
+            - {name: KB_GRAPH_TOKENS_PER_HOUR, value: {{ int $g.tokensPerHour | quote }}}
+            - {name: KB_GRAPH_MAX_HOPS, value: {{ int $g.maxHops | quote }}}
+            - {name: KB_GRAPH_PROMPT_VERSION, value: {{ $g.promptVersion | quote }}}
             {{- end }}
           securityContext:
             allowPrivilegeEscalation: false

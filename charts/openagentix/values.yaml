@@ -267,6 +267,25 @@ knowledge:
       model: ""
       dim: 0
       apiKeySecret: {name: "", key: ""}                         # optional bearer key for that endpoint
+    # Knowledge graph (GraphRAG inside the kb): entities and relations are extracted from every ingested document by a model
+    # on the gateway, in the background, and stored in the kb database next to the chunks. OFF by default; with it off the
+    # kb, its schema and this render are unchanged. Turning it on adds tables to the kb schema and sends document text to
+    # `extractModel`: choose a model you may send that text to. Extraction is a model call per ~2400 characters, so it costs
+    # tokens: `tokensPerHour` is the budget (the kb stops calling the model when it is used up and resumes later).
+    # The key is a gateway virtual key kept in an existing Secret in this namespace; the chart never renders it. install.sh does
+    # not create it yet: create a virtual key for the gateway and the Secret yourself (key `OPENAI_API_KEY`), or point
+    # keySecret at kb-virtual-key (the kb's embedding key), which shares that key's attribution and token budget.
+    graph:
+      enabled: false
+      extractModel: claude-haiku       # a gateway.models name (or any model name the gatewayUrl endpoint knows)
+      gatewayUrl: ""                   # default: the model gateway's base URL; required when gateway.enabled=false
+      keySecret: {name: kb-extract-key, key: OPENAI_API_KEY}
+      windowChars: 2400                # text per model call; whole chunks are packed up to this size
+      maxEntitiesPerChunk: 12          # cap per window = this x the chunks in it
+      maxRelationsPerWindow: 30
+      tokensPerHour: 300000            # sliding hour, counted from the usage the gateway reports
+      maxHops: 3                       # longest graph traversal a query may ask for (1..3)
+      promptVersion: v1                # stored with every relation; changing it re-extracts all documents on their next ingest
     # The kb pod takes /mcp from the vMCP only. Ingestion by `kubectl port-forward` (hack/kb-ingest.sh) needs no
     # policy entry because it arrives on the pod's loopback. In-cluster ingest jobs must be listed, pod-scoped:
     #   ingestFrom: [{namespace: ci, podLabels: {app: ingest}}]

@@ -20,7 +20,7 @@ The upstream pieces already emit most of what is needed. The work is wiring them
 | Substrate (router, egress, API server, atelet, controller) | scrape endpoints on 15020, 9090, 8080 (`ate_*`) | none of its own; the egress proxy logs `trace.id` and `ate.actor.name=session-<contextId>` on every sandbox-originated hop | no configuration needed |
 | Agent Kourier | `agentkourier_*` on 8080 | OTLP http/protobuf through `extraEnv` | its NetworkPolicy needs the scraper and the collector; the installer adds both |
 | Bridge, `a2a-call` | none | none exported: they START the trace (`traceparent` header) | one structured log line per message or run, with the trace id |
-| kb, notify | none yet | none yet | deferred: their code was out of scope |
+| kb, notify | none in round 1; round 2 adds them (below) | none yet | round 1 left their code out of scope |
 
 ## Decision: two layers, one switch
 
@@ -79,7 +79,18 @@ They cannot be turned off at the source, so they are dropped before storage: the
 
 ## Deferred
 
-Dashboards (Grafana) and alert rules; per-user and per-team cost views; USD budget caps (the gateway has token budgets only); metrics and traces for kb and notify (needs their code); a persistent trace store; sampling beyond a head rate; exemplars linking metrics to traces; log shipping; tail sampling in a real collector; the Kourier and Telegram live traces; an upstream fix for the tool-argument attributes.
+Grafana and alert rules (round 2 adds a local page, not Grafana); per-user and per-team cost views; USD budget caps (the gateway has token budgets only); traces for kb and notify; a persistent trace store; sampling beyond a head rate; exemplars linking metrics to traces; log shipping; tail sampling in a real collector; the Kourier and Telegram live traces; an upstream fix for the tool-argument attributes.
+
+## Round 2 (2026-11-23): kb and notify metrics, local dashboard
+
+**Status: built and tested offline; not yet run on the cluster.** What was added, and why in this shape:
+
+- **Metrics from our own services**, off unless `observability.enabled`: `KB_METRICS_ADDR` and `NOTIFY_METRICS_ADDR` start a second listener (port 9090) that serves only `GET /metrics`, so the API's authentication and NetworkPolicy are not widened and `/metrics` is not on the API port (tested both ways). No new dependency: a small text-exposition package, copied byte for byte into both modules and guarded by a test.
+- **Scraping** reuses the round 1 mechanism: two entries in `observability.metrics.scrape.targets` gated by `when: knowledge` and `when: notify`, feeding the PodMonitors and the bundled VictoriaMetrics config from one list. Their namespace and port follow the service's own values. A NetworkPolicy per service admits only the bundled VictoriaMetrics pods on the metrics port (as for the vMCP); an external Prometheus behind a PodMonitor needs a policy of the operator's own. With observability off, the default render and every demo values file render byte-identically to the commit before (`cmp`).
+- **Cardinality and privacy.** Every label value is validated against a closed set, and anything else is folded to a fixed value (`other`, `unknown`, `error`). HTTP routes are the mux pattern, never the path. kb graph gauges have one `collection="all"` series; collection names are opt-in (`knowledge.kb.metrics.collectionLabels`) and capped at 50 because operators choose them. notify uses the platform kind, not the destination name, because the name is operator-chosen, can identify a person, and is already in the service log; per-destination counts remain a log query. Each metric also stops at 500 series and counts what it dropped. Canary strings in documents, queries, messages, addresses and tokens never reach `/metrics` or the logs (tests).
+- **Dashboard without a new pod.** The demo node is full, so there is no Grafana. A static page plus a small `python3` proxy that the script runs locally. Same-origin through the proxy removes any dependence on VictoriaMetrics CORS behaviour (not checked). `--check` runs the page's queries against any Prometheus-compatible API so the page can be validated on the cluster later.
+- **Deviations from the brief.** kb search modes are `lexical` and `hybrid`: the code always runs the lexical search and fuses the vector result when the query was embedded, so there is no vector-only path. notify has two more outcomes than the brief listed, `busy` and `uncertain` (idempotency in doubt), and a platform timeout counts as `upstream_error`.
+- **Not done or not proven:** a run on the cluster; the real VictoriaMetrics accepting every query of the page; label names of upstream series assumed from round 1 notes; alert rules; traces for kb and notify.
 
 ## Open core vs enterprise (input, not a decision)
 

@@ -102,3 +102,14 @@ An operator can now load a hand-written catalogue (services, teams, owners, esca
 Proven live: the sample catalogue was loaded (19 entities, 12 relations) and the agent answered "which service calls Quill, which team owns it, who is the escalation manager" from two extracted facts and one curated fact. It named the fact set as the source of the curated fact and said it could not confirm it in the documents.
 
 Agent Kourier's network policy now allows the node subnet for the API server port on kind, so a Docker restart that moves the node address no longer breaks it.
+
+## 2026-11-23: metrics from kb and notify, and a dashboard without a new pod
+
+Round 1 of observability gave cost per agent, one trace per turn and the tool audit, but our own two services emitted nothing and there was nothing to look at. Round 2 adds Prometheus metrics to the knowledge base and notify services and a local dashboard. The demo node is already full, so there is no Grafana and no new pod.
+
+The services serve metrics on their own port, only when observability is on, and only the bundled VictoriaMetrics may reach it. Labels come from closed sets: no text, queries, ids, destination names or addresses. The first design question was destination names for notify. They are operator chosen and can name a person, so the label is the platform kind instead. The library is a small text-exposition package copied into both modules, because neither had a metrics client and a shared module would have complicated the builds. Tests plant canary strings and check that they never appear in the metrics or the logs.
+
+The dashboard is one static page and a script that port-forwards VictoriaMetrics and proxies its read-only query API with python3, so the page never makes a cross-origin request. It has a check mode that runs every query of the page, so it can be pointed at the cluster later.
+
+Built and tested offline only: Go tests, chart render tests, a fake Prometheus API and a jsdom run of the page. It has not run on the cluster. The queries have not met a real VictoriaMetrics, and the label names of the upstream gateway series are taken from round 1 notes.
+

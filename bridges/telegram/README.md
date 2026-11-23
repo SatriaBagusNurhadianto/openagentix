@@ -49,6 +49,14 @@ connection from the internet. Go, standard library only.
 | `SHUTDOWN_GRACE` | `25s` | Wait for in-flight turns on shutdown. Keep below the pod's `terminationGracePeriodSeconds`. |
 | `HEALTH_ADDR` | `:8080` | Listen address for `/healthz`; empty disables it. |
 
+## Logging and tracing
+
+One structured line per handled message (`msg":"turn"`): `trace_id`, `chat_hash`, `context_id`, `outcome` (`ok`, `agent_error`,
+`send_error`, `new_conversation`), `agent_ms`, `total_ms`, `reply_chars`. Never the message or the reply, and the chat id appears
+only as `chat_hash`: 8 hex digits of SHA-256 over a random per-process salt and the id (stable inside one process, not matchable
+against a list of ids, different after a restart). Every turn starts a W3C trace: the bridge sends `traceparent` to the agent (no
+`baggage`) and logs the same trace id, so a log line leads to the trace. It exports no spans of its own (standard library only).
+
 ## Health
 
 `GET /healthz` returns `200` while the last successful `getUpdates` is at most 3x

@@ -66,6 +66,12 @@ func (c *Client) Send(ctx context.Context, contextID, text string) (string, stri
 	if id := UserIDFromContext(ctx); id != "" {
 		req.Header.Set("X-User-Id", id)
 	}
+	// W3C trace propagation (traceparent only; baggage is never sent). The caller's trace wins, else this call starts one.
+	tc, ok := TraceFromContext(ctx)
+	if !ok {
+		tc = NewTrace()
+	}
+	req.Header.Set("traceparent", tc.Traceparent())
 	if c.token != "" {
 		req.Header.Set("Authorization", "Bearer "+c.token)
 	}

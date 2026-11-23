@@ -2,6 +2,9 @@ package bridge
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -47,6 +50,17 @@ type Bridge struct {
 	lastPoll           atomic.Int64     // unix nanos of the last successful getUpdates
 	AllowAll           bool             // explicit opt-in: accept every chat; otherwise empty Allowed rejects all
 	UserIDPrefix       string           // prepended to the chat id to form the agent-side user id (X-User-Id); empty sends no user id
+	saltOnce           sync.Once
+	salt               []byte // per process: chat ids appear in logs only as a short hash salted with this
+}
+
+// chatHash is a short stable alias of a chat id for log lines: 8 hex digits of SHA-256(salt || id), the salt random
+// per process. It correlates the lines of one chat without writing the (personal, guessable) id, and it cannot be
+// matched against a list of ids offline because the salt is never logged or stored.
+func (b *Bridge) chatHash(chat int64) string {
+	b.saltOnce.Do(func() { b.salt = make([]byte, 16); _, _ = rand.Read(b.salt) })
+	h := sha256.Sum256(append(append([]byte(nil), b.salt...), strconv.FormatInt(chat, 10)...))
+	return hex.EncodeToString(h[:4])
 }
 
 const defaultMaxTurns = 8
@@ -175,42 +189,58 @@ func (b *Bridge) handle(ctx context.Context, u telegram.Update) {
 		return
 	}
 	chat := u.Message.Chat.ID
+	ch := b.chatHash(chat)
 	if !b.AllowAll && !b.Allowed[chat] {
-		b.Log.Debug("ignoring message from chat not in allowlist", "chat_id", chat)
+		b.Log.Debug("ignoring message from chat not in allowlist", "chat_hash", ch)
 		return
 	}
+	started := time.Now()
+	// One trace per handled message. The bridge only starts it (W3C traceparent, no spans of its own); the id is also in the
+	// log line below, so a log line leads to the trace in the backend.
+	tc := a2a.NewTrace()
 	text := u.Message.Text
 	if b.isNewCommand(text) {
 		b.Store.Delete(chat)
 		if err := b.Telegram.SendMessage(ctx, chat, "Started a new conversation."); err != nil {
-			b.Log.Error("telegram sendMessage failed", "chat_id", chat, "err", err)
+			b.Log.Error("telegram sendMessage failed", "chat_hash", ch, "trace_id", tc.TraceID, "err", err)
 		}
+		b.Log.Info("turn", "trace_id", tc.TraceID, "chat_hash", ch, "outcome", "new_conversation", "total_ms", time.Since(started).Milliseconds())
 		return
 	}
 	// Best effort: turns take seconds, so show "typing..." first. A failure
 	// (or slow call) is bounded and never blocks the turn.
 	tctx, tcancel := context.WithTimeout(ctx, typingTimeout)
 	if err := b.Telegram.SendTyping(tctx, chat); err != nil {
-		b.Log.Warn("telegram sendChatAction failed", "chat_id", chat, "err", err)
+		b.Log.Warn("telegram sendChatAction failed", "chat_hash", ch, "err", err)
 	}
 	tcancel()
-	actx, cancel := context.WithTimeout(ctx, b.AgentTimeout)
+	actx, cancel := context.WithTimeout(a2a.WithTrace(ctx, tc), b.AgentTimeout)
 	defer cancel()
 	// The user id is the chat id (a number from Telegram, never message text), so each chat, and each group, is
 	// its own user for the agent's sessions and long-term memory.
 	if b.UserIDPrefix != "" {
 		actx = a2a.WithUserID(actx, b.UserIDPrefix+strconv.FormatInt(chat, 10))
 	}
+	agentStart := time.Now()
 	reply, newCtx, err := b.Agent.Send(actx, b.Store.Get(chat), text)
+	agentMs := time.Since(agentStart).Milliseconds()
+	outcome := "ok"
 	if err != nil {
-		b.Log.Error("agent call failed", "chat_id", chat, "err", err)
+		b.Log.Error("agent call failed", "chat_hash", ch, "trace_id", tc.TraceID, "err", err)
+		outcome = "agent_error"
 		reply = genericFailure
 	} else if newCtx != "" {
 		b.Store.Set(chat, newCtx)
 	}
 	if err := b.Telegram.SendMessage(ctx, chat, reply); err != nil {
-		b.Log.Error("telegram sendMessage failed", "chat_id", chat, "err", err)
+		b.Log.Error("telegram sendMessage failed", "chat_hash", ch, "trace_id", tc.TraceID, "err", err)
+		if outcome == "ok" {
+			outcome = "send_error"
+		}
 	}
+	// One line per handled message: ids, durations, outcome. Never the message or the reply, never the chat id.
+	b.Log.Info("turn", "trace_id", tc.TraceID, "chat_hash", ch, "context_id", b.Store.Get(chat), "outcome", outcome,
+		"agent_ms", agentMs, "total_ms", time.Since(started).Milliseconds(), "reply_chars", len([]rune(reply)))
 }
 
 const typingTimeout = 3 * time.Second

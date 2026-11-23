@@ -23,12 +23,16 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{/* Tool names of the knowledge base as the vMCP exposes them: <prefix of the entry><kb tool>. JSON list. */}}
 {{- define "oa.knowledgeTools" -}}
 {{- $pfx := replace "{workload}" .Values.knowledge.mcp.entryName .Values.mcp.virtual.prefixFormat -}}
-{{- list (printf "%skb_search" $pfx) (printf "%skb_get_document" $pfx) (printf "%skb_list_collections" $pfx) | toJson -}}
+{{- $l := list (printf "%skb_search" $pfx) (printf "%skb_get_document" $pfx) (printf "%skb_list_collections" $pfx) -}}
+{{- if .Values.knowledge.kb.graph.enabled }}{{ $l = concat $l (list (printf "%skb_graph_search" $pfx) (printf "%skb_graph_entity" $pfx) (printf "%skb_graph_paths" $pfx)) }}{{ end -}}
+{{- $l | toJson -}}
 {{- end -}}
 
 {{- define "oa.knowledgeAgentPrompt" -}}
 {{- $t := include "oa.knowledgeTools" . | fromJsonArray -}}
-{{- .Values.knowledge.agentPrompt | replace "{search}" (index $t 0) | replace "{get}" (index $t 1) -}}
+{{- $p := .Values.knowledge.agentPrompt | replace "{search}" (index $t 0) | replace "{get}" (index $t 1) -}}
+{{- if .Values.knowledge.kb.graph.enabled }}{{ $p = printf "%s\n%s" (trim $p) (.Values.knowledge.kb.graph.agentPrompt | replace "{graph_search}" (index $t 3) | replace "{graph_entity}" (index $t 4) | replace "{graph_paths}" (index $t 5) | replace "{get}" (index $t 1) | trim) }}{{ end -}}
+{{- $p -}}
 {{- end -}}
 
 {{/* "true" when at least one agent has long-term memory enabled (and kagent is deployed). */}}

@@ -977,19 +977,26 @@ eq "graph on: defaults window/entities/relations"      "$(gv KB_GRAPH_WINDOW_CHA
 eq "graph on: defaults budget/hops/prompt version"     "$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 300000/3/v1
 eq "graph on: exactly the 10 KB_GRAPH_* variables"     "$(q "$D" "[$KE|select(.name|startswith(\"KB_GRAPH\"))]|length")" 10
 eq "graph on: nothing else on the kb Deployment changed" "$(diff <(q "$D" "[$KE|.name]|map(select(startswith(\"KB_GRAPH\")|not))|join(\",\")") <(q "$(docs)" "[$KE|.name]|join(\",\")") >/dev/null && echo same || echo differs)" same
-eq "graph on: still exactly one gateway virtual-key annotation on the kb" "$(q "$D" "$KB|.metadata.annotations|keys|map(select(startswith(\"openagentix.io/gateway\")))|length")" 2
+eq "graph on: the kb keeps its embedding-key annotations untouched" "$(q "$D" "$KB|.metadata.annotations[\"openagentix.io/gateway-user\"]+\"/\"+.metadata.annotations[\"openagentix.io/gateway-key-secret\"]")" kb/kb-virtual-key
+eq "graph on: the extraction key is a second annotation set, user id kb-extract" "$(q "$D" "$KB|.metadata.annotations|[.[\"openagentix.io/gateway-user-extract\"],.[\"openagentix.io/gateway-key-secret-extract\"],.[\"openagentix.io/gateway-key-name-extract\"]]|join(\"/\")")" kb-extract/kb-extract-key/OPENAI_API_KEY
+eq "graph on: the extraction key is not the embedding key" "$(q "$D" "$KB|.metadata.annotations|(.[\"openagentix.io/gateway-key-secret-extract\"]!=.[\"openagentix.io/gateway-key-secret\"]) and (.[\"openagentix.io/gateway-user-extract\"]!=.[\"openagentix.io/gateway-user\"])")" true
+eq "graph on: KB_GRAPH_API_KEY reads the annotated Secret" "$(q "$D" "$KB|[.metadata.annotations[\"openagentix.io/gateway-key-secret-extract\"],.metadata.annotations[\"openagentix.io/gateway-key-name-extract\"]]|join(\"/\")")" "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")"
 eq "graph on: renders no extra object (same kinds as default)" "$(q "$D" '[.[]|.kind]|sort|join(",")')" "$(q "$(docs)" '[.[]|.kind]|sort|join(",")')"
 eq "graph on: the chart renders no Secret"             "$(count "$D" '.kind=="Secret"')" 0
-D=$(docs "${GR[@]}" --set knowledge.kb.graph.extractModel=gemini --set knowledge.kb.graph.windowChars=1800 --set knowledge.kb.graph.maxEntitiesPerChunk=8 \
+D=$(docs "${GR[@]}" --set-json 'gateway.models=[{"name":"claude-haiku","provider":"Anthropic","authSecret":"anthropic-api-key","upstreamModel":"claude-haiku-5-5"},{"name":"gemini","provider":"Gemini","authSecret":"gemini-api-key"}]' --set knowledge.kb.graph.extractModel=gemini --set knowledge.kb.graph.windowChars=1800 --set knowledge.kb.graph.maxEntitiesPerChunk=8 \
   --set knowledge.kb.graph.maxRelationsPerWindow=10 --set knowledge.kb.graph.tokensPerHour=50000 --set knowledge.kb.graph.maxHops=2 \
   --set knowledge.kb.graph.promptVersion=v2 --set knowledge.kb.graph.keySecret.name=my-key --set knowledge.kb.graph.keySecret.key=K)
 eq "graph overrides: model"                            "$(gv KB_GRAPH_EXTRACT_MODEL)" gemini
 eq "graph overrides: numbers"                          "$(gv KB_GRAPH_WINDOW_CHARS)/$(gv KB_GRAPH_MAX_ENTITIES_PER_CHUNK)/$(gv KB_GRAPH_MAX_RELATIONS_PER_WINDOW)/$(gv KB_GRAPH_TOKENS_PER_HOUR)/$(gv KB_GRAPH_MAX_HOPS)/$(gv KB_GRAPH_PROMPT_VERSION)" 1800/8/10/50000/2/v2
 eq "graph overrides: key Secret reference"             "$(q "$D" "$KE|select(.name==\"KB_GRAPH_API_KEY\")|.valueFrom.secretKeyRef|.name+\"/\"+.key")" my-key/K
+eq "graph overrides: the annotation names the same Secret and key" "$(q "$D" "$KB|.metadata.annotations|[.[\"openagentix.io/gateway-key-secret-extract\"],.[\"openagentix.io/gateway-key-name-extract\"]]|join(\"/\")")" my-key/K
 D=$(docs "${GR[@]}" --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1)
 eq "graph.gatewayUrl overrides the gateway URL"        "$(gv KB_GRAPH_GATEWAY_URL)" http://gw.example/v1
 eq "graph on without gateway and without gatewayUrl fails to render" "$(render_err "${GR[@]}" --set gateway.enabled=false --set agents=null | grep -c 'knowledge.kb.graph.gatewayUrl')" 1
 D=$(docs "${GR[@]}" --set gateway.enabled=false --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1 --set agents=null)
+eq "graph.gatewayUrl of your own: no extraction key is created for it" "$(q "$(docs "${GR[@]}" --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1)" "$KB|.metadata.annotations|keys|map(select(endswith(\"-extract\")))|length")" 0
+eq "graph on: extractModel must be a gateway model (claude-haiku is the default)" "$(render_err "${GR[@]}" --set knowledge.kb.graph.extractModel=nonesuch | grep -c 'is not a gateway.models name')" 1
+eq "graph on with a model of your own endpoint needs no gateway.models entry" "$(q "$(docs "${GR[@]}" --set knowledge.kb.graph.extractModel=nonesuch --set knowledge.kb.graph.gatewayUrl=http://gw.example/v1)" "$KE|select(.name==\"KB_GRAPH_EXTRACT_MODEL\")|.value")" nonesuch
 eq "graph on without the bundled gateway but with gatewayUrl renders" "$(q "$D" "$KE|select(.name==\"KB_GRAPH_GATEWAY_URL\")|.value")" http://gw.example/v1
 eq "graph maxHops above 3 is rejected"                 "$(render_err "${GR[@]}" --set knowledge.kb.graph.maxHops=4 | grep -c 'maxHops')" 1
 eq "graph windowChars below 1 is rejected"             "$(render_err "${GR[@]}" --set knowledge.kb.graph.windowChars=0 | grep -c 'windowChars')" 1
@@ -998,6 +1005,20 @@ D=$(docs --set knowledge.enabled=false "${GR[@]}")
 eq "knowledge.enabled=false wins over graph.enabled"   "$(count "$D" '.metadata.namespace=="openagentix-knowledge"')" 0
 D=$(docs "${GR[@]}" --set knowledge.kb.graph.apiKey=SENTINEL-GRAPH-KEY --set knowledge.kb.graph.keySecret.value=SENTINEL-GRAPH-KEY)
 eq "a key value passed in values is never rendered"    "$(q "$D" 'tostring|contains("SENTINEL-GRAPH-KEY")')" false
+
+echo "# knowledge graph: agent wiring"
+DG=$(docs "${GR[@]}")
+ATG='.[]|select(.kind=="AgentTemplate" and .metadata.name=="assistant-template")'
+eq "graph on: the assistant also gets the three graph tools" "$(q "$DG" "$ATG|[.spec.tools[0].mcp.tools[]|select(test(\"kb_graph_\"))]|sort|join(\",\")")" knowledge_kb_graph_entity,knowledge_kb_graph_paths,knowledge_kb_graph_search
+eq "graph on: the kb tools are still there, 3 more tools in all" "$(q "$DG" "$ATG|.spec.tools[0].mcp.tools|length")" 11
+eq "graph off: the assistant has no graph tool"        "$(q "$(docs)" "$ATG|[.spec.tools[0].mcp.tools[]|select(test(\"graph\"))]|length")" 0
+eq "graph on: the prompt names the graph tools as the agent sees them" "$(q "$DG" "$ATG|.spec.systemPrompt|test(\"knowledge_kb_graph_search\") and test(\"knowledge_kb_graph_entity\") and test(\"knowledge_kb_graph_paths\") and test(\"knowledge_kb_get_document\")")" true
+eq "graph on: the prompt has no unreplaced placeholder" "$(q "$DG" "$ATG|.spec.systemPrompt|test(\"[{]graph|[{]get[}]|[{]search[}]\")")" false
+eq "graph off: the prompt does not mention the graph" "$(q "$(docs)" "$ATG|.spec.systemPrompt|test(\"graph\")")" false
+eq "graph on: the original knowledge base prompt is kept" "$(q "$DG" "$ATG|.spec.systemPrompt|test(\"knowledge base\") and test(\"say when you used one\")")" true
+# Cedar toolAccess is the operator's own list: the chart adds nothing to it
+DT=$(docs "${GR[@]}" --set 'mcp.virtual.incomingAuth.toolAccess[0].atespace=kagent' --set 'mcp.virtual.incomingAuth.toolAccess[0].tools={fetch_fetch}')
+eq "toolAccess is rendered as given, graph tools are never added to it" "$(q "$DT" '[.[]|select(.kind=="VirtualMCPServer")|tostring|test("kb_graph")]|any')" false
 
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)

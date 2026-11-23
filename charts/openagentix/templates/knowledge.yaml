@@ -27,14 +27,20 @@
 {{- $kbGwKey := and $viaGw (not $kb.embeddings.url) }}
 {{- /* Knowledge graph: entity and relation extraction through the model gateway. Off by default; nothing below renders then. */ -}}
 {{- $g := $kb.graph }}
-{{- $graphURL := "" }}
+{{- $graphURL := "" }}{{ $graphGwKey := false }}
 {{- if $g.enabled }}
 {{- $graphURL = $g.gatewayUrl }}
 {{- if not $graphURL }}
 {{- if not .Values.gateway.enabled }}{{ fail "knowledge.kb.graph.gatewayUrl is required when knowledge.kb.graph.enabled=true and gateway.enabled=false: extraction calls an OpenAI-compatible endpoint" }}{{ end }}
 {{- $graphURL = include "oa.gatewayBaseUrl" . }}
 {{- end }}
+{{- /* the extraction key is a virtual key of the chart's own gateway: install.sh creates it (never printed) and registers its hash */ -}}
+{{- $graphGwKey = and (not $g.gatewayUrl) .Values.gateway.enabled }}
 {{- $_ := required "knowledge.kb.graph.extractModel is required when knowledge.kb.graph.enabled=true (a gateway model alias)" $g.extractModel }}
+{{- if and (not $g.gatewayUrl) .Values.gateway.enabled }}
+{{- $known := list }}{{ range .Values.gateway.models }}{{ $known = append $known .name }}{{ end }}
+{{- if not (has $g.extractModel $known) }}{{ fail (printf "knowledge.kb.graph.extractModel %q is not a gateway.models name (have: %s); add it to gateway.models or set knowledge.kb.graph.gatewayUrl" $g.extractModel (join ", " $known)) }}{{ end }}
+{{- end }}
 {{- $_ = required "knowledge.kb.graph.keySecret.name and .key are required when knowledge.kb.graph.enabled=true" (and $g.keySecret.name $g.keySecret.key) }}
 {{- range $f := list "windowChars" "maxEntitiesPerChunk" "maxRelationsPerWindow" "tokensPerHour" }}
 {{- if lt (int (index $g $f)) 1 }}{{ fail (printf "knowledge.kb.graph.%s must be >= 1, got %v" $f (index $g $f)) }}{{ end }}
@@ -49,11 +55,20 @@ metadata:
   labels:
     app: kb
     {{- include "oa.labels" . | nindent 4 }}
-  {{- if $kbGwKey }}
+  {{- if or $kbGwKey $graphGwKey }}
   annotations:
+    {{- if $kbGwKey }}
     # install.sh reads these to create the kb's own gateway virtual key (Secret kb-virtual-key) and register its hash
     openagentix.io/gateway-user: kb
     openagentix.io/gateway-key-secret: kb-virtual-key
+    {{- end }}
+    {{- if $graphGwKey }}
+    # a second key for the same Deployment, set "-extract": entity extraction has its own virtual key (user id kb-extract), so a
+    # large ingest spends its own gateway token bucket and never the embedding key's or an agent's
+    openagentix.io/gateway-user-extract: kb-extract
+    openagentix.io/gateway-key-secret-extract: {{ $g.keySecret.name | quote }}
+    openagentix.io/gateway-key-name-extract: {{ $g.keySecret.key | quote }}
+    {{- end }}
   {{- end }}
 spec:
   replicas: {{ $kb.replicas }}

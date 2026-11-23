@@ -6,7 +6,7 @@ go 1.27.1
 // (github.com/google/ax/pkg/apis/v1alpha1) come from the local read-only
 // checkout at commit 0b44e971. Because of this replace, the Docker image is
 // built from a prebuilt binary (see Makefile and Dockerfile).
-replace github.com/google/ax => /Users/gshah/work/agentix/ax
+replace github.com/google/ax => ../../../ax
 
 require (
 	github.com/google/ax v0.0.0-00010101000000-000000000000

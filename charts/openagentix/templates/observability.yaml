@@ -1,0 +1,351 @@
+{{- if include "oa.obsOn" . }}
+{{- include "oa.obsValidate" . }}
+{{- $o := .Values.observability }}
+{{- $ns := $o.namespace }}
+{{- $ep := include "oa.obsEndpoint" . }}
+{{- $mcpOn := .Values.mcp.enabled }}
+{{- /* Runtime and vMCP spans carry tool arguments and results whatever the capture setting: export them only to a sink that drops them. */}}
+{{- $sinkOk := or $o.capture.content $o.otlp.contentFiltered (and $o.bundled.enabled (not $o.otlp.endpoint)) }}
+{{- $rtTraces := and $o.tracing.enabled $sinkOk }}
+# What install.sh reads to configure what this chart does not own (the kagent controller and agent runtimes, Agent Kourier)
+# from the SAME values. Public settings only: no endpoint credentials, no Secret values.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: openagentix-observability
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+data:
+  otlpEndpoint: {{ $ep | quote }}
+  otlpProtocol: {{ $o.otlp.protocol | quote }}
+  tracesEnabled: {{ $o.tracing.enabled | quote }}
+  runtimeTraces: {{ $rtTraces | quote }}
+  samplingRate: {{ $o.tracing.samplingRate | toString | quote }}
+  propagators: {{ include "oa.obsPropagators" . | quote }}
+  captureContent: {{ include "oa.obsCapture" . | quote }}
+  baggage: {{ $o.baggage | quote }}
+  kagentNamespace: {{ .Values.kagent.namespace | quote }}
+  kourierNamespace: {{ .Values.channels.kourier.broker.namespace | quote }}
+  {{- /* Agent Kourier: its OTLP exporter reads only http/protobuf. Values for its Helm release, merged by install.sh. */}}
+  {{- $kEnv := list }}
+  {{- if and .Values.channels.kourier.enabled $rtTraces (eq $o.otlp.protocol "http/protobuf") }}
+  {{- $kEnv = list (dict "name" "OTEL_EXPORTER_OTLP_ENDPOINT" "value" $ep) (dict "name" "OTEL_EXPORTER_OTLP_PROTOCOL" "value" "http/protobuf") (dict "name" "OTEL_TRACES_EXPORTER" "value" "otlp") (dict "name" "OTEL_SERVICE_NAME" "value" "agent-kourier") }}
+  {{- end }}
+  {{- $kFrom := list }}
+  {{- $kEgress := list }}
+  {{- if and .Values.channels.kourier.enabled $o.bundled.enabled }}
+  {{- $kFrom = list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $ns)) "podSelector" (dict "matchLabels" (dict "app" "victoria-metrics"))) }}
+  {{- if $kEnv }}
+  {{- $kEgress = list (dict "to" (list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" $ns)) "podSelector" (dict "matchLabels" (dict "app" "jaeger")))) "ports" (list (dict "port" 4318 "protocol" "TCP"))) }}
+  {{- end }}
+  {{- end }}
+  kourierEnv: {{ toJson $kEnv | quote }}
+  kourierMetricsFrom: {{ toJson $kFrom | quote }}
+  kourierEgress: {{ toJson $kEgress | quote }}
+{{- if and $mcpOn $rtTraces }}
+---
+# vMCP traces and Prometheus metrics. The audit log is configured on the VirtualMCPServer itself.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPTelemetryConfig
+metadata:
+  name: openagentix-telemetry
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  openTelemetry:
+    enabled: true
+    endpoint: {{ regexReplaceAll "^https?://" $ep "" | quote }}
+    insecure: {{ hasPrefix "http://" $ep }}
+    tracing: {enabled: true, samplingRate: {{ $o.tracing.samplingRate | toString | quote }}}
+    metrics: {enabled: false}
+  prometheus: {enabled: true}
+{{- else if $mcpOn }}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPTelemetryConfig
+metadata:
+  name: openagentix-telemetry
+  namespace: {{ .Values.mcp.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  prometheus: {enabled: true}
+{{- end }}
+{{- /* ---- targets, shared by the PodMonitors and the bundled VictoriaMetrics ---- */}}
+{{- $targets := list }}
+{{- range $t := $o.metrics.scrape.targets }}
+{{- $keep := true }}
+{{- if eq (default "" $t.when) "gateway" }}{{ $keep = $.Values.gateway.enabled }}{{ end }}
+{{- if eq (default "" $t.when) "mcp" }}{{ $keep = $mcpOn }}{{ end }}
+{{- if eq (default "" $t.when) "channels" }}{{ $keep = $.Values.channels.kourier.enabled }}{{ end }}
+{{- if $keep }}{{ $targets = append $targets $t }}{{ end }}
+{{- end }}
+{{- if and $o.metrics.scrape.enabled (.Capabilities.APIVersions.Has "monitoring.coreos.com/v1") }}
+{{- range $t := $targets }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: openagentix-{{ $t.job }}
+  namespace: {{ default $ns $o.metrics.scrape.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  namespaceSelector: {matchNames: [{{ $t.namespace }}]}
+  selector:
+    matchLabels: {{- toYaml $t.selector | nindent 6 }}
+  podMetricsEndpoints:
+    - portNumber: {{ $t.port }}
+      path: /metrics
+      interval: {{ $o.metrics.scrape.interval }}
+{{- end }}
+{{- end }}
+{{- if $o.bundled.enabled }}
+{{- $b := $o.bundled }}
+{{- $np := .Values.networkPolicy.enabled }}
+---
+# ---- Bundled dev profile: VictoriaMetrics (PromQL, UI on 8428) and Jaeger v2 (in-memory traces, UI on 16686). Port-forward only. ----
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: victoria-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+---
+# Pod discovery for the scrape jobs: read-only, pods only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: openagentix-observability-discovery
+  labels: {{- include "oa.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: openagentix-observability-discovery
+  labels: {{- include "oa.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: openagentix-observability-discovery}
+subjects:
+  - {kind: ServiceAccount, name: victoria-metrics, namespace: {{ $ns }}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: victoria-metrics-scrape
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+data:
+  scrape.yml: |
+    global:
+      scrape_interval: {{ $o.metrics.scrape.interval }}
+    scrape_configs:
+      - job_name: victoria-metrics
+        static_configs:
+          - targets: ["127.0.0.1:8428"]
+      {{- range $t := $targets }}
+      - job_name: {{ $t.job }}
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces: {names: [{{ $t.namespace }}]}
+            selectors:
+              - role: pod
+                label: {{ include "oa.selectorString" $t.selector | quote }}
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_phase]
+            regex: Running
+            action: keep
+          - source_labels: [__meta_kubernetes_pod_ip]
+            regex: (.+)
+            replacement: $1:{{ $t.port }}
+            target_label: __address__
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+      {{- end }}
+{{- if $b.metrics.storage.size }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: victoria-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if $b.metrics.storage.storageClassName }}
+  storageClassName: {{ $b.metrics.storage.storageClassName }}
+  {{- end }}
+  resources: {requests: {storage: {{ $b.metrics.storage.size }}}}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: victoria-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: victoria-metrics}}
+  template:
+    metadata:
+      labels: {app: victoria-metrics}
+      annotations:
+        checksum/scrape: {{ $targets | toJson | sha256sum | trunc 16 }}
+    spec:
+      serviceAccountName: victoria-metrics
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        fsGroup: 65534
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: victoria-metrics
+          image: {{ $b.metrics.image }}
+          args:
+            - -storageDataPath=/data
+            - -retentionPeriod={{ $b.metrics.retention }}
+            - -promscrape.config=/etc/vm/scrape.yml
+            - -httpListenAddr=:8428
+            - -memory.allowedPercent=40
+            - -promscrape.suppressDuplicateScrapeTargetErrors
+          ports: [{name: http, containerPort: 8428}]
+          readinessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /health, port: http}, periodSeconds: 20, failureThreshold: 6}
+          resources: {{- toYaml $b.metrics.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: scrape, mountPath: /etc/vm, readOnly: true}
+      volumes:
+        - name: data
+          {{- if $b.metrics.storage.size }}
+          persistentVolumeClaim: {claimName: victoria-metrics}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: scrape
+          configMap: {name: victoria-metrics-scrape}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: victoria-metrics
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: victoria-metrics}
+  ports: [{name: http, port: 8428, targetPort: http}]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: jaeger-config
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- include "oa.jaegerConfig" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: jaeger}}
+  template:
+    metadata:
+      labels: {app: jaeger}
+      annotations:
+        checksum/config: {{ include "oa.jaegerConfig" . | sha256sum | trunc 16 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: jaeger
+          image: {{ $b.traces.image }}
+          args: ["--config=/etc/jaeger/config.yaml"]
+          ports:
+            - {name: otlp-grpc, containerPort: 4317}
+            - {name: otlp-http, containerPort: 4318}
+            - {name: ui, containerPort: 16686}
+            - {name: health, containerPort: 13133}
+          readinessProbe: {httpGet: {path: /status, port: health}, periodSeconds: 10}
+          livenessProbe: {httpGet: {path: /status, port: health}, periodSeconds: 20, failureThreshold: 6}
+          resources: {{- toYaml $b.traces.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: config, mountPath: /etc/jaeger, readOnly: true}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: config
+          configMap: {name: jaeger-config}
+        - name: tmp
+          emptyDir: {sizeLimit: 16Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: jaeger}
+  ports:
+    - {name: otlp-grpc, port: 4317, targetPort: otlp-grpc}
+    - {name: otlp-http, port: 4318, targetPort: otlp-http}
+    - {name: ui, port: 16686, targetPort: ui}
+{{- if $np }}
+---
+# Default for the namespace: no ingress. The UIs are reached with kubectl port-forward, which does not pass through a NetworkPolicy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: victoria-metrics-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app: victoria-metrics}}
+  policyTypes: [Ingress]
+---
+# OTLP only, from the namespaces that export (agent sandboxes arrive from the Substrate egress proxy in ate-system).
+# kindnet does not enforce egress rules for destinations outside the cluster; this policy is about who may SEND traces here.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jaeger-ingress
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector: {matchLabels: {app: jaeger}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 4317}
+        - {protocol: TCP, port: 4318}
+      from:
+        {{- range $b.otlpFrom }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ . | quote }}}}
+        {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

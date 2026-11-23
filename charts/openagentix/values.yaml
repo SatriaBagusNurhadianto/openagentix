@@ -401,6 +401,75 @@ memory:
     project name, a codename, a standing instruction) or asks you to remember something, call the save_memory tool
     with one short, self-contained sentence. Never store passwords, tokens or other secrets.
 
+# ---- Observability (traces, metrics, tool-call audit) -----------------------------------------------
+# OFF by default: with `enabled: false` the chart renders nothing below and the output is byte-identical to a chart without it.
+# ONE switch. When on, the chart (1) tells the model gateway to trace (AgentgatewayPolicy spec.frontend.tracing), (2) gives the
+# vMCP an MCPTelemetryConfig (traces, Prometheus metrics) and a metadata-only audit log, (3) renders PodMonitors for your own
+# Prometheus when the monitoring.coreos.com/v1 API exists, and (4) renders a ConfigMap `openagentix-observability` that install.sh
+# reads to configure what the chart does not own (the kagent controller and agent runtimes, Agent Kourier) from the SAME values.
+# The two ways to get a backend: your own OTLP endpoint (`otlp.endpoint`), or the small bundled dev profile (`bundled.enabled`).
+# PRIVACY: content capture (prompts, answers, tool arguments and results) is OFF everywhere and `capture.content` is the only
+# switch that turns it on. Baggage propagation is OFF. No end-user id is a metric label (the `user_id` label of the gateway metrics
+# is the AGENT's virtual-key name). See README "Observability" and docs/decisions/0003-observability.md.
+observability:
+  enabled: false
+  namespace: openagentix-observability       # the bundled profile and, by default, the PodMonitors
+  otlp:
+    # OTLP endpoint every component exports to. Empty with bundled.enabled = the bundled Jaeger (http/protobuf on :4318).
+    # grpc: host:port style URL, http/protobuf: base URL (the signal path /v1/traces is added by the exporters).
+    endpoint: ""
+    protocol: http/protobuf                  # http/protobuf | grpc. Sandboxes reach it through the egress proxy: http/protobuf is the proven path
+    # The agent runtime (Go ADK) and the vMCP write tool ARGUMENTS and RESULTS into their spans whatever the capture setting
+    # (gcp.vertex.agent.tool_call_args / tool_response, mcp.tool.arguments, gen_ai.tool.call.arguments). Only a collector can drop them.
+    # The bundled Jaeger does. For your own endpoint, set this to true ONLY when the collector in front of it deletes those
+    # attributes (see the processor in templates/_helpers.tpl, oa.jaegerConfig); until then the chart exports only the model gateway's spans
+    # (no content) and leaves kagent runtime and vMCP tracing OFF.
+    contentFiltered: false
+  tracing:
+    enabled: true
+    samplingRate: "1.0"                      # 0.0..1.0, a string; head sampling at the gateway and the vMCP (kagent keeps parent-based AlwaysOn)
+  metrics:
+    scrape:
+      enabled: true                          # PodMonitors, only when the monitoring.coreos.com/v1 API exists
+      namespace: ""                          # where the PodMonitors go (default observability.namespace)
+      interval: 30s
+      # What gets scraped (PodMonitors and the bundled VictoriaMetrics). `when` limits an entry to a block that is enabled:
+      # gateway | mcp | channels. port is a container port NUMBER; the pods need not declare it.
+      targets:
+        - {job: model-gateway,      namespace: agentgateway-system, selector: {gateway.networking.k8s.io/gateway-name: model-gateway}, port: 15020, when: gateway}
+        - {job: agentgateway,       namespace: agentgateway-system, selector: {app.kubernetes.io/name: agentgateway}, port: 9092, when: gateway}
+        - {job: atenet-router,      namespace: ate-system, selector: {app: atenet-router}, port: 15020}
+        - {job: atenet-egress,      namespace: ate-system, selector: {app: atenet-egress}, port: 15020}
+        - {job: ate-api-server,     namespace: ate-system, selector: {app: ate-api-server}, port: 9090}
+        - {job: atelet,             namespace: ate-system, selector: {app: atelet}, port: 9090}
+        - {job: ate-controller,     namespace: ate-system, selector: {app: ate-controller}, port: 8080}
+        - {job: vmcp,               namespace: mcp-tools, selector: {app: virtualmcpserver}, port: 9464, when: mcp}
+        - {job: agent-kourier,      namespace: agent-kourier, selector: {app.kubernetes.io/name: agent-kourier}, port: 8080, when: channels}
+  audit:
+    enabled: true                            # vMCP audit log: tool name, outcome, caller subject, ids and sizes. Never arguments or results (see capture)
+  baggage: false                             # true lets agent/conversation ids ride in the W3C `baggage` header to MCP servers AND model providers; leave off
+  capture:
+    content: false                           # THE switch. true records prompts, answers, tool arguments and results in spans and the audit log
+  # A small dev-only backend in `namespace`: VictoriaMetrics (PromQL + UI) and Jaeger v2 with IN-MEMORY storage. Not for production.
+  bundled:
+    enabled: false
+    metrics:
+      image: victoriametrics/victoria-metrics:v1.156.0@sha256:da8a90ac0912f16589be2b96a6441a2fca4bca415c83783d972d92e3b5b66970   # multi-arch index digest (arm64, amd64)
+      retention: 7d
+      storage: {size: 2Gi, storageClassName: ""}   # PVC; empty size = emptyDir (data lost with the pod)
+      resources:                             # measured: 156 MB working set (page cache included) after 1 h and a few calls on kind; one OOM kill (137) seen at 192Mi
+        requests: {cpu: 25m, memory: 96Mi}
+        limits: {cpu: 500m, memory: 256Mi}
+    traces:
+      image: jaegertracing/jaeger:2.23.0@sha256:3823829974ccfc2485d2e48b165579091f32295022ae80ca49704e2f4834116e   # multi-arch index digest (arm64, amd64)
+      maxTraces: 2000                        # in-memory ring: the oldest traces are dropped; a pod restart loses all
+      extraDropAttributes: []                # more span attribute keys to delete before storage (added to the built-in content list)
+      resources:                             # measured: 27 MB working set after a few traces (cap: maxTraces, memory_limiter at 150 MiB)
+        requests: {cpu: 25m, memory: 48Mi}
+        limits: {cpu: 500m, memory: 192Mi}
+    # Namespaces whose pods may send OTLP to the bundled Jaeger (agent sandboxes arrive from the Substrate egress proxy).
+    otlpFrom: [agentgateway-system, kagent, ate-system, mcp-tools, agent-kourier, openagentix-gateway, openagentix-schedules]
+
 # ---- kagent wiring and agents ------------------------------------------------------------------
 kagent:
   enabled: true

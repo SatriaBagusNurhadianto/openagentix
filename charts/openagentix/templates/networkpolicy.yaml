@@ -42,6 +42,25 @@ spec:
           podSelector:
             matchLabels: {{- toYaml $n.controllerPodLabels | nindent 14 }}
         {{- end }}
+{{- if and (include "oa.obsOn" .) .Values.observability.bundled.enabled }}
+---
+# The bundled VictoriaMetrics scrapes the vMCP's Prometheus port (ToolHive diagnostics, 9464). Nothing else is added.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-vmcp-metrics
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: virtualmcpserver, toolhive-name: {{ $m.virtual.name | quote }}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 9464}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.observability.namespace }}}}
+          podSelector: {matchLabels: {app: victoria-metrics}}
+{{- end }}
 {{- end }}
 {{- if .Values.kagent.enabled }}
 {{- $k := .Values.kagent }}

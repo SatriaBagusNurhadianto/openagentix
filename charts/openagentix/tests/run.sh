@@ -792,6 +792,168 @@ E=$(render_err -f "$NV" --set notify.destinations.existingSecret.name=)
 eq "enabled without a destinations Secret name fails the render" "$([ -n "$E" ] && echo failed || echo rendered)" failed
 rm -f "$NV"
 
+echo "# observability: off by default"
+D=$(docs)
+POL='.[]|select(.kind=="AgentgatewayPolicy")'
+eq "no observability objects by default"               "$(count "$D" '.metadata.namespace=="openagentix-observability" or .kind=="MCPTelemetryConfig" or .kind=="PodMonitor" or .kind=="ServiceMonitor" or (.metadata.name=="openagentix-observability")')" 0
+eq "default gateway policy has no tracing"             "$(q "$D" "$POL|.spec.frontend|has(\"tracing\")")" false
+eq "default vMCP has no telemetryConfigRef or audit"   "$(q "$D" '.[]|select(.kind=="VirtualMCPServer")|(.spec|has("telemetryConfigRef"))|tostring')+$(q "$D" '.[]|select(.kind=="VirtualMCPServer")|.spec.config|has("audit")|tostring')" "false+false"
+H0=$(helm template openagentix "$CHART" -n openagentix-system 2>&1 | shasum -a 256)
+H1=$(helm template openagentix "$CHART" -n openagentix-system --set observability.enabled=false --set observability.bundled.enabled=true --set observability.capture.content=true --set observability.otlp.endpoint=http://x:4318 2>&1 | shasum -a 256)
+eq "observability.enabled=false (other observability values set) is byte-identical to the default render" "$H1" "$H0"
+H2=$(helm template openagentix "$CHART" -n openagentix-system -f /dev/stdin <<<'observability: null' 2>&1 | shasum -a 256)
+eq "observability=null is byte-identical to the default render" "$H2" "$H0"
+
+echo "# observability: wiring to your own OTLP endpoint"
+OE=(--set observability.enabled=true --set observability.otlp.endpoint=http://otel.example.svc:4318 --set observability.otlp.contentFiltered=true)
+OB=(--set observability.enabled=true --set observability.bundled.enabled=true)
+D=$(docs "${OE[@]}")
+MK='.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-observability")'
+eq "still exactly ONE AgentgatewayPolicy"              "$(count "$D" '.kind=="AgentgatewayPolicy"')" 1
+eq "policy: tracing url is the configured endpoint"    "$(q "$D" "$POL|.spec.frontend.tracing.url")" http://otel.example.svc:4318
+eq "policy: tracing protocol HTTP for http/protobuf"   "$(q "$D" "$POL|.spec.frontend.tracing.protocol")" HTTP
+eq "policy: tracing random sampling from values"       "$(q "$D" "$POL|.spec.frontend.tracing.randomSampling")" 1.0
+eq "policy: tracing adds NO span attributes (no content)" "$(q "$D" "$POL|.spec.frontend.tracing|has(\"attributes\")")" false
+eq "policy: user_id access log attribute is kept"      "$(q "$D" "$POL|.spec.frontend.accessLog.attributes.add[0].name")" user_id
+eq "policy: traffic section unchanged (apikey auth)"   "$(q "$D" "$POL|.spec.traffic.apiKeyAuthentication.mode")" Strict
+D2=$(docs "${OE[@]}" --set observability.otlp.protocol=grpc --set observability.otlp.endpoint=http://otel.example.svc:4317)
+eq "policy: grpc protocol maps to GRPC"                "$(q "$D2" "$POL|.spec.frontend.tracing.protocol")" GRPC
+D2=$(docs "${OE[@]}" --set observability.tracing.enabled=false)
+eq "tracing.enabled=false: no gateway tracing"         "$(q "$D2" "$POL|.spec.frontend|has(\"tracing\")")" false
+TC='.[]|select(.kind=="MCPTelemetryConfig")'
+eq "one MCPTelemetryConfig in the tools namespace"     "$(count "$D" '.kind=="MCPTelemetryConfig"')/$(q "$D" "$TC|.metadata.namespace")" 1/mcp-tools
+eq "toolhive: otlp endpoint without scheme"            "$(q "$D" "$TC|.spec.openTelemetry.endpoint")" otel.example.svc:4318
+eq "toolhive: http endpoint means insecure"            "$(q "$D" "$TC|.spec.openTelemetry.insecure")" true
+eq "toolhive: tracing on, sampling from values"        "$(q "$D" "$TC|.spec.openTelemetry.tracing|\"\(.enabled) \(.samplingRate)\"")" "true 1.0"
+eq "toolhive: prometheus metrics on"                   "$(q "$D" "$TC|.spec.prometheus.enabled")" true
+VM='.[]|select(.kind=="VirtualMCPServer")'
+eq "vMCP references the telemetry config"              "$(q "$D" "$VM|.spec.telemetryConfigRef.name")" "$(q "$D" "$TC|.metadata.name")"
+eq "vMCP audit on, request and response data OFF"      "$(q "$D" "$VM|.spec.config.audit|\"\(.enabled) \(.includeRequestData) \(.includeResponseData)\"")" "true false false"
+eq "vMCP: incoming auth untouched"                     "$(q "$D" "$VM|.spec.incomingAuth.type")" oidc
+D2=$(docs "${OE[@]}" --set observability.audit.enabled=false)
+eq "audit.enabled=false: no audit block"               "$(q "$D2" "$VM|.spec.config|has(\"audit\")")" false
+eq "marker ConfigMap in the observability namespace"   "$(q "$D" "$MK|.metadata.namespace")" openagentix-observability
+eq "marker: endpoint, protocol"                        "$(q "$D" "$MK|.data|\"\(.otlpEndpoint) \(.otlpProtocol)\"")" "http://otel.example.svc:4318 http/protobuf"
+eq "marker: capture and baggage are false"             "$(q "$D" "$MK|.data|\"\(.captureContent) \(.baggage)\"")" "false false"
+eq "marker: propagators default to tracecontext"       "$(q "$D" "$MK|.data.propagators")" tracecontext
+eq "marker: kourier and kagent switches present"       "$(q "$D" "$MK|.data|has(\"tracesEnabled\") and has(\"samplingRate\")")" true
+eq "no bundled backend without bundled.enabled"        "$(count "$D" '.metadata.namespace=="openagentix-observability" and .kind!="ConfigMap"')" 0
+eq "no Secret objects"                                 "$(count "$D" '.kind=="Secret"')" 0
+D2=$(docs "${OE[@]}" --set observability.baggage=true)
+eq "baggage=true: propagators include baggage"         "$(q "$D2" "$MK|.data.propagators")" tracecontext,baggage
+eq "baggage=true: the Harness carries OTEL_PROPAGATORS" "$(q "$D2" '.[]|select(.kind=="Harness" and .metadata.name=="assistant-harness")|.spec.env[]|select(.name=="OTEL_PROPAGATORS")|.value')" tracecontext,baggage
+eq "baggage off: the Harness has no env"               "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="assistant-harness")|has("spec") and (.spec|has("env"))')" false
+E=$(render_err --set observability.enabled=true)
+eq "enabled with no endpoint and no bundled backend fails the render" "$([ -n "$E" ] && echo failed || echo rendered)" failed
+E=$(render_err "${OE[@]}" --set observability.otlp.protocol=carrier-pigeon)
+eq "an unknown OTLP protocol fails the render"         "$([ -n "$E" ] && echo failed || echo rendered)" failed
+E=$(render_err "${OE[@]}" --set observability.tracing.samplingRate=2)
+eq "a sampling rate outside 0..1 fails the render"     "$([ -n "$E" ] && echo failed || echo rendered)" failed
+D2=$(docs --set observability.enabled=true --set observability.otlp.endpoint=http://x:4318 --set mcp.enabled=false)
+eq "mcp.enabled=false: no telemetry config, render ok" "$(count "$D2" '.kind=="MCPTelemetryConfig"')+$(count "$D2" '.kind=="ConfigMap" and .metadata.name=="openagentix-observability"')" "0+1"
+D2=$(docs --set observability.enabled=true --set observability.otlp.endpoint=http://x:4318 --set gateway.enabled=false)
+eq "gateway.enabled=false: render ok, no tracing policy" "$(count "$D2" '.kind=="AgentgatewayPolicy"')" 0
+
+echo "# observability: Agent Kourier wiring (applied by install.sh from the marker)"
+eq "kourier switched off: marker has no kourier env"   "$(q "$D" "$MK|.data.kourierEnv")" "[]"
+DK=$(docs "${OE[@]}" --set channels.kourier.enabled=true)
+eq "kourier on: OTLP env, http/protobuf, no credentials" "$(q "$DK" "$MK|.data.kourierEnv|fromjson|map(.name)|join(\",\")")" "OTEL_EXPORTER_OTLP_ENDPOINT,OTEL_EXPORTER_OTLP_PROTOCOL,OTEL_TRACES_EXPORTER,OTEL_SERVICE_NAME"
+eq "kourier on: endpoint value is the configured one"  "$(q "$DK" "$MK|.data.kourierEnv|fromjson|.[0].value")" http://otel.example.svc:4318
+DK2=$(docs "${OE[@]}" --set channels.kourier.enabled=true --set observability.otlp.protocol=grpc)
+eq "kourier on, grpc: no kourier tracing env (http/protobuf only)" "$(q "$DK2" "$MK|.data.kourierEnv")" "[]"
+eq "kourier: no scraper peer or egress without the bundled profile" "$(q "$DK" "$MK|.data|[.kourierMetricsFrom,.kourierEgress]|join(\" \")")" "[] []"
+DK3=$(docs "${OB[@]}" --set channels.kourier.enabled=true)
+eq "kourier + bundled: scraper peer is the VictoriaMetrics pod" "$(q "$DK3" "$MK|.data.kourierMetricsFrom|fromjson|.[0].podSelector.matchLabels.app")" victoria-metrics
+eq "kourier + bundled: egress to the bundled Jaeger OTLP port" "$(q "$DK3" "$MK|.data.kourierEgress|fromjson|.[0]|[.to[0].podSelector.matchLabels.app,(.ports[0].port|tostring)]|join(\" \")")" "jaeger 4318"
+
+echo "# observability: an own endpoint that is not known to drop tool arguments gets no runtime or vMCP traces"
+DU=$(docs --set observability.enabled=true --set observability.otlp.endpoint=http://otel.example.svc:4318)
+eq "unfiltered own endpoint: marker says runtime traces are off" "$(q "$DU" "$MK|.data.runtimeTraces")" false
+eq "unfiltered own endpoint: the gateway (no content) still traces" "$(q "$DU" "$POL|.spec.frontend.tracing.url")" http://otel.example.svc:4318
+eq "unfiltered own endpoint: no vMCP tracing, metrics stay on" "$(q "$DU" "$TC|(.spec.openTelemetry//{})|has(\"enabled\")")+$(q "$DU" "$TC|.spec.prometheus.enabled")" "false+true"
+eq "unfiltered own endpoint: no Kourier tracing env"   "$(q "$(docs --set observability.enabled=true --set observability.otlp.endpoint=http://x:4318 --set channels.kourier.enabled=true)" "$MK|.data.kourierEnv")" "[]"
+eq "contentFiltered=true turns runtime traces on"      "$(q "$D" "$MK|.data.runtimeTraces")" true
+eq "bundled with its own Jaeger: runtime traces on"    "$(q "$(docs "${OB[@]}")" "$MK|.data.runtimeTraces")" true
+eq "bundled but exporting elsewhere: runtime traces off unless filtered" "$(q "$(docs "${OB[@]}" --set observability.otlp.endpoint=http://mine:4318)" "$MK|.data.runtimeTraces")" false
+eq "capture.content=true: runtime traces on (the operator asked for content)" "$(q "$(docs --set observability.enabled=true --set observability.otlp.endpoint=http://x:4318 --set observability.capture.content=true)" "$MK|.data.runtimeTraces")" true
+
+echo "# observability: monitors only when the CRD API exists"
+eq "no PodMonitor without the monitoring.coreos.com/v1 API" "$(count "$D" '.kind=="PodMonitor" or .kind=="ServiceMonitor"')" 0
+DM=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1)
+eq "with the API: one PodMonitor per target"           "$(count "$DM" '.kind=="PodMonitor"')" 8
+eq "PodMonitor for the gateway proxy"                  "$(q "$DM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-model-gateway")|.spec.namespaceSelector.matchNames[0]+" "+(.spec.podMetricsEndpoints[0].portNumber|tostring)')" "agentgateway-system 15020"
+eq "PodMonitors live in the observability namespace"   "$(q "$DM" '[.[]|select(.kind=="PodMonitor")|.metadata.namespace]|unique|join(",")')" openagentix-observability
+eq "PodMonitor selects pods by label"                  "$(q "$DM" '.[]|select(.kind=="PodMonitor" and .metadata.name=="openagentix-atenet-egress")|.spec.selector.matchLabels.app')" atenet-egress
+DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set observability.metrics.scrape.enabled=false)
+eq "scrape.enabled=false: no monitors even with the API" "$(count "$DM2" '.kind=="PodMonitor"')" 0
+DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set observability.metrics.scrape.namespace=monitoring --set observability.metrics.scrape.interval=15s)
+eq "scrape.namespace and interval are honoured"        "$(q "$DM2" '[.[]|select(.kind=="PodMonitor")]|map(.metadata.namespace+" "+.spec.podMetricsEndpoints[0].interval)|unique|join(",")')" "monitoring 15s"
+DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set channels.kourier.enabled=true)
+eq "kourier target appears only with channels.kourier"  "$(count "$DM" '.kind=="PodMonitor" and .metadata.name=="openagentix-agent-kourier"')+$(count "$DM2" '.kind=="PodMonitor" and .metadata.name=="openagentix-agent-kourier"')" "0+1"
+DM2=$(docs "${OE[@]}" --api-versions monitoring.coreos.com/v1 --set gateway.enabled=false --set mcp.enabled=false --set agents=null --set knowledge.enabled=false)
+eq "gateway/mcp targets drop with their blocks"         "$(count "$DM2" '.kind=="PodMonitor"')" 5
+
+echo "# observability: privacy, one switch"
+DC=$(docs "${OE[@]}" --set observability.capture.content=true)
+eq "capture.content=true: marker says so"             "$(q "$DC" "$MK|.data.captureContent")" true
+eq "capture.content=true: audit includes request and response data" "$(q "$DC" "$VM|.spec.config.audit|\"\(.includeRequestData) \(.includeResponseData)\"")" "true true"
+DC2=$(docs "${OE[@]}" --set observability.audit.includeRequestData=true --set observability.audit.includeResponseData=true --set observability.tracing.captureContent=true --set observability.capture.captureContent=true)
+eq "no other value path turns content on"              "$(q "$DC2" "$MK|.data.captureContent")+$(q "$DC2" "$VM|.spec.config.audit|\"\(.includeRequestData) \(.includeResponseData)\"")" "false+false false"
+eq "gateway span attributes never reference prompt, completion or body" "$(q "$DC" "$POL|.spec|tojson|test(\"prompt|completion|request.body|response.body|llm\\\\.\")")" false
+
+echo "# observability: bundled dev profile"
+OB=(--set observability.enabled=true --set observability.bundled.enabled=true)
+D=$(docs "${OB[@]}")
+NS='.metadata.namespace=="openagentix-observability"'
+eq "bundled: VictoriaMetrics and Jaeger Deployments"   "$(count "$D" "$NS and .kind==\"Deployment\" and (.metadata.name==\"victoria-metrics\" or .metadata.name==\"jaeger\")")" 2
+eq "bundled: endpoint defaults to the bundled Jaeger"  "$(q "$D" "$MK|.data.otlpEndpoint")" http://jaeger.openagentix-observability.svc.cluster.local:4318
+eq "bundled: gateway tracing url is the bundled Jaeger" "$(q "$D" "$POL|.spec.frontend.tracing.url")" http://jaeger.openagentix-observability.svc.cluster.local:4318
+eq "bundled: no Ingress, no LoadBalancer, no NodePort" "$(count "$D" "$NS and (.kind==\"Ingress\" or (.kind==\"Service\" and (.spec.type//\"ClusterIP\")!=\"ClusterIP\"))")" 0
+eq "bundled: images pinned by tag and digest"          "$(q "$D" "[.[]|select($NS and .kind==\"Deployment\")|.spec.template.spec.containers[].image|select(test(\":[0-9v][^@]*@sha256:[0-9a-f]{64}\$\"))]|length")" 2
+for W in victoria-metrics jaeger; do
+  DEP=".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"$W\")|.spec.template.spec"
+  eq "$W: non-root, read-only root, no capabilities, no privilege escalation, seccomp" "$(q "$D" "$DEP|[(.securityContext.runAsNonRoot), (.containers[0].securityContext.readOnlyRootFilesystem), (.containers[0].securityContext.allowPrivilegeEscalation), (.containers[0].securityContext.capabilities.drop|join(\",\")), (.securityContext.seccompProfile.type)]|map(tostring)|join(\" \")")" "true true false ALL RuntimeDefault"
+  eq "$W: requests and limits set"                     "$(q "$D" "$DEP|.containers[0].resources|[.requests.memory,.limits.memory,.requests.cpu,.limits.cpu]|all(.!=null)")" true
+done
+eq "jaeger: no service account token mounted"          "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"jaeger\")|.spec.template.spec.automountServiceAccountToken")" false
+eq "victoria-metrics: own ServiceAccount, token mounted (pod discovery needs it)" "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"victoria-metrics\")|.spec.template.spec|[.serviceAccountName,(.automountServiceAccountToken//true)]|map(tostring)|join(\" \")")" "victoria-metrics true"
+eq "victoria-metrics: retention and PVC"               "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"victoria-metrics\")|.spec.template.spec.containers[0].args|index(\"-retentionPeriod=7d\")!=null")" true
+eq "victoria-metrics: scrape config comes from a ConfigMap" "$(count "$D" "$NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\"")" 1
+SC=$(q "$D" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"victoria-metrics-scrape\")|.data[\"scrape.yml\"]")
+eq "scrape config: one job per target"                 "$(yq -r '[.scrape_configs[].job_name]|sort|join(",")' <<<"$SC")" "agentgateway,ate-api-server,ate-controller,atelet,atenet-egress,atenet-router,model-gateway,victoria-metrics,vmcp"
+eq "scrape config: the gateway job targets pod IP :15020 in its namespace" "$(yq -r '.scrape_configs[]|select(.job_name=="model-gateway")|[.kubernetes_sd_configs[0].role, .kubernetes_sd_configs[0].namespaces.names[0], (.relabel_configs|tostring|contains("15020"))]|join(" ")' <<<"$SC")" "pod agentgateway-system true"
+eq "ClusterRole: only get/list/watch on pods"          "$(q "$D" '.[]|select(.kind=="ClusterRole" and .metadata.name=="openagentix-observability-discovery")|.rules|tojson')" '[{"apiGroups":[""],"resources":["pods"],"verbs":["get","list","watch"]}]'
+eq "bundled: no Secret objects"                        "$(count "$D" '.kind=="Secret"')" 0
+JC=$(q "$D" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"jaeger-config\")|.data[\"config.yaml\"]")
+eq "jaeger: in-memory store capped by maxTraces"       "$(yq -r '.extensions.jaeger_storage.backends.memstore.memory.max_traces' <<<"$JC")" 2000
+eq "jaeger: OTLP gRPC and HTTP receivers"              "$(yq -r '.receivers.otlp.protocols|keys|join(",")' <<<"$JC")" grpc,http
+eq "jaeger: content-dropping processor in the pipeline by default" "$(yq -r '.service.pipelines.traces.processors|index("attributes/drop-content")!=null' <<<"$JC")" true
+DROP=$(yq -r '.processors["attributes/drop-content"].actions|map(.pattern // .key)|join("|")' <<<"$JC")
+eq "jaeger: drops the Go ADK tool arguments and results" "$(grep -c 'tool_call_args' <<<"$DROP")+$(grep -c 'tool_response' <<<"$DROP")" "1+1"
+eq "jaeger: deletes the end-user id from spans by default (user.id carries telegram:<chat id>)" "$(grep -c 'user.id' <<<"$DROP")+$(grep -c 'enduser.id' <<<"$DROP")" "1+1"
+eq "jaeger: drops the vMCP tool arguments (mcp.tool.arguments)" "$(grep -c 'mcp.tool.arguments' <<<"$DROP")" 1
+eq "jaeger: drops GenAI message content keys"          "$(grep -c 'gen_ai.input.messages' <<<"$DROP")" 1
+DC=$(docs "${OB[@]}" --set observability.capture.content=true)
+JC2=$(q "$DC" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"jaeger-config\")|.data[\"config.yaml\"]")
+eq "capture.content=true: the dropping processor is gone" "$(yq -r '.service.pipelines.traces.processors|index("attributes/drop-content")==null' <<<"$JC2")" true
+DX=$(docs "${OB[@]}" --set 'observability.bundled.traces.extraDropAttributes={app.secret.key}')
+JX=$(q "$DX" ".[]|select($NS and .kind==\"ConfigMap\" and .metadata.name==\"jaeger-config\")|.data[\"config.yaml\"]")
+eq "jaeger: extraDropAttributes adds attributes to the delete list" "$(yq -r '.processors["attributes/drop-content"].actions|map(.key)|index("app.secret.key")!=null' <<<"$JX")" true
+eq "jaeger: the pod template hash follows the CONFIG CONTENT (a changed drop list must restart Jaeger)" "$([ "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"jaeger\")|.spec.template.metadata.annotations[\"checksum/config\"]")" != "$(q "$DX" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"jaeger\")|.spec.template.metadata.annotations[\"checksum/config\"]")" ] && echo differs || echo same)" differs
+eq "jaeger: a pod-template hash follows the config"    "$(q "$D" ".[]|select($NS and .kind==\"Deployment\" and .metadata.name==\"jaeger\")|.spec.template.metadata.annotations|has(\"checksum/config\")")" true
+NP='.[]|select(.kind=="NetworkPolicy" and '"$NS"')'
+eq "jaeger NetworkPolicy: OTLP ports only from the listed namespaces" "$(q "$D" "$NP|select(.metadata.name==\"jaeger-ingress\")|.spec.ingress[0]|[(.ports|map(.port)|join(\",\")), (.from|length)]|map(tostring)|join(\" \")")" "4317,4318 7"
+eq "jaeger NetworkPolicy: UI port is not opened (port-forward only)" "$(q "$D" "[$NP|select(.metadata.name==\"jaeger-ingress\")|.spec.ingress[].ports[].port]|index(16686)==null")" true
+eq "victoria-metrics NetworkPolicy: no ingress rule (query via port-forward)" "$(q "$D" "$NP|select(.metadata.name==\"victoria-metrics-ingress\")|(.spec.ingress//[])|length")" 0
+eq "vMCP admits the metrics scraper on 9464"           "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-metrics")|.spec.ingress[0]|[(.ports[0].port),(.from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]),(.from[0].podSelector.matchLabels.app)]|map(tostring)|join(" ")')" "9464 openagentix-observability victoria-metrics"
+D2=$(docs "${OB[@]}" --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false: no NetworkPolicy for the bundled pods" "$(count "$D2" "$NS and .kind==\"NetworkPolicy\"")" 0
+D2=$(docs "${OB[@]}" --set observability.bundled.metrics.storage.size=)
+eq "empty storage size: emptyDir, no PVC"              "$(count "$D2" '.kind=="PersistentVolumeClaim" and .metadata.name=="victoria-metrics"')" 0
+D2=$(docs "${OB[@]}" --set observability.otlp.endpoint=http://mine:4318)
+eq "bundled with an explicit endpoint: the endpoint wins" "$(q "$D2" "$MK|.data.otlpEndpoint")" http://mine:4318
+eq "no secret-looking data anywhere in the bundled render" "$(count "$D" 'has("data") and (.kind!="ConfigMap")')" 0
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

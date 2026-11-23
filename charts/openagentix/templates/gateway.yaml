@@ -84,8 +84,10 @@ spec:
     retry:
       attempts: {{ $g.policy.retry.attempts }}
       codes: {{ toJson $g.policy.retry.codes }}
-  {{- if $g.policy.attributeUserId }}
+  {{- $trace := and (include "oa.obsOn" .) .Values.observability.tracing.enabled }}
+  {{- if or $g.policy.attributeUserId $trace }}
   frontend:
+    {{- if $g.policy.attributeUserId }}
     accessLog:
       attributes:
         add:
@@ -94,5 +96,13 @@ spec:
       attributes:
         add:
           - {name: user_id, expression: apiKey.user_id}
+    {{- end }}
+    {{- if $trace }}
+    # Tracing: default span attributes only (no prompt or completion), the incoming traceparent is continued and passed upstream.
+    tracing:
+      url: {{ include "oa.obsEndpoint" . | quote }}
+      protocol: {{ ternary "GRPC" "HTTP" (eq .Values.observability.otlp.protocol "grpc") }}
+      randomSampling: {{ .Values.observability.tracing.samplingRate | toString | quote }}
+    {{- end }}
   {{- end }}
 {{- end }}

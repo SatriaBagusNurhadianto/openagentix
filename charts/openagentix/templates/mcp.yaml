@@ -76,6 +76,17 @@ spec:
       parallelMaxConcurrency: {{ $m.virtual.codeMode.parallelMaxConcurrency }}
       toolCallTimeout: {{ $m.virtual.codeMode.toolCallTimeout }}
     {{- end }}
+    {{- if and (include "oa.obsOn" .) .Values.observability.audit.enabled }}
+    # Audit events: tool name, outcome, caller subject (the actor JWT sub, which carries the session id), sizes.
+    # Request and response data are included only when observability.capture.content is true.
+    audit:
+      enabled: true
+      includeRequestData: {{ include "oa.obsCapture" . }}
+      includeResponseData: {{ include "oa.obsCapture" . }}
+    {{- end }}
+  {{- if include "oa.obsOn" . }}
+  telemetryConfigRef: {name: openagentix-telemetry}
+  {{- end }}
   incomingAuth:
     type: {{ $ia.type }}
     {{- if eq $ia.type "oidc" }}

@@ -62,6 +62,10 @@ spec:
   {{- else }}
   kagent: {}
   {{- end }}
+  {{- if and (include "oa.obsOn" $) $.Values.observability.baggage }}
+  env:
+    - {name: OTEL_PROPAGATORS, value: {{ include "oa.obsPropagators" $ | quote }}}
+  {{- end }}
   workload:
     image: {{ default $k.harnessImage $a.harnessImage }}
   substrate:

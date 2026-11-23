@@ -93,3 +93,24 @@ Expect `TASK_STATE_COMPLETED` and an answer that says 4.
 - Agents share one Substrate worker pool, so a busy agent can starve another. Untested: load, concurrency.
 - Requires Kubernetes 1.37 or newer (pod-certificate APIs).
 - The demo token budget of 100000 per hour was too low for tool use; the chart default is now 1000000.
+
+## Speed, measured again (2026-11-23)
+
+The first comparison made kagent look slow (12 s for a plain question). It was repeated on a quiet node with traces, 5 runs each. Median seconds:
+
+| Test | kagent as deployed | kagent, memory off | kagent lean | AX with Claude Code | AX minimal loop |
+|---|---|---|---|---|---|
+| Plain question | 2.8 | 2.5 | 2.9 | 7.6 | 3.4 |
+| Tool question | 6.9 | 6.5 | 6.0 | 11.1 | 7.4 |
+| 3-turn conversation | 18.0 | 9.9 | 8.4 | 17.8 | 10.4 |
+
+What the traces show for a plain question on kagent (2.5 s): model call 0.9 s, time before the agent starts 1.0 s, the rest 0.6 s. Memory recall costs 0.1 to 0.2 s.
+
+Weak points found:
+
+- With memory on, the first turn makes an extra model call to save a memory. That doubles a 3-turn conversation.
+- About one new conversation in five waits 5 to 14 s before the agent starts.
+- About 8,000 prompt tokens per call as deployed, and no prompt cache hits.
+- Four conversations at once overload the single demo node. kagent answered 7 of 8 with a median of 56 s. AX answered 8 of 8 with a median of 19 s.
+
+The tooling is in `components/bench/`. The reading and the answer to "should we build on AX" are in ADR 0005 (`docs/decisions/0005-runtime-speed-kagent-vs-ax.md`).

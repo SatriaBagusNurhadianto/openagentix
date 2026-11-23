@@ -1,5 +1,7 @@
 # ADR 0001: Agent runtime for the MVP — kagent over Google AX
 
+> **Update, 2026-11-23:** the speed figures below were taken on an overloaded node. A repeat with traces found kagent as fast as AX or faster in sequential use. See [ADR 0005](0005-runtime-speed-kagent-vs-ax.md).
+
 - **Status:** Accepted for the MVP, confirmed after running the same agent on both runtimes. Revisit under the conditions in "When to revisit".
 - **Date:** 2026-11-22 (revised the same day; see "Revision history")
 - **Evidence:** `spikes/kagent/NOTES.md`, `spikes/ax/NOTES.md`, a source check of AX at commit `0b44e971`, and the same-flow measurements in `spikes/ax/compare/RESULTS.md`

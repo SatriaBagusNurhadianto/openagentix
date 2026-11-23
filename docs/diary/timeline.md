@@ -113,3 +113,18 @@ The dashboard is one static page and a script that port-forwards VictoriaMetrics
 
 Built and tested offline only: Go tests, chart render tests, a fake Prometheus API and a jsdom run of the page. It has not run on the cluster. The queries have not met a real VictoriaMetrics, and the label names of the upstream gateway series are taken from round 1 notes.
 
+## 2026-11-23: observability round 2 goes live, and the runtime speed test is repeated
+
+The dashboard queries were checked against the live cluster: 14 of 14 valid, 12 scrape targets up.
+
+The kagent versus AX speed test was repeated with traces and three kagent variants (as deployed, memory off, lean). AX was installed again for the test and removed afterwards.
+
+What was learned:
+- kagent is not slow. A plain question takes 2.5 to 2.9 s, against 3.4 s for the minimal AX loop and 7.6 s for AX with Claude Code. The 12 s of the first test came from an overloaded node.
+- Memory recall is cheap. Memory saving costs an extra model call in the first turn.
+- Some new conversations wait 5 to 14 s before the agent starts. The cause is not found yet.
+- No call reported a prompt cache read.
+- Four conversations at once pushed the node load to 89. Both runtimes did badly, kagent worse.
+- AX sandboxes cannot authenticate to our tool layer yet: AX refuses to send a token to a plain-HTTP service.
+- Decision record: ADR 0005. Recommendation: stay on kagent and tune it, keep AX as an optional second runtime.
+

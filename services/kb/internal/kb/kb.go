@@ -16,6 +16,7 @@ import (
 	"github.com/openagentix/openagentix/services/kb/internal/chunk"
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
 	"github.com/openagentix/openagentix/services/kb/internal/graph"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 )
 
@@ -66,6 +67,10 @@ type Service struct {
 	// MaxChunksPerDoc rejects documents that split into more chunks, before
 	// any embedding call. Zero selects DefaultMaxChunksPerDoc.
 	MaxChunksPerDoc int
+
+	// Metrics, when non-nil, counts ingests and searches. It never receives
+	// text, ids or collection names.
+	Metrics *obs.Metrics
 }
 
 // GraphOptions configures how Put plans graph extraction.
@@ -141,6 +146,31 @@ func validateSourceURI(raw string) error {
 // Put validates, chunks, embeds and upserts a document. It returns the number
 // of chunks stored. Repeating the call with the same input is idempotent.
 func (s *Service) Put(ctx context.Context, collection, id string, in DocInput) (int, error) {
+	n, err := s.put(ctx, collection, id, in)
+	s.Metrics.Ingest(outcomeOf(err, ctx))
+	return n, err
+}
+
+// outcomeOf names an error with a value from the closed set the metrics accept.
+func outcomeOf(err error, ctx context.Context) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, ErrInvalid):
+		return "invalid"
+	case errors.Is(err, ErrTooLarge):
+		return "too_large"
+	case errors.Is(err, ErrUpstream):
+		return "upstream_error"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	case errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled:
+		return "canceled"
+	}
+	return "error"
+}
+
+func (s *Service) put(ctx context.Context, collection, id string, in DocInput) (int, error) {
 	if err := ValidateCollection(collection); err != nil {
 		return 0, err
 	}
@@ -220,16 +250,25 @@ func (s *Service) Collections(ctx context.Context) ([]store.CollectionInfo, erro
 // Search returns ranked chunks. topK <= 0 selects DefaultTopK and values above
 // MaxTopK are clamped. If the embedder fails, search falls back to lexical.
 func (s *Service) Search(ctx context.Context, query, collection string, topK int) ([]store.Hit, error) {
+	start := time.Now()
+	hits, mode, err := s.search(ctx, query, collection, topK)
+	s.Metrics.Search(mode, outcomeOf(err, ctx), time.Since(start))
+	return hits, err
+}
+
+// search also reports the mode: "hybrid" when the query was embedded, else "lexical".
+func (s *Service) search(ctx context.Context, query, collection string, topK int) ([]store.Hit, string, error) {
+	mode := "lexical"
 	query = strings.TrimSpace(query)
 	if query == "" {
-		return nil, invalid("query must not be empty")
+		return nil, mode, invalid("query must not be empty")
 	}
 	if utf8.RuneCountInString(query) > MaxQueryChars {
-		return nil, invalid("query longer than %d characters", MaxQueryChars)
+		return nil, mode, invalid("query longer than %d characters", MaxQueryChars)
 	}
 	if collection != "" {
 		if err := ValidateCollection(collection); err != nil {
-			return nil, err
+			return nil, mode, err
 		}
 	}
 	if topK <= 0 {
@@ -244,9 +283,11 @@ func (s *Service) Search(ctx context.Context, query, collection string, topK int
 			s.Log.Warn("query embedding failed; falling back to lexical search", "err", err)
 		} else {
 			q.Embedding = v
+			mode = "hybrid"
 		}
 	}
-	return s.Store.Search(ctx, q)
+	hits, err := s.Store.Search(ctx, q)
+	return hits, mode, err
 }
 
 // Get returns a document, truncating its text at DocMaxChars characters.

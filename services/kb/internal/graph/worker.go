@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 )
 
@@ -36,6 +37,9 @@ type Options struct {
 	BackoffBase   time.Duration // delay after the first failed attempt, doubling; default 5s
 	BackoffMax    time.Duration // default 10m
 	Now           func() time.Time
+	// Metrics, when non-nil, counts job results, model calls, tokens and budget
+	// pauses. Only codes and counts: never document text, ids or collections.
+	Metrics *obs.Metrics
 }
 
 func (o *Options) defaults() {
@@ -89,14 +93,19 @@ func (w *Worker) Run(ctx context.Context) error {
 		if worked {
 			continue
 		}
-		if wait <= 0 {
+		budgetPause := wait > 0
+		if !budgetPause {
 			wait = w.opts.PollInterval
 		} else {
 			w.log.Info("extraction paused: hourly token budget used", "wait_s", int(wait.Seconds()), "tokens_per_hour", w.opts.TokensPerHour)
 		}
+		began := time.Now()
 		select {
 		case <-ctx.Done():
 		case <-time.After(wait):
+		}
+		if budgetPause {
+			w.opts.Metrics.GraphPaused(time.Since(began))
 		}
 	}
 	return ctx.Err()
@@ -132,6 +141,11 @@ func (w *Worker) run(ctx context.Context, job store.Job) {
 		if err := w.store.FailJob(ctx, job.JobKey, code, retryIn, final); err != nil && !errors.Is(err, store.ErrJobGone) && ctx.Err() == nil {
 			log.Error("recording a failed extraction failed", "code", CodeStore)
 		}
+		if final {
+			w.opts.Metrics.GraphJob("failed")
+		} else {
+			w.opts.Metrics.GraphJob("retry")
+		}
 		log.Warn("extraction failed", "code", code, "final", final, "retry_in_s", int(retryIn.Seconds()), "duration_ms", time.Since(start).Milliseconds())
 	}
 
@@ -154,18 +168,22 @@ func (w *Worker) run(ctx context.Context, job store.Job) {
 
 	ex, usage, err := w.extractor.Extract(ctx, win)
 	w.budget.add(w.opts.Now(), usage.Tokens)
+	w.opts.Metrics.GraphTokens(usage.Tokens)
 	if err != nil {
 		if ctx.Err() != nil {
 			return // shutting down: leave the lease to expire
 		}
 		var ee *Error
 		if errors.As(err, &ee) {
+			w.opts.Metrics.GraphModelCall("error", ee.Code)
 			fail(ee.Code, ee.Retryable, ee.RetryAfter)
 		} else {
+			w.opts.Metrics.GraphModelCall("error", CodeTransport)
 			fail(CodeTransport, true, 0)
 		}
 		return
 	}
+	w.opts.Metrics.GraphModelCall("ok", "")
 
 	w.embedNames(ctx, log, ex.Entities)
 	err = w.store.ApplyExtraction(ctx, store.ExtractionResult{
@@ -173,6 +191,7 @@ func (w *Worker) run(ctx context.Context, job store.Job) {
 	})
 	switch {
 	case errors.Is(err, store.ErrJobGone):
+		w.opts.Metrics.GraphJob("discarded")
 		log.Info("extraction result discarded: the job is gone", "duration_ms", time.Since(start).Milliseconds())
 		return
 	case ctx.Err() != nil:
@@ -181,6 +200,7 @@ func (w *Worker) run(ctx context.Context, job store.Job) {
 		fail(CodeStore, true, 0)
 		return
 	}
+	w.opts.Metrics.GraphJob("done")
 	log.Info("extraction done", "entities", len(ex.Entities), "relations", len(ex.Relations),
 		"dropped_entities", ex.Stats.EntitiesDropped, "dropped_relations", ex.Stats.RelationsDropped,
 		"tokens", usage.Tokens, "duration_ms", time.Since(start).Milliseconds())

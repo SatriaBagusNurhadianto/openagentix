@@ -15,6 +15,7 @@ import (
 	"github.com/openagentix/openagentix/services/kb/internal/config"
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
 	"github.com/openagentix/openagentix/services/kb/internal/mcpserver"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 )
 
 // Deps are everything the HTTP layer needs.
@@ -23,12 +24,14 @@ type Deps struct {
 	Cfg     config.Config
 	Log     *slog.Logger
 	Version string
+	// Metrics, when non-nil, counts requests and tool calls. It is exposed on its own listener (RunMetrics), never here.
+	Metrics *obs.Metrics
 }
 
 // Handler builds the full handler: /mcp, /v1/*, /healthz, /readyz.
 func Handler(d Deps) http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version, Timeout: d.Cfg.RequestTimeout}))
+	mux.Handle("/mcp", mcpserver.New(d.Svc, d.Log, mcpserver.Options{Stateless: d.Cfg.MCPStateless, Version: d.Version, Timeout: d.Cfg.RequestTimeout, Metrics: d.Metrics}))
 	mux.Handle("/v1/", api.New(d.Svc, api.Config{
 		AdminToken: d.Cfg.AdminToken, AllowAnonymous: d.Cfg.AdminAllowAnonymous, MaxBodyBytes: d.Cfg.MaxBodyBytes,
 	}, d.Log))
@@ -47,7 +50,38 @@ func Handler(d Deps) http.Handler {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = w.Write([]byte("ready\n"))
 	})
-	return recoverer(d.Log, accessLog(d.Log, requestTimeout(d.Cfg.RequestTimeout, d.Cfg.IngestTimeout, mux)))
+	return recoverer(d.Log, accessLog(d.Log, requestTimeout(d.Cfg.RequestTimeout, d.Cfg.IngestTimeout, httpMetrics(d.Metrics, mux))))
+}
+
+// httpMetrics counts requests by the matched route template, never the raw
+// path. It wraps the mux directly so the mux sets Request.Pattern on the very
+// request value read here afterwards.
+func httpMetrics(m *obs.Metrics, next http.Handler) http.Handler {
+	if m == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w}
+		next.ServeHTTP(sw, r)
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		m.HTTP(routeOf(r.Pattern), r.Method, status, time.Since(start))
+	})
+}
+
+// routeOf strips the method from a ServeMux pattern ("PUT /v1/x/{id}" -> "/v1/x/{id}").
+// The catch-all "/v1/" pattern means no API route matched.
+func routeOf(pattern string) string {
+	if _, p, ok := strings.Cut(pattern, " "); ok {
+		pattern = p
+	}
+	if pattern == "/v1/" {
+		return ""
+	}
+	return pattern
 }
 
 type statusWriter struct {
@@ -150,6 +184,38 @@ func Run(ctx context.Context, d Deps, ln net.Listener) error {
 	if err := srv.Shutdown(sctx); err != nil {
 		_ = srv.Close()
 		return err
+	}
+	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
+}
+
+// RunMetrics serves GET /metrics on ln, and nothing else, until ctx is
+// cancelled. It carries no authentication: bind it to a pod-local or cluster
+// network port that a NetworkPolicy opens only to the scraper.
+func RunMetrics(ctx context.Context, m *obs.Metrics, ln net.Listener, grace time.Duration) error {
+	srv := &http.Server{
+		Handler:           m.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	errc := make(chan error, 1)
+	go func() { errc <- srv.Serve(ln) }()
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+	}
+	if grace <= 0 {
+		grace = time.Second
+	}
+	sctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if err := srv.Shutdown(sctx); err != nil {
+		_ = srv.Close()
 	}
 	if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err

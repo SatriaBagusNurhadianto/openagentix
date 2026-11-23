@@ -20,6 +20,7 @@ import (
 	"github.com/openagentix/openagentix/services/kb/internal/config"
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 	"github.com/openagentix/openagentix/services/kb/internal/store/memory"
 )
@@ -337,5 +338,65 @@ func TestMCPToolCallHonoursRequestDeadline(t *testing.T) {
 	}
 	if err == nil && !res.IsError {
 		t.Fatalf("expected an error result, got %+v", res)
+	}
+}
+
+func TestHTTPMetricsUseRouteTemplatesAndNeverRawPaths(t *testing.T) {
+	m := obs.New("test")
+	d := deps(memory.New(0), config.Config{AdminToken: "tok"}, io.Discard)
+	d.Metrics = m
+	d.Svc.Metrics = m
+	h := Handler(d)
+	get(h, "GET", "/healthz")
+	get(h, "GET", "/v1/collections")                                  // 401, templated route
+	get(h, "PUT", "/v1/collections/canary-coll/documents/canary-doc") // 401: still the template
+	get(h, "GET", "/no/such/canary-path")
+	get(h, "GET", "/metrics") // the API listener must not serve metrics
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	out := rec.Body.String()
+	for _, want := range []string{
+		`openagentix_kb_http_requests_total{route="/healthz",method="GET",status_class="2xx"} 1`,
+		`openagentix_kb_http_requests_total{route="/v1/collections",method="GET",status_class="4xx"} 1`,
+		`openagentix_kb_http_requests_total{route="/v1/collections/{collection}/documents/{id}",method="PUT",status_class="4xx"} 1`,
+		`openagentix_kb_http_requests_total{route="unmatched",method="GET",status_class="4xx"} 2`,
+		`openagentix_kb_http_request_duration_seconds_count{route="/healthz",method="GET"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "canary") {
+		t.Errorf("raw path leaked into metrics:\n%s", out)
+	}
+	if rec := get(h, "GET", "/metrics"); rec.Code != 404 {
+		t.Fatalf("the API listener serves /metrics: %d", rec.Code)
+	}
+}
+
+func TestMetricsServerServesOnlyMetrics(t *testing.T) {
+	m := obs.New("test")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RunMetrics(ctx, m, ln, time.Second) }()
+	base := "http://" + ln.Addr().String()
+	for path, want := range map[string]int{"/metrics": 200, "/v1/collections": 404, "/mcp": 404, "/healthz": 404, "/": 404} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunMetrics returned %v", err)
 	}
 }

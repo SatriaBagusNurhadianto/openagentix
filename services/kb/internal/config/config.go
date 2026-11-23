@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -40,6 +41,13 @@ type Config struct {
 	QueryEmbedTimeout time.Duration // bound on the query-time embedding call
 	IngestTimeout     time.Duration // request deadline of PUT /v1/.../documents/...
 	MaxChunksPerDoc   int           // reject larger documents before embedding
+
+	// MetricsAddr, when set, is the listen address of the separate Prometheus
+	// listener (GET /metrics only, no authentication). Empty means no metrics.
+	MetricsAddr string
+	// MetricsCollectionLabels adds the operator-chosen collection name as a label
+	// on the graph size gauges. Off by default: names are unbounded.
+	MetricsCollectionLabels bool
 
 	Graph GraphConfig
 }
@@ -180,6 +188,9 @@ func Load(getenv func(string) string) (Config, error) {
 	default:
 		return c, fmt.Errorf("KB_MCP_STATELESS: must be true or false, got %q", v)
 	}
+	if err := loadMetrics(getenv, &c); err != nil {
+		return c, err
+	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
@@ -218,6 +229,30 @@ func Load(getenv func(string) string) (Config, error) {
 		return c, err
 	}
 	return c, nil
+}
+
+func loadMetrics(getenv func(string) string, c *Config) error {
+	c.MetricsAddr = getenv("KB_METRICS_ADDR")
+	if c.MetricsAddr != "" {
+		_, port, err := net.SplitHostPort(c.MetricsAddr)
+		if err != nil || port == "" {
+			return fmt.Errorf("KB_METRICS_ADDR: %q must be host:port or :port", c.MetricsAddr)
+		}
+		if c.MetricsAddr == c.Addr && port != "0" { // port 0 picks a free port each, so two of them never collide
+			return fmt.Errorf("KB_METRICS_ADDR: %q must differ from KB_ADDR (metrics are served on their own listener)", c.MetricsAddr)
+		}
+	}
+	switch v := getenv("KB_METRICS_COLLECTION_LABELS"); v {
+	case "", "false":
+	case "true":
+		if c.MetricsAddr == "" {
+			return fmt.Errorf("KB_METRICS_COLLECTION_LABELS=true requires KB_METRICS_ADDR")
+		}
+		c.MetricsCollectionLabels = true
+	default:
+		return fmt.Errorf("KB_METRICS_COLLECTION_LABELS: must be true or false, got %q", v)
+	}
+	return nil
 }
 
 func loadGraph(getenv func(string) string, g *GraphConfig) error {
@@ -275,7 +310,7 @@ func (c Config) LogAttrs() []any {
 		"max_chunks_per_doc", c.MaxChunksPerDoc, "ingest_timeout", c.IngestTimeout.String(),
 		"query_embed_timeout", c.QueryEmbedTimeout.String(),
 		"embeddings", c.EmbeddingsEnabled(), "embeddings_model", c.EmbeddingsModel, "embeddings_dim", c.EmbeddingsDim,
-		"graph", c.Graph.Enabled, "graph_extract_model", c.Graph.ExtractModel, "graph_prompt_version", c.Graph.PromptVersion,
+		"metrics_addr", c.MetricsAddr, "graph", c.Graph.Enabled, "graph_extract_model", c.Graph.ExtractModel, "graph_prompt_version", c.Graph.PromptVersion,
 		"graph_window_chars", c.Graph.WindowChars, "graph_tokens_per_hour", c.Graph.TokensPerHour,
 	}
 }

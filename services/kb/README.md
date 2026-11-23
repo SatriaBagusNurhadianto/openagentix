@@ -123,6 +123,8 @@ All routes need `Authorization: Bearer $KB_ADMIN_TOKEN`.
 | `KB_INGEST_TIMEOUT` | `120s` | deadline for `PUT /v1/.../documents/...`, which embeds many chunks in sequential batches |
 | `KB_SHUTDOWN_GRACE` | `25s` | time to drain in-flight requests on SIGTERM |
 | `KB_MCP_STATELESS` | `true` | no MCP sessions, so any replica can answer any request |
+| `KB_METRICS_ADDR` | empty (off) | listen address of a separate Prometheus listener that serves only `GET /metrics`, without authentication; must differ from `KB_ADDR`. Counts and timings with closed label sets, never text, ids or collection names |
+| `KB_METRICS_COLLECTION_LABELS` | `false` | `true` labels the graph size gauges with the collection name (capped at 50; names are operator-chosen). Needs `KB_METRICS_ADDR` |
 | `KB_EMBEDDINGS_URL` | | OpenAI-compatible endpoint or base URL (`.../v1` gets `/embeddings` appended). Unset = lexical only |
 | `KB_EMBEDDINGS_MODEL` | | model name; required with the URL |
 | `KB_EMBEDDINGS_DIM` | | vector dimension; required with the URL (1 to 2000: pgvector's HNSW index on `vector` supports at most 2000 dimensions, so larger models need a smaller output dimension, e.g. OpenAI `dimensions`) |

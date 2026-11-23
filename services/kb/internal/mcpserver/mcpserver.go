@@ -13,6 +13,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 )
 
@@ -25,6 +26,8 @@ type Options struct {
 	// Timeout bounds every tool call. The SDK does not hand the HTTP request's deadline to tool handlers, so the
 	// server-wide request timeout has to be applied here too; zero means no bound.
 	Timeout time.Duration
+	// Metrics, when non-nil, counts tool calls by tool and outcome. Never arguments or results.
+	Metrics *obs.Metrics
 }
 
 // SearchInput is the kb_search argument object.
@@ -90,7 +93,7 @@ func New(svc *kb.Service, log *slog.Logger, opts Options) http.Handler {
 	if opts.Version == "" {
 		opts.Version = "dev"
 	}
-	h := &handlers{svc: svc, log: log, timeout: opts.Timeout}
+	h := &handlers{svc: svc, log: log, timeout: opts.Timeout, metrics: opts.Metrics}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "openagentix-kb", Title: "OpenAgentix Knowledge Base", Version: opts.Version}, &mcp.ServerOptions{
 		Instructions: "Search the organisation's knowledge base. Use kb_search to find relevant passages, then kb_get_document for the full text of a document. Cite the source URI when you use a passage.",
 	})
@@ -124,6 +127,24 @@ type handlers struct {
 	svc     *kb.Service
 	log     *slog.Logger
 	timeout time.Duration
+	metrics *obs.Metrics
+}
+
+// toolOutcome names a tool error with a value from the closed set the metrics accept.
+func toolOutcome(err error) string {
+	switch {
+	case err == nil:
+		return "ok"
+	case errors.Is(err, kb.ErrInvalid):
+		return "invalid"
+	case errors.Is(err, store.ErrNotFound):
+		return "not_found"
+	case errors.Is(err, store.ErrAmbiguous):
+		return "ambiguous"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "timeout"
+	}
+	return "error"
 }
 
 // bound derives the context of one tool call.
@@ -139,6 +160,7 @@ func (h *handlers) bound(ctx context.Context) (context.Context, context.CancelFu
 func (h *handlers) done(tool string, start time.Time, n int, err error) error {
 	attrs := []any{"tool", tool, "duration_ms", time.Since(start).Milliseconds(), "results", n, "is_error", err != nil}
 	h.log.Info("tool call", attrs...)
+	h.metrics.ToolCall(tool, toolOutcome(err), time.Since(start))
 	if err == nil {
 		return nil
 	}

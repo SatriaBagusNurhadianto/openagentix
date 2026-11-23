@@ -264,3 +264,24 @@ func TestGraphKeyIsNeverLogged(t *testing.T) {
 		t.Fatal("Graph prints its API key")
 	}
 }
+
+func TestMetricsConfig(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil || c.MetricsAddr != "" || c.MetricsCollectionLabels {
+		t.Fatalf("metrics must be off by default: %+v %v", c, err)
+	}
+	c, err = Load(env(map[string]string{"KB_METRICS_ADDR": ":9090", "KB_METRICS_COLLECTION_LABELS": "true"}))
+	if err != nil || c.MetricsAddr != ":9090" || !c.MetricsCollectionLabels {
+		t.Fatalf("%+v %v", c, err)
+	}
+	for want, m := range map[string]map[string]string{
+		"KB_METRICS_ADDR":              {"KB_METRICS_ADDR": "nine-thousand"},
+		"must differ from KB_ADDR":     {"KB_METRICS_ADDR": ":8080"},
+		"KB_METRICS_COLLECTION_LABELS": {"KB_METRICS_COLLECTION_LABELS": "yes"},
+		"requires KB_METRICS_ADDR":     {"KB_METRICS_COLLECTION_LABELS": "true"},
+	} {
+		if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v", want, err)
+		}
+	}
+}

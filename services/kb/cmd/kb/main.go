@@ -12,12 +12,14 @@ import (
 	"os/signal"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/openagentix/openagentix/services/kb/internal/chunk"
 	"github.com/openagentix/openagentix/services/kb/internal/config"
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
 	"github.com/openagentix/openagentix/services/kb/internal/graph"
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
+	"github.com/openagentix/openagentix/services/kb/internal/obs"
 	"github.com/openagentix/openagentix/services/kb/internal/server"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 	"github.com/openagentix/openagentix/services/kb/internal/store/memory"
@@ -26,6 +28,9 @@ import (
 
 // version is stamped at build time with -ldflags "-X main.version=...".
 var version = "dev"
+
+// onMetricsListen, if set (tests), receives the bound address of the metrics listener.
+var onMetricsListen func(addr string)
 
 func main() {
 	level := slog.LevelInfo
@@ -49,6 +54,10 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	if err != nil {
 		return fmt.Errorf("invalid configuration: %w", err)
 	}
+	var m *obs.Metrics // nil unless KB_METRICS_ADDR is set: every call on it is a no-op
+	if cfg.MetricsAddr != "" {
+		m = obs.New(version)
+	}
 	var embedder embed.Embedder = embed.None{}
 	if cfg.EmbeddingsEnabled() {
 		embedder, err = embed.NewOpenAI(embed.OpenAIConfig{
@@ -58,6 +67,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 		if err != nil {
 			return fmt.Errorf("embeddings: %w", err)
 		}
+		embedder = obs.WrapEmbedder(embedder, m)
 	}
 	var st store.Store
 	switch cfg.Store {
@@ -76,6 +86,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 		Chunk:       chunk.Options{MaxChars: cfg.ChunkMaxChars, Overlap: cfg.ChunkOverlap},
 		DocMaxChars: cfg.DocMaxChars, Log: log,
 		QueryEmbedTimeout: cfg.QueryEmbedTimeout, MaxChunksPerDoc: cfg.MaxChunksPerDoc,
+		Metrics: m,
 	}
 	if cfg.Graph.Enabled {
 		svc.Graph = &kb.GraphOptions{WindowChars: cfg.Graph.WindowChars, PromptVersion: cfg.Graph.PromptVersion, MaxHops: cfg.Graph.MaxHops}
@@ -87,8 +98,9 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 			return fmt.Errorf("graph extraction: %w", err)
 		}
 		worker := graph.NewWorker(st, extractor, embedder, log, graph.Options{
-			PromptVersion: cfg.Graph.PromptVersion, TokensPerHour: cfg.Graph.TokensPerHour,
+			PromptVersion: cfg.Graph.PromptVersion, TokensPerHour: cfg.Graph.TokensPerHour, Metrics: m,
 		})
+		svc.RegisterGraphGauges(m, kb.GraphGaugeOptions{PerCollection: cfg.MetricsCollectionLabels})
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() { defer wg.Done(); _ = worker.Run(ctx) }()
@@ -105,5 +117,26 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	if onListen != nil {
 		onListen(ln.Addr().String())
 	}
-	return server.Run(ctx, server.Deps{Svc: svc, Cfg: cfg, Log: log, Version: version}, ln)
+	if m != nil {
+		mln, err := net.Listen("tcp", cfg.MetricsAddr)
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("metrics listen: %w", err)
+		}
+		log.Info("metrics listening", "listen", mln.Addr().String())
+		if onMetricsListen != nil {
+			onMetricsListen(mln.Addr().String())
+		}
+		var mwg sync.WaitGroup
+		mctx, mstop := context.WithCancel(ctx)
+		mwg.Add(1)
+		go func() {
+			defer mwg.Done()
+			if err := server.RunMetrics(mctx, m, mln, time.Second); err != nil {
+				log.Error("metrics listener stopped", "err", err)
+			}
+		}()
+		defer func() { mstop(); mwg.Wait() }()
+	}
+	return server.Run(ctx, server.Deps{Svc: svc, Cfg: cfg, Log: log, Version: version, Metrics: m}, ln)
 }

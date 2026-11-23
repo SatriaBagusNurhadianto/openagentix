@@ -5,11 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -21,7 +23,7 @@ import (
 func envFn(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 
 // start runs the service and returns its base URL and a stop func that waits for exit.
-func start(t *testing.T, env map[string]string, logs *bytes.Buffer) (string, func() error) {
+func start(t *testing.T, env map[string]string, logs io.Writer) (string, func() error) {
 	t.Helper()
 	if env["KB_ADDR"] == "" {
 		env["KB_ADDR"] = "127.0.0.1:0"
@@ -189,5 +191,124 @@ func TestPostgresEndToEnd(t *testing.T) {
 	}
 	if err := stop(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// lockedBuf is a log sink that tests can read while the service still writes.
+type lockedBuf struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *lockedBuf) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+func (l *lockedBuf) String() string { l.mu.Lock(); defer l.mu.Unlock(); return l.b.String() }
+
+func put(t *testing.T, base, id, text string) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"title": id, "text": text})
+	req, _ := http.NewRequest("PUT", base+"/v1/collections/ops/documents/"+id, bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer t")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("ingest: %v %v", err, resp)
+	}
+	resp.Body.Close()
+}
+
+const graphDoc = "The Checkout service calls the Payments service for every order."
+
+// fakeExtractGateway answers chat completions with one entity pair and counts the calls.
+func fakeExtractGateway(t *testing.T, hold <-chan struct{}) (*httptest.Server, *atomic.Int32, *atomic.Value) {
+	t.Helper()
+	var calls atomic.Int32
+	var auth atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		auth.Store(r.Header.Get("Authorization"))
+		if hold != nil {
+			<-hold
+		}
+		content, _ := json.Marshal(map[string]any{
+			"entities": []map[string]string{{"name": "Checkout service", "type": "service"}, {"name": "Payments service", "type": "service"}},
+			"relations": []map[string]string{{"source": "Checkout service", "predicate": "calls", "target": "Payments service",
+				"evidence": "The Checkout service calls the Payments service for every order."}},
+		})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []any{map[string]any{"message": map[string]any{"content": string(content)}}},
+			"usage":   map[string]any{"total_tokens": 300},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &calls, &auth
+}
+
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timeout waiting for %s", what)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestGraphEnabledExtractsInTheBackgroundAndOnlyOnce(t *testing.T) {
+	hold := make(chan struct{})
+	gw, calls, auth := fakeExtractGateway(t, hold)
+	logs := &lockedBuf{}
+	base, stop := start(t, map[string]string{
+		"KB_ADMIN_TOKEN": "t", "KB_GRAPH_ENABLED": "true", "KB_GRAPH_EXTRACT_MODEL": "extract-default",
+		"KB_GRAPH_GATEWAY_URL": gw.URL + "/v1", "KB_GRAPH_API_KEY": "gw-key-xyz",
+	}, logs)
+	// The model call is held, yet the ingest request has to return.
+	put(t, base, "d1", graphDoc)
+	waitFor(t, "the extraction call", func() bool { return calls.Load() == 1 })
+	close(hold)
+	waitFor(t, "the job to finish", func() bool { return strings.Contains(logs.String(), "extraction done") })
+	if auth.Load() != "Bearer gw-key-xyz" {
+		t.Fatalf("auth = %v", auth.Load())
+	}
+	put(t, base, "d1", graphDoc) // identical content
+	time.Sleep(300 * time.Millisecond)
+	if calls.Load() != 1 {
+		t.Fatalf("model calls after an identical re-ingest = %d, want 1", calls.Load())
+	}
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	for _, leak := range []string{"gw-key-xyz", "Checkout service", "calls the Payments"} {
+		if strings.Contains(logs.String(), leak) {
+			t.Fatalf("logs leak %q:\n%s", leak, logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), `"graph":true`) {
+		t.Fatalf("startup summary misses the graph switch:\n%s", logs.String())
+	}
+}
+
+func TestGraphDisabledStartsNoWorkerAndMakesNoCalls(t *testing.T) {
+	gw, calls, _ := fakeExtractGateway(t, nil)
+	logs := &lockedBuf{}
+	base, stop := start(t, map[string]string{"KB_ADMIN_TOKEN": "t"}, logs)
+	put(t, base, "d1", graphDoc)
+	time.Sleep(300 * time.Millisecond)
+	if err := stop(); err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("model calls with the graph off = %d", calls.Load())
+	}
+	// Settings for the gateway without the switch are refused, not ignored.
+	err := run(context.Background(), envFn(map[string]string{"KB_GRAPH_GATEWAY_URL": gw.URL}), slog.New(slog.NewJSONHandler(&bytes.Buffer{}, nil)), nil)
+	if err == nil || !strings.Contains(err.Error(), "KB_GRAPH_ENABLED") {
+		t.Fatalf("err = %v", err)
+	}
+	if strings.Contains(logs.String(), "extraction") {
+		t.Fatalf("graph log lines with the graph off:\n%s", logs.String())
 	}
 }

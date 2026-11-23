@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"strconv"
 	"time"
@@ -39,7 +40,43 @@ type Config struct {
 	QueryEmbedTimeout time.Duration // bound on the query-time embedding call
 	IngestTimeout     time.Duration // request deadline of PUT /v1/.../documents/...
 	MaxChunksPerDoc   int           // reject larger documents before embedding
+
+	Graph GraphConfig
 }
+
+// Secret is a string that prints as "[redacted]" with every fmt verb that
+// calls String, so it cannot reach a log line by accident.
+type Secret string
+
+func (Secret) String() string { return "[redacted]" }
+
+// GraphConfig holds the knowledge-graph (entity and relation extraction)
+// settings. The graph is off by default; the other fields only matter when
+// Enabled is set. APIKey must never be logged.
+type GraphConfig struct {
+	Enabled               bool
+	ExtractModel          string // model alias on the gateway
+	GatewayURL            string // OpenAI-compatible base URL
+	APIKey                Secret
+	WindowChars           int // extraction window size
+	MaxEntitiesPerChunk   int // entity cap per window is this times its chunks
+	MaxRelationsPerWindow int
+	TokensPerHour         int // budget for extraction calls, from the usage in responses
+	MaxHops               int // longest traversal queries may ask for, 1..3
+	PromptVersion         string
+}
+
+// Graph defaults.
+const (
+	DefaultGraphWindowChars           = 2400
+	DefaultGraphMaxEntitiesPerChunk   = 12
+	DefaultGraphMaxRelationsPerWindow = 30
+	DefaultGraphTokensPerHour         = 300000
+	DefaultGraphMaxHops               = 3
+	DefaultGraphPromptVersion         = "v1"
+)
+
+var promptVersionRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,32}$`)
 
 // EmbeddingsEnabled reports whether an embedder is configured.
 func (c Config) EmbeddingsEnabled() bool { return c.EmbeddingsURL != "" }
@@ -77,6 +114,12 @@ func Load(getenv func(string) string) (Config, error) {
 		QueryEmbedTimeout: 3 * time.Second,
 		IngestTimeout:     120 * time.Second,
 		MaxChunksPerDoc:   2000,
+	}
+	c.Graph = GraphConfig{
+		ExtractModel: getenv("KB_GRAPH_EXTRACT_MODEL"), GatewayURL: getenv("KB_GRAPH_GATEWAY_URL"), APIKey: Secret(getenv("KB_GRAPH_API_KEY")),
+		WindowChars: DefaultGraphWindowChars, MaxEntitiesPerChunk: DefaultGraphMaxEntitiesPerChunk,
+		MaxRelationsPerWindow: DefaultGraphMaxRelationsPerWindow, TokensPerHour: DefaultGraphTokensPerHour,
+		MaxHops: DefaultGraphMaxHops, PromptVersion: orDefault(getenv("KB_GRAPH_PROMPT_VERSION"), DefaultGraphPromptVersion),
 	}
 	var err error
 	if c.RequestTimeout, err = duration(getenv, "KB_REQUEST_TIMEOUT", c.RequestTimeout, false); err != nil {
@@ -171,7 +214,55 @@ func Load(getenv func(string) string) (Config, error) {
 	} else if c.EmbeddingsModel != "" || c.EmbeddingsDim != 0 || c.EmbeddingsAPIKey != "" {
 		return c, fmt.Errorf("KB_EMBEDDINGS_URL is required when other KB_EMBEDDINGS_* settings are set")
 	}
+	if err := loadGraph(getenv, &c.Graph); err != nil {
+		return c, err
+	}
 	return c, nil
+}
+
+func loadGraph(getenv func(string) string, g *GraphConfig) error {
+	switch v := getenv("KB_GRAPH_ENABLED"); v {
+	case "", "false":
+	case "true":
+		g.Enabled = true
+	default:
+		return fmt.Errorf("KB_GRAPH_ENABLED: must be true or false, got %q", v)
+	}
+	if !g.Enabled {
+		if g.ExtractModel != "" || g.GatewayURL != "" || g.APIKey != "" {
+			return fmt.Errorf("KB_GRAPH_ENABLED=true is required when other KB_GRAPH_* settings are set")
+		}
+		return nil
+	}
+	var err error
+	if g.WindowChars, err = positiveInt(getenv, "KB_GRAPH_WINDOW_CHARS", g.WindowChars); err != nil {
+		return err
+	}
+	if g.MaxEntitiesPerChunk, err = positiveInt(getenv, "KB_GRAPH_MAX_ENTITIES_PER_CHUNK", g.MaxEntitiesPerChunk); err != nil {
+		return err
+	}
+	if g.MaxRelationsPerWindow, err = positiveInt(getenv, "KB_GRAPH_MAX_RELATIONS_PER_WINDOW", g.MaxRelationsPerWindow); err != nil {
+		return err
+	}
+	if g.TokensPerHour, err = positiveInt(getenv, "KB_GRAPH_TOKENS_PER_HOUR", g.TokensPerHour); err != nil {
+		return err
+	}
+	if g.MaxHops, err = positiveInt(getenv, "KB_GRAPH_MAX_HOPS", g.MaxHops); err != nil {
+		return err
+	}
+	if g.MaxHops > 3 {
+		return fmt.Errorf("KB_GRAPH_MAX_HOPS: %d exceeds the maximum of 3", g.MaxHops)
+	}
+	if !promptVersionRe.MatchString(g.PromptVersion) {
+		return fmt.Errorf("KB_GRAPH_PROMPT_VERSION: %q must match %s", g.PromptVersion, promptVersionRe)
+	}
+	if g.ExtractModel == "" {
+		return fmt.Errorf("KB_GRAPH_EXTRACT_MODEL is required when KB_GRAPH_ENABLED=true")
+	}
+	if u, perr := url.Parse(g.GatewayURL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("KB_GRAPH_GATEWAY_URL: must be an http(s) URL when KB_GRAPH_ENABLED=true")
+	}
+	return nil
 }
 
 // LogAttrs returns slog key/value pairs describing the configuration with all
@@ -184,6 +275,8 @@ func (c Config) LogAttrs() []any {
 		"max_chunks_per_doc", c.MaxChunksPerDoc, "ingest_timeout", c.IngestTimeout.String(),
 		"query_embed_timeout", c.QueryEmbedTimeout.String(),
 		"embeddings", c.EmbeddingsEnabled(), "embeddings_model", c.EmbeddingsModel, "embeddings_dim", c.EmbeddingsDim,
+		"graph", c.Graph.Enabled, "graph_extract_model", c.Graph.ExtractModel, "graph_prompt_version", c.Graph.PromptVersion,
+		"graph_window_chars", c.Graph.WindowChars, "graph_tokens_per_hour", c.Graph.TokensPerHour,
 	}
 }
 

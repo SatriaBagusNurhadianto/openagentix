@@ -15,6 +15,7 @@ import (
 
 	"github.com/openagentix/openagentix/services/kb/internal/chunk"
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
+	"github.com/openagentix/openagentix/services/kb/internal/graph"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
 )
 
@@ -58,9 +59,19 @@ type Service struct {
 	// fallback. Zero selects DefaultQueryEmbedTimeout.
 	QueryEmbedTimeout time.Duration
 
+	// Graph, when non-nil, makes Put queue entity and relation extraction for
+	// the document. It never waits for it: a graph.Worker does the extraction.
+	Graph *GraphOptions
+
 	// MaxChunksPerDoc rejects documents that split into more chunks, before
 	// any embedding call. Zero selects DefaultMaxChunksPerDoc.
 	MaxChunksPerDoc int
+}
+
+// GraphOptions configures how Put plans graph extraction.
+type GraphOptions struct {
+	WindowChars   int    // extraction window size in characters
+	PromptVersion string // jobs of another version are redone
 }
 
 // DocInput is the writable part of a document.
@@ -179,6 +190,11 @@ func (s *Service) Put(ctx context.Context, collection, id string, in DocInput) (
 	doc := store.Document{Collection: collection, ID: id, Title: in.Title, SourceURI: in.SourceURI, Text: in.Text}
 	if err := s.Store.UpsertDocument(ctx, doc, chunks); err != nil {
 		return 0, err
+	}
+	if s.Graph != nil {
+		if _, err := graph.Enqueue(ctx, s.Store, collection, id, pieces, s.Graph.WindowChars, s.Graph.PromptVersion); err != nil {
+			return 0, fmt.Errorf("queueing graph extraction: %w", err)
+		}
 	}
 	return len(chunks), nil
 }

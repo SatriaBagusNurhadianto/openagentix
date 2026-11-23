@@ -10,11 +10,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 
 	"github.com/openagentix/openagentix/services/kb/internal/chunk"
 	"github.com/openagentix/openagentix/services/kb/internal/config"
 	"github.com/openagentix/openagentix/services/kb/internal/embed"
+	"github.com/openagentix/openagentix/services/kb/internal/graph"
 	"github.com/openagentix/openagentix/services/kb/internal/kb"
 	"github.com/openagentix/openagentix/services/kb/internal/server"
 	"github.com/openagentix/openagentix/services/kb/internal/store"
@@ -60,7 +62,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	var st store.Store
 	switch cfg.Store {
 	case "postgres":
-		st, err = postgres.Open(ctx, postgres.Options{URL: cfg.DatabaseURL, Schema: cfg.DBSchema, VectorDim: embedder.Dimensions()})
+		st, err = postgres.Open(ctx, postgres.Options{URL: cfg.DatabaseURL, Schema: cfg.DBSchema, VectorDim: embedder.Dimensions(), Graph: cfg.Graph.Enabled})
 		if err != nil {
 			return fmt.Errorf("postgres store: %w", err)
 		}
@@ -74,6 +76,23 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 		Chunk:       chunk.Options{MaxChars: cfg.ChunkMaxChars, Overlap: cfg.ChunkOverlap},
 		DocMaxChars: cfg.DocMaxChars, Log: log,
 		QueryEmbedTimeout: cfg.QueryEmbedTimeout, MaxChunksPerDoc: cfg.MaxChunksPerDoc,
+	}
+	if cfg.Graph.Enabled {
+		svc.Graph = &kb.GraphOptions{WindowChars: cfg.Graph.WindowChars, PromptVersion: cfg.Graph.PromptVersion}
+		extractor, err := graph.NewGateway(graph.GatewayConfig{
+			BaseURL: cfg.Graph.GatewayURL, Model: cfg.Graph.ExtractModel, APIKey: string(cfg.Graph.APIKey),
+			Limits: graph.Limits{MaxEntities: cfg.Graph.MaxEntitiesPerChunk, MaxRelations: cfg.Graph.MaxRelationsPerWindow},
+		})
+		if err != nil {
+			return fmt.Errorf("graph extraction: %w", err)
+		}
+		worker := graph.NewWorker(st, extractor, embedder, log, graph.Options{
+			PromptVersion: cfg.Graph.PromptVersion, TokensPerHour: cfg.Graph.TokensPerHour,
+		})
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = worker.Run(ctx) }()
+		defer wg.Wait() // runs before st.Close: the worker never touches a closed store
 	}
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {

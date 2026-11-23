@@ -321,3 +321,65 @@ func TestPutContextExpiryDuringEmbeddingIsNotUpstreamError(t *testing.T) {
 		t.Fatalf("err = %v, want the context error (not ErrUpstream)", err)
 	}
 }
+
+func graphSvc() *Service {
+	s := newSvc(embed.None{})
+	s.Graph = &GraphOptions{WindowChars: 100, PromptVersion: "v1"}
+	return s
+}
+
+func pendingJobs(t *testing.T, s *Service, coll string) store.GraphStats {
+	t.Helper()
+	st, err := s.Store.GraphStats(context.Background(), coll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+func TestPutEnqueuesExtractionOnlyWhenGraphIsOn(t *testing.T) {
+	ctx := context.Background()
+	text := "Alpha service calls Beta service.\n\nBeta service is owned by the Core team and runs in Frankfurt."
+	off := newSvc(embed.None{})
+	if _, err := off.Put(ctx, "docs", "d", DocInput{Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	if st := pendingJobs(t, off, "docs"); st.JobsPending != 0 {
+		t.Fatalf("graph off but jobs queued: %+v", st)
+	}
+	on := graphSvc()
+	if _, err := on.Put(ctx, "docs", "d", DocInput{Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	if st := pendingJobs(t, on, "docs"); st.JobsPending == 0 {
+		t.Fatalf("graph on but nothing queued: %+v", st)
+	}
+}
+
+func TestPutOfIdenticalContentKeepsFinishedExtractionAndChangedContentResets(t *testing.T) {
+	ctx := context.Background()
+	s := graphSvc()
+	text := "Alpha service calls Beta service."
+	if _, err := s.Put(ctx, "docs", "d", DocInput{Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	job, ok, _ := s.Store.ClaimJob(ctx, time.Minute)
+	if !ok {
+		t.Fatal("no job")
+	}
+	if err := s.Store.ApplyExtraction(ctx, store.ExtractionResult{Job: job.JobKey, PromptVersion: "v1"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Put(ctx, "docs", "d", DocInput{Title: "retitled", Text: text}); err != nil {
+		t.Fatal(err)
+	}
+	if st := pendingJobs(t, s, "docs"); st.JobsDone != 1 || st.JobsPending != 0 {
+		t.Fatalf("identical re-put redid the work: %+v", st)
+	}
+	if _, err := s.Put(ctx, "docs", "d", DocInput{Text: text + " Gamma service too."}); err != nil {
+		t.Fatal(err)
+	}
+	if st := pendingJobs(t, s, "docs"); st.JobsDone != 0 || st.JobsPending != 1 {
+		t.Fatalf("changed re-put did not queue a new extraction: %+v", st)
+	}
+}

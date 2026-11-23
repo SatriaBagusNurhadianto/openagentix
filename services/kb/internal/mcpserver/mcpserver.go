@@ -110,6 +110,9 @@ func New(svc *kb.Service, log *slog.Logger, opts Options) http.Handler {
 		Description: "List the knowledge-base collections and how many documents each holds. Use the names as the collection argument of kb_search.",
 		Annotations: ro,
 	}, h.list)
+	if svc.GraphEnabled() {
+		h.registerGraph(srv, ro)
+	}
 	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return srv }, &mcp.StreamableHTTPOptions{
 		Stateless:    opts.Stateless,
 		JSONResponse: true,

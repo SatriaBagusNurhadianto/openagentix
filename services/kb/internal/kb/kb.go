@@ -72,6 +72,8 @@ type Service struct {
 type GraphOptions struct {
 	WindowChars   int    // extraction window size in characters
 	PromptVersion string // jobs of another version are redone
+	MaxHops       int    // longest traversal graph queries accept, 1..store.MaxHops; zero means store.MaxHops
+	FanOut        int    // edges followed out of one entity by graph queries; zero means store.DefaultFanOut
 }
 
 // DocInput is the writable part of a document.

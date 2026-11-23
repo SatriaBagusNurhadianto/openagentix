@@ -78,7 +78,7 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 		QueryEmbedTimeout: cfg.QueryEmbedTimeout, MaxChunksPerDoc: cfg.MaxChunksPerDoc,
 	}
 	if cfg.Graph.Enabled {
-		svc.Graph = &kb.GraphOptions{WindowChars: cfg.Graph.WindowChars, PromptVersion: cfg.Graph.PromptVersion}
+		svc.Graph = &kb.GraphOptions{WindowChars: cfg.Graph.WindowChars, PromptVersion: cfg.Graph.PromptVersion, MaxHops: cfg.Graph.MaxHops}
 		extractor, err := graph.NewGateway(graph.GatewayConfig{
 			BaseURL: cfg.Graph.GatewayURL, Model: cfg.Graph.ExtractModel, APIKey: string(cfg.Graph.APIKey),
 			Limits: graph.Limits{MaxEntities: cfg.Graph.MaxEntitiesPerChunk, MaxRelations: cfg.Graph.MaxRelationsPerWindow},

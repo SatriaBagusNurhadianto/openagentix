@@ -48,6 +48,10 @@ func New(svc *kb.Service, cfg Config, log *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /v1/collections", s.auth(s.listCollections))
 	mux.HandleFunc("PUT /v1/collections/{collection}/documents/{id}", s.auth(s.putDocument))
 	mux.HandleFunc("DELETE /v1/collections/{collection}/documents/{id}", s.auth(s.deleteDocument))
+	if svc.GraphEnabled() {
+		mux.HandleFunc("GET /v1/collections/{collection}/graph/stats", s.auth(s.graphStats))
+		mux.HandleFunc("GET /v1/graph/stats", s.auth(s.graphStatsAll))
+	}
 	return mux
 }
 
@@ -152,6 +156,42 @@ func (s *server) listCollections(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0, len(cols))
 	for _, c := range cols {
 		out = append(out, map[string]any{"name": c.Name, "documents": c.Documents})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"collections": out})
+}
+
+func graphStatsJSON(collection string, st store.GraphStats) map[string]any {
+	return map[string]any{
+		"collection": collection, "entities": st.Entities, "relations": st.Relations, "mentions": st.Mentions,
+		"jobs":            map[string]int{"pending": st.JobsPending, "done": st.JobsDone, "failed": st.JobsFailed},
+		"last_error_code": st.LastErrorCode,
+	}
+}
+
+func (s *server) graphStats(w http.ResponseWriter, r *http.Request) {
+	coll := r.PathValue("collection")
+	st, err := s.svc.GraphStats(r.Context(), coll)
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, graphStatsJSON(coll, st))
+}
+
+func (s *server) graphStatsAll(w http.ResponseWriter, r *http.Request) {
+	cols, err := s.svc.Collections(r.Context())
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(cols))
+	for _, c := range cols {
+		st, err := s.svc.GraphStats(r.Context(), c.Name)
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		out = append(out, graphStatsJSON(c.Name, st))
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"collections": out})
 }

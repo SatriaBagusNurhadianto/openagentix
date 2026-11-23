@@ -100,6 +100,60 @@ The canary ingests 26 short fictional documents into the collection `graph-canar
 
 Operator status, no content: `GET /v1/collections/<collection>/graph/stats` (entities, relations, jobs pending, done, failed, last error code).
 
+## Curated facts
+
+Extraction is not the only way to put facts in the graph. An operator can write a catalogue by hand (services, teams, owners, dependencies, escalation contacts) and load it with no model call. The agent gets those facts from the same three tools, mixed with the extracted ones, and each curated fact is marked as such.
+
+```mermaid
+flowchart LR
+  A["Operator file (YAML or JSON)"] --> B["hack/kb-graph-load.sh"]
+  B --> C["PUT .../graph/factsets/id"]
+  C --> D["Validate, replace the fact set atomically"]
+  D --> E["Same tables, origin manual"]
+  F["Extraction worker"] --> G["Same tables, origin extracted"]
+  E --> H["kb_graph_search / entity / paths"]
+  G --> H
+```
+
+A **fact set** is a named catalogue of one collection. Loading it replaces the previous version of the same id in one transaction: the same body twice changes nothing, and facts that disappeared from the file disappear from the graph. Other fact sets, and everything extracted from documents, are left alone.
+
+```sh
+hack/kb-graph-load.sh graph-canary org-catalogue components/knowledge/graph-sample/org-catalogue.yaml
+```
+
+The file has an optional `source_uri` (an http or https URL, shown with each fact), a list of `entities` (`name`, `type`, optional `description` and `aliases`) and a list of `relations` (`source`, `predicate`, `target`, optional `note`). YAML needs `yq` on the machine; JSON does not.
+
+REST, same admin token, body limit and no-content logging as the document routes. They exist only when the graph is on:
+
+| Route | Meaning |
+|---|---|
+| `PUT /v1/collections/{collection}/graph/factsets/{id}` | Replace the fact set. Answers the counts and whether anything changed |
+| `GET /v1/collections/{collection}/graph/factsets/{id}` | The stored body (it is operator data) |
+| `GET /v1/collections/{collection}/graph/factsets` | The fact sets of the collection with counts |
+| `DELETE /v1/collections/{collection}/graph/factsets/{id}` | Remove the fact set and its relations |
+
+Rules:
+
+- Entity types, the 80 character name limit and the predicate form (`owns`, `depends_on`) are those of extraction. The grounding rules are not: a curated entity needs no occurrence in any text and may have a generic name, because the operator decides.
+- Both ends of a relation must be entities declared in the same fact set, by name, alias or canonical name. A fact set means the same whatever else is in the collection.
+- At most 2000 entities and 5000 relations per fact set (413 above that). Every other mistake is a 400 that names the item, for example `relations[7]: target is not an entity declared in this fact set`.
+- A curated entity merges with an extracted one by the same canonical name. The curated name, type and description win for display, and the entity is marked manual.
+- Deleting or re-ingesting documents never removes a curated entity or relation. Deleting a fact set un-marks its entities; one that extracted facts still use stays, and one that nothing refers to is removed.
+
+What the agent sees:
+
+```text
+Basalt -escalates_to-> Priya Venkat | curated: factset=org-catalogue source=https://example.com/openagentix/org-catalogue | "Escalations go to Priya Venkat"
+```
+
+instead of the `document_id=... chunk=...` of an extracted fact. A curated fact has a note, not a passage, so it adds nothing to the supporting passages. In ranking, a fact set counts as one source. The answer still starts with the notice that its content is untrusted, because it mixes in extracted text.
+
+`GET /v1/collections/{collection}/graph/stats` adds `manual`: counts of curated entities, relations and fact sets.
+
+The sample `components/knowledge/graph-sample/org-catalogue.yaml` goes with the canary corpus and holds none of its answer chain. The question "Which service calls the ledger API Quill, which team owns it, and who is that team's escalation manager?" needs two extracted facts and one curated one (Orion, Basalt, Priya Venkat).
+
+Status: unit and integration tested (in-memory store, throwaway PostgreSQL, the upgrade of an existing schema), and the sample question is tested offline on the stored extraction of the canary run. **Not yet run on the cluster.**
+
 ## What was proven
 
 On the kind demo cluster with a real model (2026-11-23):
@@ -118,7 +172,8 @@ Unit and integration tests cover storage on PostgreSQL, a prompt-injection fixtu
 - The name rules are English only. Two different things with the same proper name in one collection merge.
 - Validation proves a relation is grounded in the text, not that it is right. One wrong relation was seen with a real but unrelated evidence sentence. A document can also plant a false fact. Agents must treat graph content as data.
 - At most 3 hops per call. Longer questions need two calls, which the tool answer suggests.
-- No "summarise the whole corpus" answers, no time-aware edges, no manual curation API yet.
+- No "summarise the whole corpus" answers and no time-aware edges.
+- Curated entities have no name embedding, so a question finds them by name or alias only, not by meaning. A fact set holds at most 2000 entities and 5000 relations; there is no per-fact edit, only replacing the whole set.
 - A failed job stays failed until the document is ingested again.
 - The per-key budget size at the gateway is shared by all keys; only the kb-side `tokensPerHour` is specific to extraction.
 

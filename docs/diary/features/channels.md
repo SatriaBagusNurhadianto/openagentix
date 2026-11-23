@@ -64,6 +64,8 @@ channels:
 
 `install.sh` installs the `agent-kourier` release before the chart (`components/channels/kourier.sh`, cosign check when cosign exists). The chart renders a Role that lets Kourier read only the Secrets the connections name, and a NetworkPolicy peer for Kourier on the controller port.
 
+Kourier's own NetworkPolicy lets it reach the API server. `kourier.sh` derives that address at install time. On kind the nodes are Docker containers and their addresses change when Docker restarts (`172.18.0.2` became `172.18.0.3` in one case), so a rule for one address left Kourier crash-looping until the installer was run again. Now, when every node's `providerID` starts with `kind://`, the rule allows the `/24` of the API server's address (Docker's pool gives a few nodes consecutive addresses; the rule only opens the API server port). On other clusters the exact endpoint addresses stay (`/32`). Set `KOURIER_APISERVER_CIDRS` to a comma or space separated list of CIDRs to override both. The derivation is a small function with offline tests (`components/channels/tests/run.sh`); the fix has not been run on a live cluster restart.
+
 ## How to try it
 
 ```sh

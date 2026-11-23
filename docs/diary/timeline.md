@@ -94,3 +94,11 @@ What was learned and what went wrong:
 - One wrong relation was stored (`Basalt owns Mira Okafor`) with a real but unrelated sentence as evidence. Literal evidence does not prove the relation is right.
 - A VM restart changed the node address and broke Agent Kourier, whose network policy pins the API server address at install time. Re-running the installer fixed it.
 - A test helper connected to a database it did not start. Executors may now only use databases they start themselves.
+
+## 2026-11-23: curated graph facts and the Kourier address fix
+
+An operator can now load a hand-written catalogue (services, teams, owners, escalation contacts) into a collection's graph as a named fact set: `hack/kb-graph-load.sh`. The same three graph tools return these facts, marked as curated, next to extracted ones. No model is involved. Re-ingesting or deleting documents never removes curated facts.
+
+Proven live: the sample catalogue was loaded (19 entities, 12 relations) and the agent answered "which service calls Quill, which team owns it, who is the escalation manager" from two extracted facts and one curated fact. It named the fact set as the source of the curated fact and said it could not confirm it in the documents.
+
+Agent Kourier's network policy now allows the node subnet for the API server port on kind, so a Docker restart that moves the node address no longer breaks it.

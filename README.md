@@ -92,7 +92,7 @@ The `knowledge` block (default on) deploys a small document store with hybrid se
 
 Agents that set `knowledge: true` (the demo `assistant` does) get the tools `knowledge_kb_search`, `knowledge_kb_get_document` and `knowledge_kb_list_collections` and a short addition to their system prompt: search the knowledge base for questions about OpenAgentix itself and cite document titles. The name is the entry name plus the vMCP prefix (`mcp.virtual.prefixFormat` with `{workload}` = `knowledge.mcp.entryName`) plus the kb's own tool name.
 
-`install.sh` creates four Secrets in `openagentix-knowledge` only when they are absent, so re-runs never rotate them: `kb-admin` (ingest token), `kb-postgres` (database password), `kb-database` (connection URL built from it) and `kb-virtual-key` (the kb's gateway key; its hash is added to `llm-api-keys`). It then ingests `components/knowledge/sample/` into the collection `openagentix`. Try it with the A2A command from the quickstart and the question "What is the OpenAgentix knowledge base canary code?". Expect `HERON-4412-KB-RETRIEVED` and a `knowledge_kb_search` call in the task's tool-call records.
+`install.sh` creates four Secrets in `openagentix-knowledge` (five with the knowledge graph on: see below) only when they are absent, so re-runs never rotate them: `kb-admin` (ingest token), `kb-postgres` (database password), `kb-database` (connection URL built from it) and `kb-virtual-key` (the kb's gateway key; its hash is added to `llm-api-keys`). It then ingests `components/knowledge/sample/` into the collection `openagentix`. Try it with the A2A command from the quickstart and the question "What is the OpenAgentix knowledge base canary code?". Expect `HERON-4412-KB-RETRIEVED` and a `knowledge_kb_search` call in the task's tool-call records.
 
 **Ingest your own documents.** Put markdown files in a directory and run:
 
@@ -101,6 +101,19 @@ hack/kb-ingest.sh ./my-docs my-collection        # collection defaults to "opena
 ```
 
 Each file becomes one document: id from the path (`adr/0001-x.md` becomes `adr:0001-x`), title from the first `# ` heading, one idempotent `PUT` per file, so re-running replaces rather than duplicates. The script reads the token from the `kb-admin` Secret into a variable (never printed, not in argv) and talks to the kb through `kubectl port-forward`, which needs no NetworkPolicy entry. For an in-cluster job set `KB_URL` and `KB_ADMIN_TOKEN` and list the job's pods in `knowledge.kb.ingestFrom`. Agents see every collection; to restrict a search the agent passes `collection`.
+
+**Knowledge graph (optional, off by default).** Vector search finds the passage that matches a question; it does not connect facts that sit in different documents. With `knowledge.kb.graph.enabled=true` the kb also extracts entities and relations from every ingested document with a gateway model (default `claude-haiku`, in the background, within an hourly token budget), stores them in its own PostgreSQL as plain tables, and adds three read-only tools next to the other three: `knowledge_kb_graph_search` (the entities a question names, and the chains of facts around them up to three hops), `knowledge_kb_graph_entity` and `knowledge_kb_graph_paths`. Every fact in an answer cites its `document_id`, chunk and quoted evidence, and the ids open with `kb_get_document`. Why this design and what was rejected: [ADR 0004](docs/decisions/0004-knowledge-graph.md).
+
+```sh
+VALUES_FILE=components/knowledge/graph-demo-values.yaml ./install.sh   # graph on; creates the extraction key kb-extract-key
+hack/kb-graph-canary.sh                                                # ingest a 26-document fictional corpus and check a five-hop chain
+```
+
+- *Own key.* Extraction uses its own gateway virtual key (user id `kb-extract`, Secret `kb-extract-key`), so a big ingest cannot spend the embedding key's or an agent's tokens. `install.sh` creates it only when absent and never prints it; `PURGE_SECRETS=1 ./uninstall.sh` removes it.
+- *Privacy.* The text of every ingested document is sent to the extraction model. Do not turn the graph on for documents you may not send there.
+- *Untrusted.* Graph facts come from documents through a model: strict validation keeps only entities and quotes that literally occur in the text, but a document that states something false still produces a (cited) fact. Agents are told to treat it as reference data and to check the cited document.
+- *Operator view.* `GET /v1/collections/<collection>/graph/stats` (admin token) shows entities, relations and job counts (pending, done, failed) and the last error code, never content.
+- *Status.* Built and covered by unit and integration tests; **not yet run against a real model or on the cluster**, so extraction quality, token cost and latency are unmeasured. With `mcp.virtual.incomingAuth.toolAccess` set you must add the three tool names yourself.
 
 **Swap the embedding model.**
 

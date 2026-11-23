@@ -1,0 +1,19 @@
+# Bench client pod. Runs in openagentix-gateway with the label the chart's kagent-controller NetworkPolicy admits on port 8083
+# (app: telegram-bridge). Temporary; removed with the rest of the bench.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cmp
+  namespace: openagentix-gateway
+  labels: {app: telegram-bridge, app.kubernetes.io/part-of: bench}
+spec:
+  automountServiceAccountToken: false
+  restartPolicy: Never
+  containers:
+    - name: cmp
+      image: localhost:5000/ax-assistant-api@sha256:0687d77e1bf056742449587ec8e45613fda1dd059a0aa2f34cf489016c76a517
+      imagePullPolicy: IfNotPresent
+      command: [sleep, "86400"]
+      resources:
+        requests: {cpu: 10m, memory: 32Mi}
+        limits: {cpu: 500m, memory: 128Mi}

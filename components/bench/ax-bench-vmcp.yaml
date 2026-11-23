@@ -1,0 +1,80 @@
+# BENCH-ONLY, TEMPORARY. A second vMCP that exposes only the OSV tool and accepts anonymous callers, for the AX side of the
+# kagent-versus-AX benchmark.
+#
+# Why it exists: the real vMCP (`tools`) requires a Substrate actor JWT with audience openagentix-vmcp. AX could in principle
+# get one from the egress proxy (Gateway rule with `replaceHeaders` + `actorJwt`), but ax-server refuses credential
+# replacement on an `http` rule ("the credential would be sent in cleartext") and the vMCP serves plain HTTP. So the real vMCP is
+# unreachable for an AX sandbox without weakening its auth, and its auth is left exactly as it is.
+#
+# What it does: same path as the real one (sandbox -> egress proxy -> vMCP -> ToolHive proxy of the SAME osv MCP server), but
+# without the JWT check and without the other three backends. A NetworkPolicy lets only the Substrate egress proxy reach it.
+# Created by kubectl, not by Helm. Remove with:  kubectl delete -f components/bench/ax-bench-vmcp.yaml
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPGroup
+metadata:
+  name: bench-osv
+  namespace: mcp-tools
+  labels: {app.kubernetes.io/part-of: bench}
+spec:
+  description: BENCH ONLY, one backend (osv) behind an anonymous vMCP
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPExternalAuthConfig
+metadata:
+  name: bench-osv-noauth
+  namespace: mcp-tools
+  labels: {app.kubernetes.io/part-of: bench}
+spec:
+  type: unauthenticated
+---
+# No pods: the bench vMCP connects to the existing osv ToolHive proxy, so both runtimes use the same osv server.
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: MCPServerEntry
+metadata:
+  name: bench-osv
+  namespace: mcp-tools
+  labels: {app.kubernetes.io/part-of: bench}
+spec:
+  groupRef: {name: bench-osv}
+  remoteUrl: http://mcp-osv-proxy.mcp-tools.svc.cluster.local:8080/mcp
+  transport: streamable-http
+  allowPrivateEndpoint: true
+  externalAuthConfigRef: {name: bench-osv-noauth}
+---
+apiVersion: toolhive.stacklok.dev/v1beta1
+kind: VirtualMCPServer
+metadata:
+  name: bench-osv
+  namespace: mcp-tools
+  labels: {app.kubernetes.io/part-of: bench}
+spec:
+  groupRef: {name: bench-osv}
+  config:
+    aggregation:
+      conflictResolution: prefix
+      conflictResolutionConfig: {prefixFormat: "{workload}_"}
+  incomingAuth:
+    type: anonymous
+    authzConfig:
+      type: inline
+      inline:
+        policies: ['permit(principal, action, resource);']
+  outgoingAuth: {source: discovered}
+---
+# The namespace default policy admits only the namespace itself and the ToolHive operator. Add the egress proxy that carries
+# every sandbox's calls (the same source the chart admits for the real vMCP). Nothing else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: bench-osv-vmcp-ingress
+  namespace: mcp-tools
+  labels: {app.kubernetes.io/part-of: bench}
+spec:
+  podSelector:
+    matchLabels: {app: virtualmcpserver, toolhive-name: bench-osv}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 4483}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ate-system}}
+          podSelector: {matchLabels: {app: atenet-egress}}

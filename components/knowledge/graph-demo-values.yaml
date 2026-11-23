@@ -1,0 +1,17 @@
+# Turns the knowledge graph on for a demo: entities and relations are extracted from every ingested document by the
+# gateway model `knowledge.kb.graph.extractModel` (default claude-haiku) and the agents with `knowledge: true` get
+# knowledge_kb_graph_search, knowledge_kb_graph_entity and knowledge_kb_graph_paths.
+#
+#   VALUES_FILE=components/knowledge/graph-demo-values.yaml ./install.sh
+#   hack/kb-graph-canary.sh                      # ingests components/knowledge/graph-sample and checks the chain
+#
+# This sends the text of every document you ingest to the extraction model and spends its tokens (budget:
+# knowledge.kb.graph.tokensPerHour). Do not use it with documents you may not send to that model.
+#
+# Helm merges maps from several values files key by key and REPLACES lists. This file sets one key of a map, so nothing
+# else is restated: the gateway models, the agents and every other graph setting keep their chart defaults. install.sh
+# then creates the Secret kb-extract-key (the gateway virtual key of user id kb-extract) next to kb-virtual-key.
+knowledge:
+  kb:
+    graph:
+      enabled: true

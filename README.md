@@ -247,6 +247,45 @@ After a fresh install the binding can stay `Ready=False` (reason `AgentNotReady`
 
 **Uninstall.** `./uninstall.sh` removes the openagentix release and then the `agent-kourier` release. It leaves the namespaces `agent-kourier` and `openagentix-channels`, Kourier's PVC and CRDs and the generated webhook Secret. `PURGE_SECRETS=1` also deletes the webhook Secrets install.sh generated (never your Slack Secrets); `PURGE_DATA=1` also deletes Kourier's PVC and its three CRDs (the chart marks them `keep`; deleting them deletes any ChatConnection, Binding or AgentBackend still present).
 
+## Schedules
+
+Run an agent on a timetable, declared in values like everything else. Each entry of `schedules` renders a **CronJob** in the namespace `openagentix-schedules` (its own namespace, so the NetworkPolicies can name exactly these pods) whose pod runs `tools/a2a-call`: one A2A `SendMessage` to the agent with a caller identity, then exit `0` only if the task completed. Empty by default: with no schedules the chart renders nothing for this and its output is byte-identical to before. [ADR 0002](docs/decisions/0002-schedules-and-trigger-delivery.md) explains why kagent's own scheduler is not used (it sends no caller identity, so memory-enabled agents fail, and its runs hung on a cold agent).
+
+```yaml
+schedules:
+  - name: daily-brief                 # DNS label, at most 40 characters, unique
+    agent: assistant                  # must be an agents[].name, else the render fails
+    schedule: "0 8 * * 1-5"           # 5-field cron, checked at render time (field count, ranges, names)
+    timeZone: Europe/Berlin           # optional, IANA name
+    prompt: |                         # configuration, NOT a secret (see below)
+      Check the vulnerability database for lodash 4.17.20 and answer in two sentences.
+    # optional: userId (default schedule:daily-brief), timeout (300s), suspend (false), concurrencyPolicy (Forbid),
+    # historyLimits {successful: 3, failed: 3}, backoffLimit (0), startingDeadlineSeconds (300), ttlSecondsAfterFinished
+    # (86400), resources. The defaults live in `scheduling.defaults` in values.yaml.
+```
+
+Pass the file to the installer like any values file; several can be combined (space-separated, applied in order; maps merge, **lists are replaced**, so keep all schedules in one file): `VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml" ./install.sh`. `install.sh` builds and loads the `openagentix/a2a-call:dev` image only when the chart renders a CronJob (switch `SKIP_A2A_CALL_IMAGE=1`), and stamps a hash of `tools/a2a-call` on the pod template.
+
+**User id and memory.** The pod sends `X-User-Id: <userId>`, default `schedule:<name>`. kagent keys sessions and long-term memory by it, so **one schedule is one memory scope**: every run of `daily-brief` sees what earlier runs saved with `save_memory`, and no other schedule, chat or binding does. Give two schedules the same `userId` to share a scope. Each run is a new conversation (a new kagent session owned by that user id); runs do not continue each other's session.
+
+**Where results go today: nowhere but kagent's store.** The job log has a one-line summary (state, task id, duration, length of the answer), never the answer text: answers can contain private data and job logs are widely readable. The answer is in kagent (the session of that user id, `kagent.session_task`, or the UI). Delivery to Telegram or Slack is the planned notify tool (ADR 0002); until it lands a schedule is useful for agents that act through their own tools, or whose memory you read later.
+
+**Do not put secrets in prompts.** The prompt is stored in a ConfigMap (`schedule-<name>`) that anyone who can read ConfigMaps in `openagentix-schedules` can read, and it is sent to the model provider. The chart renders no Secret values for schedules.
+
+**Run one now, and see failures.**
+
+```sh
+kubectl create job -n openagentix-schedules --from=cronjob/demo-brief demo-brief-manual-1   # one real model call
+kubectl logs -n openagentix-schedules job/demo-brief-manual-1       # {"state":"TASK_STATE_COMPLETED","taskId":...,"durationMs":9279,"answerChars":308,...}
+kubectl get cronjob,job -n openagentix-schedules                    # LAST SCHEDULE, SUSPEND, Failed jobs
+```
+
+A failed run (failed task, input required, HTTP or JSON-RPC error, timeout) makes the pod exit `1` with `a2a-call: FAILED: <reason>` on stderr and the Job `Failed`. **`backoffLimit` is 0 on purpose**: by the time a call fails the agent may already have used tools or written memory, and a blind retry repeats the cost and the side effects; the next scheduled firing is the retry. `activeDeadlineSeconds` is the timeout plus 60 seconds, so a hung pod cannot outlive its schedule; `startingDeadlineSeconds` (300) skips a firing that could not start within five minutes instead of running it late; finished Jobs and their logs are removed after a day (`ttlSecondsAfterFinished`) and the last 3 successful and 3 failed are kept. Nothing alerts you: look at `kubectl get jobs -n openagentix-schedules` or scrape kube-state-metrics' job metrics.
+
+**Cost.** Every firing is at least one model call and often several (tool calls, memory preload); a `* * * * *` schedule spends tokens every minute. Use `suspend: true` while testing (`kubectl patch cronjob <name> -n openagentix-schedules --type=merge -p '{"spec":{"suspend":true}}'` for a quick stop; the next install restores the values). The gateway's token budget per virtual key still applies. The demo schedule is suspended.
+
+**Security.** The pods are non-root with a read-only root filesystem, no capabilities, seccomp `RuntimeDefault` and no service-account token. Two NetworkPolicies: the kagent controller's A2A port admits the namespace `openagentix-schedules` **and** the pod label `openagentix.io/component=schedule` (a pod in that namespace without the label times out), and an egress policy lets those pods reach only CoreDNS and the controller on 8083 (the knowledge base and the model gateway time out). Anyone who can create pods in `openagentix-schedules` with that label can call any agent, so keep that namespace's RBAC tight. `X-User-Id` is an unauthenticated claim on port 8083 like for every caller (see Security). Verified on kind: **kindnet enforces the egress policy for cluster destinations but not for destinations outside the cluster** (a labelled pod still reached example.com); on a CNI that enforces egress fully (Calico, Cilium) the pods also have no internet.
+
 ## Add an agent
 
 Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt; `memory: {enabled: true}` turns on long-term memory, see "Memory"):
@@ -281,6 +320,7 @@ Skill references must be digest-pinned (`...@sha256:<64 hex>`); the render fails
 ```sh
 charts/openagentix/tests/run.sh      # shell assertions over `helm template`, needs helm, yq, jq
 helm lint charts/openagentix
+(cd tools/a2a-call && make test)     # the schedule caller: go vet, go test -race
 ```
 
 ## Adopting an existing hand-applied install
@@ -341,7 +381,9 @@ components/tools/               ToolHive install script, original manifests, exa
 components/agents/              the original hand-applied assistant agent (now rendered by the chart)
 hack/kind-config.yaml           kind cluster config (node image pin) used by install.sh
 components/channels/            Agent Kourier install script, its values, a demo webhook values file
-docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: proposed)
+components/schedules/           a demo values file with one suspended schedule
+tools/a2a-call/                 Go A2A caller run by the schedule CronJobs (tests, Dockerfile)
+docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented)
 spikes/kourier/                 Agent Kourier spike (evidence; superseded by the integration)
 spikes/kagent/                  kagent + Substrate bring-up (up.sh, values) and NOTES
 spikes/ax/                      Google AX spike; not installed

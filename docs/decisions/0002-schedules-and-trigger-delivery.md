@@ -1,6 +1,8 @@
 # ADR 0002: Scheduled runs and delivery of results from triggered agents
 
-- **Status:** Proposed. Nothing in this record is implemented; it is what was found and what we recommend.
+- **Status:** Accepted (schedules: option A implemented; result delivery: notify tool in progress)
+- **Update 2026-11-23:** the owner kept the recommendation (the CronJob approach, column B of the schedules table). Schedules are implemented as a `schedules[]` values block rendered into CronJobs that call the agent over A2A with `X-User-Id: schedule:<name>` (`tools/a2a-call`, README "Schedules"). On the live cluster a manual run, a memory-scoped pair of runs and a real cron firing completed against the memory-enabled `assistant`, which is the case kagent's own scheduler failed. The delivery part (notify tool) is not built yet. The record below is unchanged evidence; where it says nothing is implemented or proposes the `kagent` namespace for the CronJobs, read it as of 2026-11-22: the implementation uses its own namespace `openagentix-schedules` and a pod-scoped policy peer.
+- **Original status:** Proposed. Nothing in the record below was implemented when it was written; it is what was found and what we recommend.
 - **Date:** 2026-11-22
 - **Evidence:** kagent v1.0.1 source (`proto/kagent/api/v1/scheduled_runs.proto`, `go/core/internal/grpcserver/{scheduledrun,grpcweb,interceptors,policy}.go`, `go/core/internal/controller/scheduledrun/`, `go/core/internal/service/{scheduledrun,session}/`) read through raw GitHub files; live calls on the kind cluster `kind-openagentix` (kagent 1.0.1, Agent Kourier 0.6.0); `spikes/kourier/NOTES.md`; README "Channels and triggers".
 

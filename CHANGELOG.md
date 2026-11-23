@@ -5,6 +5,14 @@ All notable changes to OpenAgentix are documented here. The format follows [Keep
 ## [Unreleased]
 
 ### Added
+- Schedules (chart blocks `schedules` and `scheduling`, default empty: the default render is byte-identical to before; the CronJob option of ADR 0002): each entry renders a prompt ConfigMap and a CronJob in the namespace `openagentix-schedules` that calls the agent over A2A with `X-User-Id: schedule:<name>` (one memory scope per schedule, memory-enabled agents work, unlike kagent's own scheduler). Render-time checks: unknown agent, name shape and uniqueness, 5-field cron with ranges and names, timeout, concurrencyPolicy, time zone shape. `backoffLimit: 0`, `activeDeadlineSeconds` = timeout + 60, `startingDeadlineSeconds: 300`, finished Jobs removed after a day, hardened pod (non-root, read-only root filesystem, no capabilities, seccomp, no service-account token). NetworkPolicies: the controller's A2A port admits those pods (namespace and pod label), an egress policy lets them reach only CoreDNS and the controller. 91 new chart assertions (302 to 393), written first.
+- `tools/a2a-call`: Go (stdlib only) A2A 1.0 caller used by the schedules: unique message id, caller identity, timeout, size limit, no redirects, one-line JSON summary without the answer text (unless `PRINT_ANSWER=true`), exit 0 only for `TASK_STATE_COMPLETED`. Distroless non-root image.
+- `install.sh` builds and loads `openagentix/a2a-call:dev` only when schedules exist (`SKIP_A2A_CALL_IMAGE=1` to skip) and stamps a source hash on the pod template; `VALUES_FILE` documented as several space-separated files. `components/schedules/demo-values.yaml`: one suspended demo schedule.
+- README "Schedules".
+
+### Changed
+- ADR 0002 status: Accepted (schedules: option A implemented; result delivery: notify tool in progress).
+
 - Chart `networkPolicy` (default on): ingress NetworkPolicies for `mcp-tools` (backends from their own namespace and the ToolHive operator; the vMCP also from `atenet-egress` and the kagent controller) and for the kagent controller port 8083 (the bridge pod by label, the `kagent` namespace, `atenet-egress`; other ports untouched).
 - Tool-layer identity: `mcp.virtual.incomingAuth.type: oidc` is now the default. The chart renders an `MCPOIDCConfig` for the Substrate IdP (explicit JWKS URL, CA from a ConfigMap) and the RemoteMCPServer requests an actor JWT (`actorJwt`, audience `openagentix-vmcp`). `install.sh` copies the Substrate service CA from its ClusterTrustBundle into that ConfigMap.
 - `mcp.virtual.incomingAuth.toolAccess`: per-atespace tool allowlist rendered as Cedar rules (replaces the permit-all policy when set).

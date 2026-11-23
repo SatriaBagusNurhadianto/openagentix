@@ -1,0 +1,66 @@
+---
+title: What works
+sidebar_position: 2
+description: Status of every OpenAgentix capability, how it was proven, where the code lives and the main known gap.
+---
+
+# What works
+
+States used here:
+
+- **working and proven live**: run on the kind cluster, with the evidence named in the sources.
+- **built and tested only**: code and unit or chart tests exist, but no live run is recorded.
+- **experimental**: runs, but is not part of the install or is a spike.
+- **not built**: nothing in the repository.
+
+Evidence comes from the README, the CHANGELOG, `docs/decisions/` and the component notes. "Live" means the single-node kind cluster `kind-openagentix`. Nothing here was tested at scale, under load, or on a cluster other than kind.
+
+## Items from WHAT.txt
+
+| Capability | State | How it was proven | Where | Main known gap |
+|---|---|---|---|---|
+| Agent runtime | working and proven live | kagent 1.0.1 on Substrate 1.0.1: A2A `SendMessage`, multi-turn on one `contextId`, real model, cold install twice (ADR 0001, spikes/kagent/NOTES.md) | `spikes/kagent/`, `charts/openagentix/templates/kagent.yaml` | The controller does not authenticate callers; start-up race seen once |
+| Runtime choice (kagent vs Google AX vs Dapr Agents) | working and proven live (kagent vs AX only) | Same agent built on both, 4 prompts, 5 runs each (`spikes/ax/compare/RESULTS.md`) | `docs/decisions/0001-*.md` | No Dapr Agents or LiteLLM comparison found in the repository |
+| Google AX as second backend | experimental | Adapter ran 40 AX runs, all correct; not installed | `bridges/ax-adapter/`, `spikes/ax/` | No auth, no streaming, history lost on restart; AX's own Claude Code runner never started |
+| MCP tools (ToolHive vMCP, fetch, OSV) | working and proven live | A real model called `osv_query_vulnerability` and answered 4 for lodash 4.17.20 | `components/tools/`, chart `mcp` block | Cedar policy is permit-all by default; no per-agent tool authorization |
+| Code mode | built and tested only | `execute_tool_script` ran through an agent with a stub LLM (`components/tools/verify/out/`); a real model using it is not recorded | chart `mcp.virtual.codeMode` | Starlark has no `json` module; inner-call authorization not verified |
+| Model gateway | working and proven live | Real Anthropic completions through agentgateway; 401 without a key; 429 when the budget ran out | `components/model-gateway/`, chart `gateway` block | Static virtual keys, plain HTTP in cluster, one shared provider key |
+| Model routing and cost optimization | experimental | Priority-group failover with a retry policy ran with a stub and a 402 from Gemini | `components/model-gateway/manifests/10-models.yaml` | No intelligent routing; no USD caps; Gemini never gave a completion |
+| Skills | working and proven live | OCI skill mounted, loaded by a real model; canary prompt 5/5 (ADR 0001) | `components/tools/skills/`, chart `skills` | Needs a plain-HTTP registry on kind; model-driven selection lightly exercised |
+| Memory | working and proven live | A fact saved in one conversation was recalled in a new one, not for another user id | chart `memory` block, `spikes/kagent/pgvector.sh` | `ttlDays` is not enforced; nothing prunes |
+| Messaging: Telegram | working and proven live | ADR 0001 lists kagent wired to Telegram on the cluster; per-chat user id verified against kagent | `bridges/telegram/` | Single replica; in-memory offsets; the bridge's new trace line was unit-tested only |
+| Messaging: Slack | built and tested only | Chart renders it; marked UNTESTED in the README | chart `channels` block | No Slack tokens were available |
+| Messaging: Teams and other platforms | not built | No code or notes | none | Kourier docs list platforms; none wired |
+| Event gateway: signed webhooks | working and proven live | Signed webhook ran a turn, `outcome=completed`, answered 4; bad signature got 401; re-run changed nothing | `components/channels/`, chart `channels` block | No reply route; one memory scope per binding; Kourier is 0.x |
+| Agent builder | not built | Agents are declared in chart values only (adding one through a values file was done live) | chart `agents` list | No builder UI or API |
+| Agent control plane | not built | None | none | Only kagent's own controller and the chart |
+| Knowledge base | working and proven live | Semantic hits for queries sharing no word with the chunk | `services/kb/`, chart `knowledge` block | One replica, no backups, no per-collection authorization |
+| Knowledge graph | not built (in progress) | In progress, design decided: entity and relation extraction at ingest, plain tables in the knowledge base PostgreSQL, recursive SQL, three planned tools `knowledge_kb_graph_search`, `knowledge_kb_graph_entity`, `knowledge_kb_graph_paths` | not committed | Nothing committed |
+| Observability | working and proven live | Cost per agent, one 59-span trace, tool audit, trace-turn.sh (ADR 0003) | chart `observability` block, `hack/trace-turn.sh` | PodMonitors unit-tested only; no dashboards or alerts; traces in memory |
+| Governance and guardrails | built and tested only | Cedar tool allowlist verified live; notify guardrails unit-tested | chart `mcp.virtual.incomingAuth.toolAccess`, `services/notify/` | No general guardrails, approvals or policy engine for agent output |
+| Single-command install | working and proven live | Cold install from a deleted cluster, twice, warm image cache, 604 s | `install.sh`, `uninstall.sh` | Two layers (installer plus chart), not one Helm chart; no cold install with an empty image cache |
+| Open core and licensing | not built | ADR 0001 names a permissive license as a need; no LICENSE file was found | none | No licensing model written |
+
+## What was built beyond WHAT.txt
+
+| Capability | State | How it was proven | Where | Main known gap |
+|---|---|---|---|---|
+| Tool-layer identity (actor JWT, OIDC) | working and proven live | vMCP answers 401 without a valid token; token verified with the Substrate CA | chart `mcp.virtual.incomingAuth`, `install.sh` | Identity is per session, not per agent; no revocation |
+| Tool authorization (Cedar `toolAccess`) | working and proven live | Cedar logged deny for a tool left out; agent used another tool | chart `mcp.virtual.incomingAuth.toolAccess` | Off by default |
+| NetworkPolicies | working and proven live | Pods in `default` timed out against `mcp-tools`, kb, notify, the controller | chart `networkPolicy`, templates | kindnet does not enforce egress to the internet |
+| Per-agent virtual keys and token budgets | working and proven live | 429 `rate limit exceeded` seen in the live demo and a test | chart `gateway.policy` | Per proxy replica; tokens, not USD |
+| Embedding aliases `embed-default`, `embed-memory` | working and proven live | Access log shows `user_id="kb"` and `user_id="memory"`; 401 without a key | chart `knowledge`, `memory` blocks | Changing model or dimension needs re-ingest |
+| Schedules (CronJob) | working and proven live | Manual run, memory-scoped pair of runs and a real cron firing completed (ADR 0002 update) | chart `schedules`, `tools/a2a-call/` | No alert on a failed run; demo schedule is suspended |
+| Agent Kourier channels | working and proven live | See webhooks above | `components/channels/` | Webhook has no reply route |
+| Notify service | working and proven live | A direct tool call, an A2A question, the demo schedule and a signed webhook all delivered to a real Telegram chat | `services/notify/`, chart `notify` block | Slack and webhook destinations unit-tested only; one replica |
+| Telegram bridge | working and proven live | See Telegram above | `bridges/telegram/` | At-least-once delivery after a restart |
+| Cost per agent | working and proven live | Metric matched the access log for ten calls (0.0167587 USD) | gateway metrics, `hack/trace-turn.sh` | First hour after install reads high |
+| Traces | working and proven live | One trace across four services, `traceparent` survived the whole path | chart `observability` | Tool arguments leak into spans at the source; filtered by bundled Jaeger |
+| Audit log (vMCP) | working and proven live | `AUDIT` lines with tool, outcome, actor, duration; no arguments | chart `observability.audit` | Pod stdout only; not tamper-evident |
+| Helm chart tests | built and tested only | `charts/openagentix/tests/run.sh` (84 assertions at 0.1.0, 393 after schedules, more since) | `charts/openagentix/tests/` | Render checks only; no cluster |
+| Agent changes (add an agent by values) | working and proven live | A temporary agent was added and removed through a values file | chart `agents` | A new agent takes 1 to 2 minutes to become Ready |
+
+## Facts that need care
+
+- The demo node is one kind node in a Rancher Desktop VM with 6 CPU and 8 GB. Platform controllers can lose leader election and restart while images are built or controllers roll. See [install](./features/install.md).
+- The README, ADR 0001 and the kagent spike notes give the VM as 5 CPU and about 7.7 or 8 GB. The newer figure is the one used in the install page.

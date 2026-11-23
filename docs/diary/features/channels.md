@@ -1,0 +1,95 @@
+---
+title: Channels and triggers
+sidebar_position: 6
+description: The Telegram bridge, Agent Kourier webhooks and bindings that start agent turns.
+---
+
+# Channels and triggers
+
+## What it is for
+
+People and systems start agents from outside the cluster. Two components do it. The **Telegram bridge** (`bridges/telegram`, Go) lets people chat with an agent from a phone. **Agent Kourier** 0.6.0 (pinned) turns signed webhooks, and in principle Slack channels, into agent turns. Kourier has no direct messages, so Telegram stays on our own bridge.
+
+## How it works
+
+The bridge long-polls Telegram `getUpdates`, so it needs no inbound connection. It keeps one A2A `contextId` per chat, sends `X-User-Id: telegram:<chat id>` and starts a W3C trace per message. Kourier watches three custom resources: `ChatConnection` (one source and its Secret), `Binding` (channel to agent, triggers, limits, user id) and `AgentBackend` (how to reach kagent, dialect `kagent-v1`).
+
+```mermaid
+sequenceDiagram
+  participant W as Webhook sender
+  participant Q as Agent Kourier (chat port 8081)
+  participant K as kagent controller :8083
+  participant A as Agent assistant
+  W->>Q: POST /chat/webhook/openagentix-channels/demo-webhook (HMAC header)
+  Q->>Q: verify signature, dedupe, rate limit, match trigger
+  Q-->>W: 200 accepted (401 on bad signature)
+  Q->>K: A2A SendMessage with X-User-Id kourier:demo-assistant
+  K->>A: run turn
+  A->>A: act through its own tools (no reply route)
+```
+
+Namespaces: `openagentix-gateway` (bridge), `agent-kourier` (broker, SQLite on a 1 Gi PVC), `openagentix-channels` (connections, bindings, Secrets). The chat listener is a ClusterIP Service; the chart creates no Ingress.
+
+Three ways to map agents: one trigger per agent on one webhook connection, one Slack bot with a binding per channel id, or one bot per agent.
+
+## How to enable and configure
+
+Bridge keys (`bridge` block): `enabled`, `namespace: openagentix-gateway`, `agent: assistant`, `userIdPrefix`, `existingSecret: telegram-bridge`, `allowlist.enabled: true`. The bridge refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS` (or `TELEGRAM_ALLOW_ALL=true`).
+
+Kourier is off by default (`channels.kourier.enabled: false`). Switch it on with the demo values:
+
+```sh
+VALUES_FILE=components/channels/demo-values.yaml ./install.sh
+```
+
+```yaml
+channels:
+  kourier: {enabled: true}
+  connections:
+    - name: demo-webhook
+      platform: webhook
+      existingSecret: demo-webhook          # install.sh generates it when absent
+      webhook:
+        verify: {scheme: hmac-sha256, header: X-Demo-Signature, prefix: "sha256="}
+  bindings:
+    - name: demo-assistant
+      connection: demo-webhook
+      channel: demo
+      agent: assistant                      # must be an agents[].name
+      output: none
+      triggers:
+        - type: webhookEvent
+          match: {event: '^question\.asked$'}
+```
+
+`install.sh` installs the `agent-kourier` release before the chart (`components/channels/kourier.sh`, cosign check when cosign exists). The chart renders a Role that lets Kourier read only the Secrets the connections name, and a NetworkPolicy peer for Kourier on the controller port.
+
+## How to try it
+
+```sh
+kubectl port-forward -n agent-kourier svc/agent-kourier-chat 8081:8081 &
+BODY='{"event":"question.asked","channel":"demo","user":{"login":"alice"},"conversation":"c1","question":"Does lodash 4.17.20 have known vulnerabilities? How many?"}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$(kubectl get secret -n openagentix-channels demo-webhook -o jsonpath='{.data.webhookSecret}' | base64 -d)" -hex | awk '{print $NF}')
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8081/chat/webhook/openagentix-channels/demo-webhook \
+  -H 'Content-Type: application/json' -H "X-Demo-Signature: sha256=$SIG" -H 'X-Demo-Delivery: d1' --data-binary "$BODY"
+```
+
+Expect 200. Then `kubectl logs -n agent-kourier deploy/agent-kourier` shows `session turn ended outcome=completed`. For Telegram, message your bot from a chat id on the allowlist.
+
+## What was proven
+
+- A signed webhook through the chart-managed connection ran a turn (`outcome=completed`), called `osv_query_vulnerability` and answered 4. A bad signature got 401. A second `install.sh` run changed nothing.
+- Spike (`spikes/kourier/`): dedupe, threading, rate limits and two connections side by side.
+- Bridge: per-chat user id verified against kagent 1.0.1 in `insecure` mode; unit tests `TestBridge_UserIDIsPerChat` and others.
+- The Telegram path was not run live during the observability work (rule: no Telegram messages); its trace line is unit-tested only.
+
+## Known limits
+
+- Slack is UNTESTED: no Slack tokens were available. The values follow Kourier's docs and CRD schema only.
+- A webhook has no reply route (`output: none`). The agent must deliver through a tool, see [notify](./notify.md).
+- One memory scope per binding (the binding's fixed `userId`). Anyone in a bound Slack channel can use the agent and spend its budget.
+- Kourier is 0.x with one maintainer. A Kourier restart mid-turn ends the turn recorded as `refused` on kagent 1.0.1, though the task completes.
+- Excess events are dropped, not queued, and the sender still gets 200. The dedupe key lives in memory.
+- Bridge: one replica, polling offset in memory (an update can be answered twice after a restart), conversations forgotten on restart.
+- Real webhooks need an Ingress you add yourself, with TLS, and the ingress pods listed in Kourier's `networkPolicy.chatFrom`.
+- Teams and other platforms: not built.

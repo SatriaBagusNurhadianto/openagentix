@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# A stand-in for kubectl in the offline dashboard tests. Behaviour by environment:
+#   FAKE_NS_MISSING=1, FAKE_SVC_MISSING=1  the namespace or the victoria-metrics service does not exist
+#   FAKE_JAEGER=1                          the jaeger service exists
+#   FAKE_PROM_ARGS="--empty"               extra arguments for fake_prom.py (the "VictoriaMetrics" behind the port-forward)
+# `port-forward service/<name> LOCAL:REMOTE` becomes a local server on LOCAL, in this process (exec), so killing it ends it.
+HERE=$(cd "$(dirname "$0")" && pwd)
+case "$1" in
+  get)
+    case "$2" in
+      namespace) [ -z "${FAKE_NS_MISSING:-}" ] || { echo 'Error from server (NotFound): namespaces not found' >&2; exit 1; } ;;
+      service)
+        case "$3" in
+          victoria-metrics) [ -z "${FAKE_SVC_MISSING:-}" ] || { echo 'Error from server (NotFound): services not found' >&2; exit 1; } ;;
+          jaeger) [ -n "${FAKE_JAEGER:-}" ] || exit 1 ;;
+        esac ;;
+    esac
+    exit 0 ;;
+  port-forward)
+    svc=""; map=""
+    for a in "$@"; do
+      case "$a" in service/*) svc=${a#service/} ;; [0-9]*:[0-9]*) map=$a ;; esac
+    done
+    local_port=${map%%:*}
+    echo "Forwarding from 127.0.0.1:$local_port"
+    case "$svc" in
+      victoria-metrics) # shellcheck disable=SC2086
+        exec python3 "$HERE/fake_prom.py" --port "$local_port" ${FAKE_PROM_ARGS:-} ;;
+      *) cd "$(mktemp -d)" && exec python3 -m http.server "$local_port" --bind 127.0.0.1 ;;
+    esac ;;
+esac
+exit 0

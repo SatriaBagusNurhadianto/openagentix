@@ -335,6 +335,59 @@ The bot that sends is the bridge's bot. Sending (`sendMessage`) and the bridge's
 - A prompt-injected agent can still send a misleading message to an allowed destination; the header tells the reader it was automated, the content is the agent's.
 - Telegram bare domains, e-mail addresses and phone numbers are not touched and may still be tappable (see the service README). I cannot see a Telegram client: "delivered" means Telegram's API accepted the message.
 
+## Observability
+
+Cost per agent, one trace per turn, tool-call counts and an audit log, from one switch. **Off by default** (`observability.enabled: false`: the default render is byte-identical to before). Design and evidence: [ADR 0003](docs/decisions/0003-observability.md).
+
+**Turn it on.** With the bundled dev profile (VictoriaMetrics for metrics, Jaeger for traces, namespace `openagentix-observability`, in-memory traces, not for production):
+
+```sh
+VALUES_FILE="components/observability/demo-values.yaml" ./install.sh      # add the other values files you use: Helm replaces release values on every run
+```
+
+`install.sh` configures what the chart does not own from the same switch (the kagent controller and agent runtimes through `spikes/kagent/kagent-helm.sh`, Agent Kourier's OTLP env and scrape policy) and only when they differ from the wanted state, in either direction; a re-run changes nothing. **The first time it rolls the kagent controller and recompiles the agents, and on the 7.7 GiB demo node that roll caused a stall of about 20 minutes (see ADR 0003): do it when nobody is using the demo and expect to delete a crash-looping controller pod.** With your own stack instead:
+
+```yaml
+observability:
+  enabled: true
+  otlp: {endpoint: http://collector.monitoring.svc:4318, protocol: http/protobuf, contentFiltered: false}   # see "Privacy"
+  metrics: {scrape: {namespace: monitoring}}      # PodMonitors, rendered only when the monitoring.coreos.com/v1 API exists
+```
+
+**Open the UIs** (nothing is exposed; the NetworkPolicy admits no UI traffic, a port-forward does not pass through it):
+
+```sh
+kubectl port-forward -n openagentix-observability svc/victoria-metrics 8428:8428    # http://127.0.0.1:8428/vmui (PromQL), /api/v1/query
+kubectl port-forward -n openagentix-observability svc/jaeger 16686:16686            # http://127.0.0.1:16686
+```
+
+**Cost and tokens per agent.** `user_id` is the agent's gateway virtual-key name (`assistant`, `kb`, `memory`), never a person:
+
+```
+sum by (user_id)(increase(agentgateway_gen_ai_client_cost_usd_total[1h]))
+sum by (user_id, gen_ai_token_type)(increase(agentgateway_gen_ai_client_token_usage_sum[1h]))
+```
+
+Cost is the gateway's own catalog price (claude-haiku-5-5: 0.10 USD per million input and 0.50 per million output tokens); it matches the `agw.ai.usage.cost.total` field of the access log. A model missing from the catalog has no cost. For a series younger than the window VictoriaMetrics counts the value of the first scrape as an increase, so the first hour after install reads high; tokens and later windows are exact. Tool calls: `toolhive_mcp_tool_calls_total{tool="..."}`; Substrate: `ate_*`.
+
+**Follow one request.** The Telegram bridge logs one `turn` line per message with `trace_id` (and `context_id`); `tools/a2a-call` prints `traceId` and `contextId` in its summary; for a manual call send a header of your own (`-H 'traceparent: 00-<32 hex>-<16 hex>-01'`). Then:
+
+```sh
+hack/trace-turn.sh <traceId or contextId>     # read-only
+#  model:  2 calls 3.2s  tokens in=30782 out=263  models=claude-haiku-5-5  cost=$0.00321
+#  memory: 2 embedding calls 2.9s
+#  tools:  osv_query_vulnerability 2.9s   (vMCP: osv_query_vulnerability 1.3s)
+#  notify: not called
+```
+
+It reads Jaeger through a port-forward it stops itself, and without Jaeger falls back to the egress proxy's log joined on `ate.actor.name=session-<contextId>`. The full trace (controller, agent runtime in its sandbox, vMCP, model gateway) is in the Jaeger UI under the trace id. The vMCP audit records (tool name, outcome, `actor/kagent/session-<contextId>`, duration) are `AUDIT` lines in the log of the `tools` pod in `mcp-tools`.
+
+**Privacy.** Content capture is off everywhere: kagent `captureContent`, the vMCP audit's `includeRequestData`/`includeResponseData`, and the gateway adds no prompt or completion to its spans. The single value `observability.capture.content` (default `false`) is the only way to turn content on, and it turns on all of those at once. `observability.baggage` (default `false`) would put agent and conversation ids into the `baggage` header sent to MCP servers and model providers. Metrics carry no user id; the bridge's logs carry a chat id only as a short salted hash. **Known leak:** the agent runtime and the vMCP write tool arguments and results into spans whatever the capture setting (`gcp.vertex.agent.tool_call_args`, `tool_response`, `mcp.tool.arguments`), and `user.id` carries `telegram:<chat id>`. The bundled Jaeger deletes them before storage. For **your own endpoint** the chart exports only the gateway's spans until you set `observability.otlp.contentFiltered: true`, which says that your collector deletes those attributes (copy the `attributes` processor from `templates/_helpers.tpl`, `oa.jaegerConfig`). More keys: `observability.bundled.traces.extraDropAttributes`.
+
+**Footprint** (kind, 1 arm64 node): requests +144 Mi (VictoriaMetrics 96 Mi request, 256 Mi limit; Jaeger 48 Mi, 192 Mi); measured working set about an hour in: VictoriaMetrics 153 to 156 MB, Jaeger 27 to 34 MB. A 2 Gi volume holds 7 days of metrics. If the node is short of memory, drop Jaeger first: set `observability.bundled.enabled=false` and point `otlp.endpoint` at another backend, or `observability.tracing.enabled=false`.
+
+**Limits.** Traces are in memory (2 000, gone on restart). OTLP from the sandboxes is proven over http/protobuf only. The PodMonitors are rendered and unit-tested but were not run (the demo cluster has no Prometheus operator). Kourier traces and the Telegram path were not exercised live. kb and notify emit nothing yet. No dashboards, no alerts, no per-user view.
+
 ## Add an agent
 
 Create a values file and pass it to the installer (`knowledge: true` on an agent adds the knowledge base tools and prompt; `memory: {enabled: true}` turns on long-term memory, see "Memory"):
@@ -370,6 +423,7 @@ Skill references must be digest-pinned (`...@sha256:<64 hex>`); the render fails
 charts/openagentix/tests/run.sh      # shell assertions over `helm template`, needs helm, yq, jq
 helm lint charts/openagentix
 (cd tools/a2a-call && make test)     # the schedule caller: go vet, go test -race
+(cd bridges/telegram && go test -race ./...)
 ```
 
 ## Adopting an existing hand-applied install
@@ -426,6 +480,7 @@ services/kb/                    Go knowledge base service (tests, Dockerfile, re
 services/notify/                Go notify service: agents deliver a result to a named chat (tests, Dockerfile, reference manifests in deploy/)
 components/knowledge/sample/    sample corpus install.sh ingests
 hack/kb-ingest.sh               ingest a directory of markdown into a kb collection
+hack/trace-turn.sh              follow one turn (contextId or trace id) through Jaeger or the egress log; read-only
 components/model-gateway/       agentgateway install script, original manifests and NOTES
 components/tools/               ToolHive install script, original manifests, example skill, verify/ clients, NOTES
 components/agents/              the original hand-applied assistant agent (now rendered by the chart)
@@ -433,8 +488,9 @@ hack/kind-config.yaml           kind cluster config (node image pin) used by ins
 components/channels/            Agent Kourier install script, its values, a demo webhook values file
 components/schedules/           a demo values file with one suspended schedule
 components/notify/              a demo values file: notify on, `assistant` opted in
+components/observability/       a demo values file: observability on with the bundled VictoriaMetrics + Jaeger
 tools/a2a-call/                 Go A2A caller run by the schedule CronJobs (tests, Dockerfile)
-docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented)
+docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented, 0003 observability: accepted for the MVP slice)
 spikes/kourier/                 Agent Kourier spike (evidence; superseded by the integration)
 spikes/kagent/                  kagent + Substrate bring-up (up.sh, values) and NOTES
 spikes/ax/                      Google AX spike; not installed

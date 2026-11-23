@@ -1,7 +1,7 @@
 # ADR 0004: Knowledge graph in the knowledge base (entities and relations next to the chunks)
 
-- **Status:** Implemented and tested without a model: unit and integration tests (in-memory store and a throwaway PostgreSQL with pgvector) and a local run against a rule-based stand-in for the model gateway. **Not yet run against a real model, and not yet deployed on the cluster.** Everything about extraction quality, token cost and latency below is therefore a design intent or an estimate, not a measurement.
-- **Curated facts (added later, section below):** unit and integration tested only; **not yet run on the cluster.**
+- **Status:** Implemented and tested without a model: unit and integration tests (in-memory store and a throwaway PostgreSQL with pgvector) and a local run against a rule-based stand-in for the model gateway. **Later:** Proven on the kind demo cluster on 2026-11-23 with a real model: the canary script passed (26 documents, 47,073 extraction tokens, 33 entities, 29 relations) and the agent answered a five-document question with all five citations. One small fictional corpus only, so cost and quality on real documents are still unmeasured. Figures below that predate that run are estimates.
+- **Curated facts (added later, section below):** unit and integration tested. Proven on the kind demo cluster on 2026-11-23: the sample catalogue was loaded (19 entities, 12 relations) and the agent answered a question that needs two extracted facts and one curated fact, naming the fact set as the source of the curated one.
 - **Date:** 2026-11-23
 - **Scope:** an optional graph inside the existing kb service (`knowledge.kb.graph.enabled`, default off). With it off the chart render, the database schema and the tool list are unchanged.
 
@@ -58,7 +58,7 @@ A document can contain text that tries to steer the extractor ("ignore the rules
 - Entity names are merged by canonical form (below), not by similarity: a nickname or an abbreviation stays a separate entity unless the model lists it as an alias. The category-word list is English only. Merging on the name alone can join two different things that have the same proper name inside one collection ("Mesh" the service and "Mesh" the team); the type is not part of the key, so it cannot tell them apart.
 - Relations are directed and typed by a free predicate (`owns`, `calls`, ...). Predicates of different documents are not unified, so a query by predicate is not offered.
 - Deleting or replacing a document removes its edges at once; an entity that nothing refers to any more is removed with them.
-- Retrieval was judged on one real run only (below), and the fixes for what it showed have not yet been run against a real model.
+- Retrieval was judged on one real run only (below), and the fixes for what it showed were confirmed by one further real run (canary PASS).
 
 ## Entity resolution
 

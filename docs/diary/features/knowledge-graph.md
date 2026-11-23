@@ -152,7 +152,7 @@ instead of the `document_id=... chunk=...` of an extracted fact. A curated fact 
 
 The sample `components/knowledge/graph-sample/org-catalogue.yaml` goes with the canary corpus and holds none of its answer chain. The question "Which service calls the ledger API Quill, which team owns it, and who is that team's escalation manager?" needs two extracted facts and one curated one (Orion, Basalt, Priya Venkat).
 
-Status: unit and integration tested (in-memory store, throwaway PostgreSQL, the upgrade of an existing schema), and the sample question is tested offline on the stored extraction of the canary run. **Not yet run on the cluster.**
+Status: unit and integration tested (in-memory store, throwaway PostgreSQL, the upgrade of an existing schema), and the sample question is tested offline on the stored extraction of the canary run. Proven on the kind demo cluster on 2026-11-23: the sample catalogue was loaded (19 entities, 12 relations) and the agent answered a question that needs two extracted facts and one curated fact, naming the fact set as the source of the curated one.
 
 ## What was proven
 

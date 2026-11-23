@@ -133,3 +133,55 @@ func TestRun_DefaultTimeoutIs300s(t *testing.T) {
 		t.Fatalf("defaultTimeout = %v", defaultTimeout)
 	}
 }
+
+func TestRun_SummaryCarriesTheTraceIDTheAgentWasSent(t *testing.T) {
+	var seen string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("traceparent")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"task":{"id":"t-9","contextId":"c-7","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"parts":[{"text":"SECRET-ANSWER"}]}]}}}`))
+	}))
+	t.Cleanup(s.Close)
+	code, out, errs := do(t, map[string]string{"A2A_URL": s.URL, "A2A_USER_ID": "schedule:x", "PROMPT": "SECRET-PROMPT"})
+	if code != 0 {
+		t.Fatalf("code %d %s", code, errs)
+	}
+	var sum map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &sum); err != nil {
+		t.Fatalf("not one JSON line: %q", out)
+	}
+	parts := strings.Split(seen, "-")
+	if len(parts) != 4 || sum["traceId"] != parts[1] {
+		t.Fatalf("summary traceId %v, header %q", sum["traceId"], seen)
+	}
+	if sum["contextId"] != "c-7" {
+		t.Fatalf("summary contextId = %v", sum["contextId"])
+	}
+	if strings.Contains(out+errs, "SECRET-PROMPT") || strings.Contains(out+errs, "SECRET-ANSWER") {
+		t.Fatalf("text leaked into the output: %s %s", out, errs)
+	}
+}
+
+func TestRun_FailureSummaryStillHasTheTraceID(t *testing.T) {
+	s := agent(t, "TASK_STATE_FAILED", "x")
+	code, out, _ := do(t, map[string]string{"A2A_URL": s.URL, "A2A_USER_ID": "schedule:x", "PROMPT": "hi"})
+	var sum map[string]any
+	_ = json.Unmarshal([]byte(strings.TrimSpace(out)), &sum)
+	if code != 1 || len(strings.TrimSpace(asString(sum["traceId"]))) != 32 {
+		t.Fatalf("code %d summary %v", code, sum)
+	}
+}
+
+func TestRun_TraceparentEnvIsContinued(t *testing.T) {
+	var seen string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Get("traceparent")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"task":{"id":"t","status":{"state":"TASK_STATE_COMPLETED"}}}}`))
+	}))
+	t.Cleanup(s.Close)
+	_, out, _ := do(t, map[string]string{"A2A_URL": s.URL, "A2A_USER_ID": "u", "PROMPT": "hi", "TRACEPARENT": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})
+	if !strings.Contains(seen, "-4bf92f3577b34da6a3ce929d0e0e4736-") || !strings.Contains(out, `"traceId":"4bf92f3577b34da6a3ce929d0e0e4736"`) {
+		t.Fatalf("header %q summary %s", seen, out)
+	}
+}
+
+func asString(v any) string { s, _ := v.(string); return s }

@@ -33,6 +33,7 @@ type Config struct {
 	Timeout     time.Duration // whole call, connect to last byte
 	MaxResponse int64         // response body limit in bytes; 0 = DefaultMaxResponse
 	HTTPClient  *http.Client  // optional; redirects are never followed either way
+	Traceparent string        // optional incoming W3C traceparent to continue; empty or malformed starts a new trace
 }
 
 // Result is what the agent returned. Answer is private data: callers decide whether to print it.
@@ -42,6 +43,7 @@ type Result struct {
 	ContextID string
 	Answer    string
 	Duration  time.Duration
+	TraceID   string // the trace this run started (or continued); set even when the call fails, so a failure can be looked up
 }
 
 // NotCompletedError means the task ended (or stopped) in a state other than TASK_STATE_COMPLETED.
@@ -140,6 +142,9 @@ func Run(ctx context.Context, c Config) (res Result, _ error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("A2A-Version", "1.0")
 	req.Header.Set("X-User-Id", c.UserID)
+	tp, traceID := newTraceparent(c.Traceparent)
+	req.Header.Set("traceparent", tp) // traceparent only: no baggage, so no id or user id rides to model providers
+	res.TraceID = traceID
 
 	hc := http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	if c.HTTPClient != nil {

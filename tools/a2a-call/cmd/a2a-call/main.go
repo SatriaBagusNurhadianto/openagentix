@@ -8,6 +8,7 @@
 //	PROMPT               the prompt itself
 //	A2A_TIMEOUT          whole-call timeout, Go duration (default 300s)
 //	MAX_RESPONSE_BYTES   response body limit (default 4194304)
+//	TRACEPARENT          optional W3C traceparent to continue; otherwise the run starts a new trace
 //	PRINT_ANSWER         "true" adds the agent's answer to the summary; off by default, answers may be private
 //
 // stdout gets one JSON summary line; problems go to stderr. Exit codes: 0 completed, 1 the call or the task failed,
@@ -45,6 +46,8 @@ func run(getenv func(string) string, stdout, stderr io.Writer) int {
 	sum := map[string]any{
 		"state":       res.State,
 		"taskId":      res.TaskID,
+		"contextId":   res.ContextID,
+		"traceId":     res.TraceID,
 		"userId":      cfg.UserID,
 		"durationMs":  res.Duration.Milliseconds(),
 		"answerChars": len([]rune(res.Answer)),
@@ -74,6 +77,7 @@ func loadConfig(getenv func(string) string) (cfg call.Config, printAnswer bool, 
 	if u, perr := url.Parse(cfg.URL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return cfg, false, errors.New("A2A_URL must be an http or https URL")
 	}
+	cfg.Traceparent = strings.TrimSpace(getenv("TRACEPARENT"))
 	cfg.UserID = strings.TrimSpace(getenv("A2A_USER_ID"))
 	if cfg.UserID == "" {
 		return cfg, false, errors.New("A2A_USER_ID is required (kagent keys sessions and memory by it)")

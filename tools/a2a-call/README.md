@@ -26,11 +26,21 @@ against kagent 1.0.1). A response without `result.task` (a bare message, an empt
 | `MAX_RESPONSE_BYTES` | response body limit, default 4 MiB; larger is an error |
 | `PRINT_ANSWER` | `true` adds the answer to the summary. Off by default: answers can contain private data and job logs are widely readable |
 
+| `TRACEPARENT` | optional W3C `traceparent` to continue; otherwise the run starts a new trace |
+
 Redirects are never followed (a 3xx is an HTTP error).
+
+## Tracing
+
+Every run sends a W3C `traceparent` header (`00-<32 hex trace id>-<16 hex span id>-01`, random from `crypto/rand`; no OpenTelemetry
+SDK). The tool only STARTS (or continues, with `TRACEPARENT`) a trace and exports no spans: the first span in the backend is the
+platform's, whose parent id points at a span that was never recorded. The trace id is in the summary (`traceId`, also on failure) with
+the conversation id (`contextId`), so a Job's log line leads to the trace (`hack/trace-turn.sh <traceId>`). No `baggage` header is
+ever sent.
 
 ## Output and exit codes
 
-stdout: one line, e.g. `{"state":"TASK_STATE_COMPLETED","taskId":"...","userId":"schedule:daily","durationMs":9120,"answerChars":212}`.
+stdout: one line, e.g. `{"state":"TASK_STATE_COMPLETED","taskId":"...","contextId":"...","traceId":"...","userId":"schedule:daily","durationMs":9120,"answerChars":212}`.
 On failure the line also has `error`, and stderr has `a2a-call: FAILED: <reason>` (a failed task's status text is
 included, cut to 300 characters).
 

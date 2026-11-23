@@ -17,6 +17,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/openagentix/openagentix/services/notify/internal/notify"
+	"github.com/openagentix/openagentix/services/notify/internal/obs"
 )
 
 // Options configures the MCP handler.
@@ -32,6 +33,8 @@ type Options struct {
 	// MaxRequestBytes bounds one HTTP request body (the SDK default is 4 MiB).
 	// Zero means DefaultMaxRequestBytes.
 	MaxRequestBytes int64
+	// Metrics, when non-nil, counts tool calls by tool and outcome. Never arguments or results.
+	Metrics *obs.Metrics
 }
 
 // DefaultMaxRequestBytes is used when Options.MaxRequestBytes is zero.
@@ -80,7 +83,7 @@ func New(svc *notify.Service, log *slog.Logger, opts Options) http.Handler {
 	if opts.MaxRequestBytes <= 0 {
 		opts.MaxRequestBytes = DefaultMaxRequestBytes
 	}
-	h := &handlers{svc: svc, timeout: opts.Timeout}
+	h := &handlers{svc: svc, timeout: opts.Timeout, metrics: opts.Metrics}
 	srv := mcp.NewServer(&mcp.Implementation{Name: "openagentix-notify", Title: "OpenAgentix Notify", Version: opts.Version}, &mcp.ServerOptions{
 		Instructions: "Deliver a result to a pre-approved chat destination. Call notify_list_destinations to see the destination names, then notify_send with one of them. You cannot choose a chat, channel or URL: only the configured names work. Messages are marked as automated.",
 	})
@@ -107,6 +110,39 @@ func boolPtr(b bool) *bool { return &b }
 type handlers struct {
 	svc     *notify.Service
 	timeout time.Duration
+	metrics *obs.Metrics
+}
+
+// sendOutcome names a send failure with a value from the closed set the metrics accept.
+func sendOutcome(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var ne *notify.Error
+	if !errors.As(err, &ne) {
+		return "error"
+	}
+	switch ne.Kind {
+	case notify.Invalid:
+		return "invalid"
+	case notify.UnknownDestination:
+		return "unknown_destination"
+	case notify.TooLong:
+		return "too_long"
+	case notify.RateLimited:
+		return "rate_limited"
+	case notify.Busy:
+		return "busy"
+	case notify.Upstream:
+		return "upstream"
+	case notify.Timeout:
+		return "timeout"
+	case notify.Disabled:
+		return "disabled"
+	case notify.Uncertain:
+		return "uncertain"
+	}
+	return "error"
 }
 
 // bound derives the context of one tool call.
@@ -124,7 +160,9 @@ func textResult(s string) *mcp.CallToolResult {
 func (h *handlers) send(ctx context.Context, _ *mcp.CallToolRequest, in SendInput) (*mcp.CallToolResult, SendOutput, error) {
 	ctx, cancel := h.bound(ctx)
 	defer cancel()
+	began := time.Now()
 	res, err := h.svc.Send(ctx, notify.Request{Destination: in.Destination, Text: in.Text, Title: in.Title, IdempotencyKey: in.IdempotencyKey})
+	h.metrics.ToolCall("notify_send", sendOutcome(err), time.Since(began))
 	if err != nil {
 		var ne *notify.Error
 		if errors.As(err, &ne) {
@@ -144,6 +182,8 @@ func (h *handlers) send(ctx context.Context, _ *mcp.CallToolRequest, in SendInpu
 }
 
 func (h *handlers) list(context.Context, *mcp.CallToolRequest, ListInput) (*mcp.CallToolResult, ListOutput, error) {
+	began := time.Now()
+	defer func() { h.metrics.ToolCall("notify_list_destinations", "ok", time.Since(began)) }()
 	infos := h.svc.List()
 	out := ListOutput{Destinations: make([]DestinationEntry, len(infos))}
 	var sb strings.Builder

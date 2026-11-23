@@ -18,7 +18,11 @@ import (
 	"github.com/openagentix/openagentix/services/notify/internal/destinations"
 	"github.com/openagentix/openagentix/services/notify/internal/httpx"
 	"github.com/openagentix/openagentix/services/notify/internal/notify"
+	"github.com/openagentix/openagentix/services/notify/internal/obs"
 )
+
+// setupMetrics, when non-nil, is wired into the service and the MCP handler by setup.
+var setupMetrics *obs.Metrics
 
 const (
 	tgToken   = "999999:FAKE-TG-TOKEN-zzz"
@@ -97,9 +101,9 @@ func setup(t *testing.T, stateless bool, timeout time.Duration, yaml string) *en
 	if err != nil {
 		t.Fatal(err)
 	}
-	svc := notify.New(notify.Options{Destinations: ds, Label: "Test Agent", MaxInFlight: 4, IdempotencyWindow: time.Minute, IdempotencyMaxEntries: 10, Log: log})
+	svc := notify.New(notify.Options{Destinations: ds, Label: "Test Agent", MaxInFlight: 4, IdempotencyWindow: time.Minute, IdempotencyMaxEntries: 10, Log: log, Metrics: setupMetrics})
 	mux := http.NewServeMux()
-	mux.Handle("/mcp", New(svc, log, Options{Stateless: stateless, Version: "test", Timeout: timeout}))
+	mux.Handle("/mcp", New(svc, log, Options{Stateless: stateless, Version: "test", Timeout: timeout, Metrics: setupMetrics}))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

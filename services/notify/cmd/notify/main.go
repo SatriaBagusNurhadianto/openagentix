@@ -13,17 +13,23 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
+	"time"
 
 	"github.com/openagentix/openagentix/services/notify/internal/config"
 	"github.com/openagentix/openagentix/services/notify/internal/destinations"
 	"github.com/openagentix/openagentix/services/notify/internal/httpx"
 	"github.com/openagentix/openagentix/services/notify/internal/notify"
+	"github.com/openagentix/openagentix/services/notify/internal/obs"
 	"github.com/openagentix/openagentix/services/notify/internal/server"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...".
 var version = "dev"
+
+// onMetricsListen, if set (tests), receives the bound address of the metrics listener.
+var onMetricsListen func(addr string)
 
 func main() {
 	level := slog.LevelInfo
@@ -59,7 +65,12 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	case len(ds) == 0:
 		log.Warn("the destinations file defines no destinations: every send will be refused and /readyz will report not ready")
 	}
+	var m *obs.Metrics // nil unless NOTIFY_METRICS_ADDR is set: every call on it is a no-op
+	if cfg.MetricsAddr != "" {
+		m = obs.New(version)
+	}
 	svc := notify.New(notify.Options{
+		Metrics:      m,
 		Destinations: ds, Label: cfg.SenderLabel, MaxInFlight: cfg.MaxInFlight,
 		IdempotencyWindow: cfg.IdempotencyWindow, IdempotencyMaxEntries: cfg.IdempotencyMaxEntries, Log: log,
 		GlobalRatePerMinute: cfg.GlobalRatePerMinute, GlobalRatePerHour: cfg.GlobalRatePerHour,
@@ -75,5 +86,26 @@ func run(ctx context.Context, getenv func(string) string, log *slog.Logger, onLi
 	if onListen != nil {
 		onListen(ln.Addr().String())
 	}
-	return server.Run(ctx, server.Deps{Svc: svc, Cfg: cfg, Log: log, Version: version}, ln)
+	if m != nil {
+		mln, err := net.Listen("tcp", cfg.MetricsAddr)
+		if err != nil {
+			_ = ln.Close()
+			return fmt.Errorf("metrics listen: %w", err)
+		}
+		log.Info("metrics listening", "listen", mln.Addr().String())
+		if onMetricsListen != nil {
+			onMetricsListen(mln.Addr().String())
+		}
+		var mwg sync.WaitGroup
+		mctx, mstop := context.WithCancel(ctx)
+		mwg.Add(1)
+		go func() {
+			defer mwg.Done()
+			if err := server.RunMetrics(mctx, m, mln, time.Second); err != nil {
+				log.Error("metrics listener stopped", "err", err)
+			}
+		}()
+		defer func() { mstop(); mwg.Wait() }()
+	}
+	return server.Run(ctx, server.Deps{Svc: svc, Cfg: cfg, Log: log, Version: version, Metrics: m}, ln)
 }

@@ -19,6 +19,7 @@ import (
 	"github.com/openagentix/openagentix/services/notify/internal/delivery"
 	"github.com/openagentix/openagentix/services/notify/internal/destinations"
 	"github.com/openagentix/openagentix/services/notify/internal/notify"
+	"github.com/openagentix/openagentix/services/notify/internal/obs"
 )
 
 type sender struct {
@@ -250,5 +251,41 @@ func TestRecoverer_RePanicsErrAbortHandler(t *testing.T) {
 	}
 	if rec.Code == http.StatusInternalServerError || strings.Contains(logs.String(), "panic in handler") {
 		t.Fatalf("an intentional abort must not be reported as a failure: status %d logs %s", rec.Code, logs.String())
+	}
+}
+
+func TestMetricsServerServesOnlyMetrics(t *testing.T) {
+	m := obs.New("test")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- RunMetrics(ctx, m, ln, time.Second) }()
+	base := "http://" + ln.Addr().String()
+	for path, want := range map[string]int{"/metrics": 200, "/mcp": 404, "/healthz": 404, "/readyz": 404, "/": 404} {
+		resp, err := http.Get(base + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("GET %s = %d, want %d", path, resp.StatusCode, want)
+		}
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("RunMetrics returned %v", err)
+	}
+}
+
+func TestAPIListenerDoesNotServeMetrics(t *testing.T) {
+	h := Handler(deps(&sender{}, config.Config{}, io.Discard, true))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	if rec.Code != 404 {
+		t.Fatalf("GET /metrics on the API listener = %d", rec.Code)
 	}
 }

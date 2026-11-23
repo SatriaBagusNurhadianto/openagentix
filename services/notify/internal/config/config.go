@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -53,6 +54,10 @@ type Config struct {
 
 	// MaxRequestBytes bounds one MCP HTTP request body.
 	MaxRequestBytes int64
+
+	// MetricsAddr, when set, is the listen address of the separate Prometheus
+	// listener (GET /metrics only, no authentication). Empty means no metrics.
+	MetricsAddr string
 }
 
 // Load reads configuration using getenv (e.g. os.Getenv).
@@ -131,6 +136,15 @@ func Load(getenv func(string) string) (Config, error) {
 	default:
 		return c, fmt.Errorf("NOTIFY_MCP_STATELESS: must be true or false, got %q", v)
 	}
+	if c.MetricsAddr = getenv("NOTIFY_METRICS_ADDR"); c.MetricsAddr != "" {
+		_, port, perr := net.SplitHostPort(c.MetricsAddr)
+		if perr != nil || port == "" {
+			return c, fmt.Errorf("NOTIFY_METRICS_ADDR: %q must be host:port or :port", c.MetricsAddr)
+		}
+		if c.MetricsAddr == c.Addr && port != "0" { // port 0 picks a free port each, so two of them never collide
+			return c, fmt.Errorf("NOTIFY_METRICS_ADDR: %q must differ from NOTIFY_ADDR (metrics are served on their own listener)", c.MetricsAddr)
+		}
+	}
 	switch c.LogLevel {
 	case "debug", "info", "warn", "error":
 	default:
@@ -146,7 +160,7 @@ func (c Config) LogAttrs() []any {
 		"addr", c.Addr, "config_file_set", c.ConfigPath != "", "request_timeout", c.RequestTimeout.String(),
 		"outbound_timeout", c.OutboundTimeout.String(), "max_inflight", c.MaxInFlight,
 		"max_text_chars", c.Limits.MaxTextChars, "rate_per_minute", c.Limits.RatePerMinute, "rate_per_hour", c.Limits.RatePerHour, "global_rate_per_minute", c.GlobalRatePerMinute, "global_rate_per_hour", c.GlobalRatePerHour,
-		"sender_label", c.SenderLabel, "idempotency_window", c.IdempotencyWindow.String(), "mcp_stateless", c.MCPStateless, "max_request_bytes", c.MaxRequestBytes,
+		"sender_label", c.SenderLabel, "idempotency_window", c.IdempotencyWindow.String(), "mcp_stateless", c.MCPStateless, "max_request_bytes", c.MaxRequestBytes, "metrics_addr", c.MetricsAddr,
 	}
 }
 

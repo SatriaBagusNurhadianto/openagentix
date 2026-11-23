@@ -22,6 +22,7 @@ import (
 	"github.com/openagentix/openagentix/services/notify/internal/delivery"
 	"github.com/openagentix/openagentix/services/notify/internal/destinations"
 	"github.com/openagentix/openagentix/services/notify/internal/idempotency"
+	"github.com/openagentix/openagentix/services/notify/internal/obs"
 	"github.com/openagentix/openagentix/services/notify/internal/ratelimit"
 	"github.com/openagentix/openagentix/services/notify/internal/sanitize"
 )
@@ -105,6 +106,9 @@ type Options struct {
 	GlobalRatePerHour   int
 	Log                 *slog.Logger
 	Now                 func() time.Time // tests
+	// Metrics, when non-nil, counts sends by platform kind and outcome. Never text,
+	// destination names, addresses or keys.
+	Metrics *obs.Metrics
 }
 
 // record is what the idempotency cache remembers: the receipt of a delivered
@@ -129,6 +133,7 @@ type Service struct {
 	global *ratelimit.Limiter // nil when no global cap is set
 	log    *slog.Logger
 	now    func() time.Time
+	met    *obs.Metrics
 
 	globalMin, globalHour int
 }
@@ -157,6 +162,7 @@ func New(o Options) *Service {
 		idem:   idempotency.New[record](o.IdempotencyWindow, max(o.IdempotencyMaxEntries, 1), o.Now),
 		log:    o.Log,
 		now:    o.Now,
+		met:    o.Metrics,
 	}
 	if o.GlobalRatePerMinute > 0 || o.GlobalRatePerHour > 0 {
 		s.global = ratelimit.New(o.GlobalRatePerMinute, o.GlobalRatePerHour, o.Now)
@@ -194,6 +200,23 @@ func (s *Service) Send(ctx context.Context, req Request) (Result, error) {
 	began := time.Now()
 	var d *dest
 	textChars, outcome, detail := 0, "", ""
+	sizeField := "" // set when a send is refused for size: the field that was too long
+	defer func() {
+		kind := "unknown"
+		if d != nil {
+			kind = d.Platform
+		}
+		s.met.Send(kind, metricOutcome(outcome), time.Since(began))
+		switch outcome {
+		case "rate_limited":
+			s.met.RateLimited("destination")
+		case "rate_limited_global":
+			s.met.RateLimited("global")
+		}
+		if sizeField != "" {
+			s.met.PayloadRejected(kind, sizeField)
+		}
+	}()
 	defer func() {
 		attrs := []any{"outcome", outcome, "text_chars", textChars, "duration_ms", time.Since(began).Milliseconds()}
 		if d != nil {
@@ -214,6 +237,7 @@ func (s *Service) Send(ctx context.Context, req Request) (Result, error) {
 		return fail("disabled", &Error{Kind: Disabled, Msg: "notifications are disabled: no destinations are configured"})
 	}
 	if len(req.Destination) > MaxDestinationBytes {
+		sizeField = "destination"
 		return fail("invalid", &Error{Kind: Invalid, Msg: fmt.Sprintf("destination is too long: the limit is %d bytes; use a name from notify_list_destinations", MaxDestinationBytes)})
 	}
 	d = s.dests[req.Destination]
@@ -224,10 +248,13 @@ func (s *Service) Send(ctx context.Context, req Request) (Result, error) {
 	// then anything that scales with the input (cleaning, hashing).
 	switch {
 	case len(req.Text) > bytesPerCharAllowed*d.Limits.MaxTextChars:
+		sizeField = "text"
 		return fail("too_long", &Error{Kind: TooLong, Msg: fmt.Sprintf("text is too long; the limit for destination %q is %d characters. Shorten it and try again", d.Name, d.Limits.MaxTextChars)})
 	case len(req.Title) > bytesPerCharAllowed*MaxTitleChars:
+		sizeField = "title"
 		return fail("too_long", &Error{Kind: TooLong, Msg: fmt.Sprintf("title is too long: the limit is %d characters", MaxTitleChars)})
 	case len(req.IdempotencyKey) > maxKeyBytes:
+		sizeField = "idempotency_key"
 		return fail("invalid", &Error{Kind: Invalid, Msg: "idempotency_key must be 1 to 128 characters from A-Z a-z 0-9 . _ : -"})
 	}
 	select {
@@ -244,8 +271,10 @@ func (s *Service) Send(ctx context.Context, req Request) (Result, error) {
 	case text == "":
 		return fail("invalid", &Error{Kind: Invalid, Msg: "text must not be empty"})
 	case textChars > d.Limits.MaxTextChars:
+		sizeField = "text"
 		return fail("too_long", &Error{Kind: TooLong, Msg: fmt.Sprintf("text is too long: %d characters; the limit for destination %q is %d. Shorten it and try again", textChars, d.Name, d.Limits.MaxTextChars)})
 	case sanitize.RuneCount(title) > MaxTitleChars:
+		sizeField = "title"
 		return fail("too_long", &Error{Kind: TooLong, Msg: fmt.Sprintf("title is too long: the limit is %d characters", MaxTitleChars)})
 	case req.IdempotencyKey != "" && !keyRe.MatchString(req.IdempotencyKey):
 		return fail("invalid", &Error{Kind: Invalid, Msg: "idempotency_key must be 1 to 128 characters from A-Z a-z 0-9 . _ : -"})
@@ -315,6 +344,30 @@ func (s *Service) Send(ctx context.Context, req Request) (Result, error) {
 	}
 	outcome = "sent"
 	return res, nil
+}
+
+// metricOutcome maps the internal outcome strings (logged as they are) to the
+// closed set of the send metric.
+func metricOutcome(o string) string {
+	switch o {
+	case "sent":
+		return "delivered"
+	case "duplicate", "unknown_destination", "busy":
+		return o
+	case "disabled":
+		return "unknown_destination"
+	case "invalid", "too_long":
+		return "rejected_validation"
+	case "rate_limited", "rate_limited_global":
+		return "rate_limited"
+	case "idempotency_uncertain":
+		return "uncertain"
+	case "idempotency_in_progress":
+		return "busy"
+	case "upstream_error", "upstream_rate_limited", "timeout":
+		return "upstream_error"
+	}
+	return "error"
 }
 
 func (s *Service) mapDelivery(d *dest, de *delivery.Error, hasKey bool, outcome *string) (Result, error) {

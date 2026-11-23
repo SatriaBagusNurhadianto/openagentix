@@ -144,6 +144,7 @@ first line of `text` and `title` is its own field.
 | `NOTIFY_IDEMPOTENCY_WINDOW` | `10m` | how long a key remembers its result, including an uncertain or partial one |
 | `NOTIFY_IDEMPOTENCY_MAX_ENTRIES` | `1000` | bound on remembered keys |
 | `NOTIFY_MCP_STATELESS` | `true` | no MCP sessions; any replica can answer any request |
+| `NOTIFY_METRICS_ADDR` | empty (off) | listen address of a separate Prometheus listener that serves only `GET /metrics`, without authentication; must differ from `NOTIFY_ADDR`. Sends are counted by platform kind and outcome, never by destination name, text or address |
 
 Plus whatever variables your destinations name in `tokenEnv` / `secretEnv`.
 

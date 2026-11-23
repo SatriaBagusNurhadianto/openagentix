@@ -102,3 +102,21 @@ func TestLoad_MaxRequestBytes(t *testing.T) {
 		t.Fatal("negative must be rejected")
 	}
 }
+
+func TestMetricsConfig(t *testing.T) {
+	c, err := Load(env(nil))
+	if err != nil || c.MetricsAddr != "" {
+		t.Fatalf("metrics must be off by default: %+v %v", c, err)
+	}
+	if c, err = Load(env(map[string]string{"NOTIFY_METRICS_ADDR": ":9090"})); err != nil || c.MetricsAddr != ":9090" {
+		t.Fatalf("%+v %v", c, err)
+	}
+	for want, m := range map[string]map[string]string{
+		"NOTIFY_METRICS_ADDR":          {"NOTIFY_METRICS_ADDR": "nine-thousand"},
+		"must differ from NOTIFY_ADDR": {"NOTIFY_METRICS_ADDR": ":8080"},
+	} {
+		if _, err := Load(env(m)); err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v", want, err)
+		}
+	}
+}

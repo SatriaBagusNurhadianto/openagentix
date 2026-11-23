@@ -497,3 +497,7 @@ spikes/ax/                      Google AX spike; not installed
 ```
 
 The `NOTES.md` files record versions, deviations from upstream docs, failures and evidence.
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE). This repository is the open core of OpenAgentix.

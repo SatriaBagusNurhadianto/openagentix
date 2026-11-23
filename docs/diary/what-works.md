@@ -39,7 +39,7 @@ Evidence comes from the README, the CHANGELOG, `docs/decisions/` and the compone
 | Observability | working and proven live | Cost per agent, one 59-span trace, tool audit, trace-turn.sh (ADR 0003) | chart `observability` block, `hack/trace-turn.sh` | PodMonitors unit-tested only; no dashboards or alerts; traces in memory |
 | Governance and guardrails | built and tested only | Cedar tool allowlist verified live; notify guardrails unit-tested | chart `mcp.virtual.incomingAuth.toolAccess`, `services/notify/` | No general guardrails, approvals or policy engine for agent output |
 | Single-command install | working and proven live | Cold install from a deleted cluster, twice, warm image cache, 604 s | `install.sh`, `uninstall.sh` | Two layers (installer plus chart), not one Helm chart; no cold install with an empty image cache |
-| Open core and licensing | not built | ADR 0001 names a permissive license as a need; no LICENSE file was found | none | No licensing model written |
+| Open core and licensing | built and tested only | Apache-2.0 `LICENSE` at the repository root for the open core | `LICENSE` | No enterprise edition or repository split yet |
 
 ## What was built beyond WHAT.txt
 

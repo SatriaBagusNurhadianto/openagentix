@@ -62,7 +62,7 @@ Run the demo schedule once (`kubectl create job -n openagentix-schedules --from=
 - On kind with the real Telegram API: a direct tool call, an A2A question, the demo schedule and a signed webhook all delivered to the owner's chat (ADR 0002 note). "Delivered" means the Telegram API accepted the message.
 - Sending and the bridge's long polling do not conflict: no 409 in the bridge log.
 - NetworkPolicy: a pod in `default` and a non-vMCP pod in `mcp-tools` timed out.
-- A security review led to a hardening commit (`68120de`). Unit tests cover the guardrails, and assert no ids or tokens appear in logs or errors.
+- A security review led to a hardening commit (`1fb9b3b`). Unit tests cover the guardrails, and assert no ids or tokens appear in logs or errors.
 
 ## Known limits
 

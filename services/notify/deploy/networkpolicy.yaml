@@ -1,0 +1,66 @@
+# /mcp has no authentication of its own, so network policy is what keeps it
+# private to the tool gateway. This also limits what a compromised or
+# prompt-injected pod could reach.
+#
+# NOTE: NetworkPolicy is only enforced if the cluster's CNI implements it
+# (Calico, Cilium, ...). On a CNI that does not (e.g. plain kindnet/flannel)
+# these objects are accepted and silently do nothing.
+#
+# Ingress: only namespace mcp-tools, only the MCP port. Kubelet probes
+# originate on the node and are allowed by CNIs that enforce policy; if yours
+# blocks them, add an ipBlock for the node CIDR.
+#
+# Egress: DNS, and HTTPS (443) to the internet. NetworkPolicy matches IPs, not
+# hostnames, so "api.telegram.org and slack.com only" cannot be expressed here:
+# the rule below allows 443 to any public address and excludes private ranges
+# (so the pod cannot reach in-cluster services or cloud metadata). To pin it to
+# Telegram/Slack hostnames use an FQDN-aware policy (Cilium toFQDNs, Calico
+# DNS policy) or an egress proxy. In-cluster http webhook receivers
+# (allowInsecureHTTP) need an extra egress rule of your own.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-ingress
+  namespace: openagentix-notify
+spec:
+  podSelector:
+    matchLabels: {app: notify}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: mcp-tools}
+      ports:
+        - {protocol: TCP, port: 8080}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: notify-egress
+  namespace: openagentix-notify
+spec:
+  podSelector:
+    matchLabels: {app: notify}
+  policyTypes: [Egress]
+  egress:
+    # DNS
+    - to:
+        - namespaceSelector:
+            matchLabels: {kubernetes.io/metadata.name: kube-system}
+          podSelector:
+            matchLabels: {k8s-app: kube-dns}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+    # HTTPS to the public internet (api.telegram.org, slack.com, webhook hosts)
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 169.254.0.0/16
+              - 100.64.0.0/10
+      ports:
+        - {protocol: TCP, port: 443}

@@ -1,0 +1,110 @@
+# Secrets are created imperatively and never stored in git. The destinations
+# file holds chat ids (personal data), so it is a Secret too:
+#
+#   kubectl -n openagentix-notify create secret generic notify-destinations \
+#     --from-file=destinations.yaml=./destinations.yaml
+#   kubectl -n openagentix-notify create secret generic notify-credentials \
+#     --from-literal=NOTIFY_TELEGRAM_TOKEN="$TELEGRAM_BOT_TOKEN" \
+#     --from-literal=NOTIFY_SLACK_TOKEN="$SLACK_BOT_TOKEN"
+#
+# The env var names above are examples: they must match the tokenEnv /
+# secretEnv names used in destinations.yaml. Add one `env` entry per name below.
+# (Alternatively mount token files and use tokenFile.) Both Secrets are
+# `optional`: without them the pod still starts, /readyz answers 503 "no
+# destinations are configured" and every notify_send is refused (fail closed).
+#
+# SECURITY: /mcp has NO authentication. The tool gateway (ToolHive/vMCP in
+# namespace mcp-tools) authenticates agents; apply deploy/networkpolicy.yaml
+# (your CNI must enforce NetworkPolicy, or it is silently ignored) and do not
+# expose this Service through an Ingress or LoadBalancer.
+#
+# Agents reach the MCP endpoint (via the tool gateway) at
+#   http://notify.openagentix-notify.svc.cluster.local:8080/mcp
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notify
+  namespace: openagentix-notify
+  labels: {app: notify}
+spec:
+  # Rate limits and idempotency keys are held in process memory, so with N
+  # replicas each destination can receive up to N times the configured rate and
+  # a repeated idempotency_key is only de-duplicated by the replica that saw it.
+  # Keep one replica unless that is acceptable.
+  replicas: 1
+  selector:
+    matchLabels: {app: notify}
+  template:
+    metadata:
+      labels: {app: notify}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35   # > NOTIFY_SHUTDOWN_GRACE (25s)
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532        # lets the non-root user read the 0440 Secret volume
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: notify
+          image: openagentix/notify:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: NOTIFY_ADDR, value: ":8080"}
+            - {name: NOTIFY_CONFIG, value: /etc/notify/destinations.yaml}
+            - {name: NOTIFY_SENDER_LABEL, value: "OpenAgentix agent"}
+            - {name: NOTIFY_MCP_STATELESS, value: "true"}
+            # Optional tuning (defaults shown):
+            # - {name: NOTIFY_MAX_TEXT_CHARS, value: "4000"}
+            # - {name: NOTIFY_RATE_PER_MINUTE, value: "6"}
+            # - {name: NOTIFY_RATE_PER_HOUR, value: "60"}
+            # - {name: NOTIFY_MAX_INFLIGHT, value: "8"}
+            # - {name: NOTIFY_OUTBOUND_TIMEOUT, value: "10s"}
+            # - {name: NOTIFY_REQUEST_TIMEOUT, value: "30s"}
+            - name: NOTIFY_TELEGRAM_TOKEN
+              valueFrom:
+                secretKeyRef: {name: notify-credentials, key: NOTIFY_TELEGRAM_TOKEN, optional: true}
+            - name: NOTIFY_SLACK_TOKEN
+              valueFrom:
+                secretKeyRef: {name: notify-credentials, key: NOTIFY_SLACK_TOKEN, optional: true}
+          volumeMounts:
+            - {name: destinations, mountPath: /etc/notify, readOnly: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {cpu: 250m, memory: 128Mi}
+      volumes:
+        - name: destinations
+          secret:
+            secretName: notify-destinations
+            optional: true
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notify
+  namespace: openagentix-notify
+  labels: {app: notify}
+spec:
+  selector: {app: notify}
+  ports:
+    - {name: http, port: 8080, targetPort: http}

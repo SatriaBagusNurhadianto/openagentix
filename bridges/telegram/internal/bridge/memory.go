@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf16"
 
 	"github.com/openagentix/openagentix/bridges/telegram/internal/memory"
 )
@@ -24,7 +25,7 @@ const (
 	memoryCallTimeout = 20 * time.Second
 	maxListedItems    = 10
 	maxItemRunes      = 200
-	maxReplyRunes     = 3500 // below the 4096 a Telegram message holds
+	maxReplyUnits     = 3500 // UTF-16 code units, as Telegram counts them; a message holds 4096
 	memoryFailure     = "Sorry, I could not do that just now. Please try again."
 )
 
@@ -43,13 +44,22 @@ func (b *Bridge) command(text string) (name string, args []string, ours bool) {
 
 // handleMemoryCommand answers /memories and /forget. It returns false when the text is not one of them (or the feature is
 // off), and the message then goes on to the agent as before. The user id is the chat's, never something typed in the text.
-func (b *Bridge) handleMemoryCommand(ctx context.Context, chat int64, ch, trace, text string, started time.Time) bool {
+func (b *Bridge) handleMemoryCommand(ctx context.Context, chat int64, ch, trace, text string, started time.Time, shared, forwarded bool) bool {
 	if b.Memory == nil {
 		return false
 	}
 	name, args, ours := b.command(text)
 	if !ours || (name != "/memories" && name != "/forget") {
 		return false
+	}
+	if forwarded {
+		// A forwarded message is not this user's own command. Answer without acting, and do not pass it to the agent.
+		reply := "I do not act on forwarded commands. Type the command yourself."
+		if err := b.Telegram.SendMessage(ctx, chat, reply); err != nil {
+			b.Log.Error("telegram sendMessage failed", "chat_hash", ch, "trace_id", trace, "err", err)
+		}
+		b.Log.Info("turn", "trace_id", trace, "chat_hash", ch, "outcome", "memory_forwarded", "total_ms", time.Since(started).Milliseconds())
+		return true
 	}
 	reply, outcome, count := "", "", 0
 	mctx, cancel := context.WithTimeout(ctx, memoryCallTimeout)
@@ -66,7 +76,10 @@ func (b *Bridge) handleMemoryCommand(ctx context.Context, chat int64, ch, trace,
 			reply, outcome = memoryFailure, "memory_error"
 			break
 		}
-		reply, outcome, count = formatMemories(items), "memories", len(items)
+		reply, outcome, count = formatMemories(items, shared), "memories", len(items)
+	case shared:
+		// Every member of a group shares the chat's memories: one member must not delete them for all.
+		reply, outcome = "For safety, /forget works only in a private chat with me. In a group it would delete what every member told me.", "forget_refused"
 	default: // /forget
 		if len(args) != 1 || args[0] != "confirm" {
 			reply, outcome = "This deletes everything I remember about you in this chat. It cannot be undone. To go on, send: /forget confirm", "forget_ask"
@@ -101,17 +114,21 @@ func (b *Bridge) logMemoryError(ch, trace, op string, err error) {
 	b.Log.Error("memory call failed", "chat_hash", ch, "trace_id", trace, "op", op)
 }
 
-// formatMemories lists at most maxListedItems, each cut to maxItemRunes characters, in at most maxReplyRunes in all.
-func formatMemories(items []memory.Item) string {
+// formatMemories lists at most maxListedItems, each cut to maxItemRunes characters, in at most maxReplyUnits in all.
+func formatMemories(items []memory.Item, shared bool) string {
+	whom := "about you"
+	if shared {
+		whom = "from the members"
+	}
 	if len(items) == 0 {
-		return "I have nothing stored about you in this chat."
+		return "I have nothing stored " + whom + " in this chat."
 	}
 	var sb strings.Builder
 	noun := "things"
 	if len(items) == 1 {
 		noun = "thing"
 	}
-	fmt.Fprintf(&sb, "I remember %d %s about you:\n", len(items), noun)
+	fmt.Fprintf(&sb, "I remember %d %s %s in this chat:\n", len(items), noun, whom)
 	shown := 0
 	for _, it := range items {
 		if shown == maxListedItems {
@@ -121,7 +138,7 @@ func formatMemories(items []memory.Item) string {
 		if !it.ExpiresAt.IsZero() {
 			line += " (until " + it.ExpiresAt.UTC().Format("2006-01-02") + ")"
 		}
-		if len([]rune(sb.String()))+len([]rune(line))+1 > maxReplyRunes-200 { // keep room for the last lines
+		if units(sb.String())+units(line)+1 > maxReplyUnits-200 { // keep room for the last lines
 			break
 		}
 		sb.WriteString(line + "\n")
@@ -133,6 +150,9 @@ func formatMemories(items []memory.Item) string {
 	sb.WriteString("Send /forget to delete all of this.")
 	return sb.String()
 }
+
+// units counts UTF-16 code units, the way Telegram measures a message.
+func units(s string) int { return len(utf16.Encode([]rune(s))) }
 
 // clean puts text on one line without control characters and cuts it to n characters (never inside one).
 func clean(s string, n int) string {

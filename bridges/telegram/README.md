@@ -13,6 +13,7 @@ connection from the internet. Go, standard library only.
   puts on the update (a number), never from message text. A **group chat is one identity**, keyed by the group's chat id
   (a negative number such as `telegram:-1001234567890`): everyone in the group shares the group's sessions and memory,
   and what one member asks the agent to remember is recalled for all members of that group (and for nobody outside it).
+  For that reason `/forget` works only in a private chat, and a forwarded message is never taken as a memory command.
   `/new` starts a fresh conversation but keeps the identity, so saved memories survive it. Verified against kagent
   1.0.1 in `insecure` auth mode: the header is honoured and `:` and `-` are accepted. In other auth modes kagent takes
   the user from the authenticated principal and ignores this header.

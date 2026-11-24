@@ -30,14 +30,24 @@ func NewClient(base, token string, hc *http.Client) *Client {
 }
 
 type Chat struct {
-	ID int64 `json:"id"`
+	ID   int64  `json:"id"`
+	Type string `json:"type"` // private, group, supergroup, channel
 }
 
 type Message struct {
 	MessageID int64  `json:"message_id"`
 	Chat      Chat   `json:"chat"`
 	Text      string `json:"text"`
+	// Forward markers: forward_origin (Bot API 7.0 and later) or forward_date (older). Only their presence is used.
+	ForwardOrigin json.RawMessage `json:"forward_origin,omitempty"`
+	ForwardDate   int64           `json:"forward_date,omitempty"`
 }
+
+// Forwarded reports whether the message was forwarded from somewhere else.
+func (m *Message) Forwarded() bool { return len(m.ForwardOrigin) > 0 || m.ForwardDate != 0 }
+
+// Shared reports whether the chat has more than one human member by kind (anything but a private chat).
+func (c Chat) Shared() bool { return c.Type != "" && c.Type != "private" }
 
 type Update struct {
 	UpdateID int64    `json:"update_id"`

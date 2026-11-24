@@ -9,6 +9,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/openagentix/openagentix/bridges/telegram/internal/memory"
@@ -237,5 +238,62 @@ func TestMemoryCommandLogLines(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), memCanary) || strings.Contains(buf.String(), "424242") {
 		t.Fatalf("log carries content or the chat id:\n%s", buf.String())
+	}
+}
+
+// updRaw builds an update with extra message fields (chat type, forward markers).
+func updRaw(id, chat int64, chatType, extra, text string) string {
+	return fmt.Sprintf(`{"update_id":%d,"message":{"message_id":%d,"chat":{"id":%d,"type":%q}%s,"text":%q}}`, id, id, chat, chatType, extra, text)
+}
+
+// In a group every member shares the chat's memory scope: one member must not be able to wipe it.
+func TestForgetIsRefusedOutsidePrivateChats(t *testing.T) {
+	f := newFakeTelegram(t, "["+updRaw(1, -100, "group", "", "/forget confirm")+"]", "["+updRaw(2, -200, "supergroup", "", "/forget confirm")+"]")
+	mem := &fakeMemory{}
+	runUntil(t, memBridge(f, okAgent(), mem, nil), func() bool { return len(f.sentMsgs()) >= 2 })
+	if _, d := mem.counts(); d != 0 {
+		t.Fatalf("Delete was called %d times in a group chat", d)
+	}
+	for _, m := range f.sentMsgs() {
+		if !strings.Contains(m.Text, "private chat") {
+			t.Errorf("reply %q does not explain the private-chat rule", m.Text)
+		}
+	}
+}
+
+// A forwarded message whose text is a command is not the user's own command.
+func TestForwardedMemoryCommandsAreIgnored(t *testing.T) {
+	f := newFakeTelegram(t,
+		"["+updRaw(1, 42, "private", `,"forward_origin":{"type":"user"}`, "/forget confirm")+"]",
+		"["+updRaw(2, 42, "private", `,"forward_date":1700000000`, "/memories")+"]",
+		"["+updRaw(3, 42, "private", "", "/memories")+"]")
+	mem := &fakeMemory{}
+	runUntil(t, memBridge(f, okAgent(), mem, nil), func() bool { l, _ := mem.counts(); return l >= 1 && len(f.sentMsgs()) >= 3 })
+	if l, d := mem.counts(); l != 1 || d != 0 {
+		t.Fatalf("list=%d delete=%d, want only the one direct /memories", l, d)
+	}
+}
+
+func TestMemoriesWordingInGroups(t *testing.T) {
+	f := newFakeTelegram(t, "["+updRaw(1, -100, "group", "", "/memories")+"]")
+	mem := &fakeMemory{items: []memory.Item{{Content: "x"}}}
+	runUntil(t, memBridge(f, okAgent(), mem, nil), func() bool { return len(f.sentMsgs()) >= 1 })
+	if txt := f.sentMsgs()[0].Text; strings.Contains(txt, "about you") || !strings.Contains(txt, "in this chat") {
+		t.Fatalf("group reply = %q", txt)
+	}
+}
+
+// Telegram counts the 4096 limit in UTF-16 code units; an emoji is two.
+func TestMemoriesReplyFitsTelegramInUTF16(t *testing.T) {
+	var items []memory.Item
+	for i := 0; i < 30; i++ {
+		items = append(items, memory.Item{Content: strings.Repeat("\U0001F600", 400)})
+	}
+	got := formatMemories(items, false)
+	if n := len(utf16.Encode([]rune(got))); n > 4000 {
+		t.Fatalf("reply is %d UTF-16 units", n)
+	}
+	if !strings.Contains(got, "/forget") {
+		t.Fatalf("the closing line is missing")
 	}
 }

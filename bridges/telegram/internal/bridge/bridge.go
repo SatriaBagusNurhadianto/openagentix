@@ -208,7 +208,7 @@ func (b *Bridge) handle(ctx context.Context, u telegram.Update) {
 		b.Log.Info("turn", "trace_id", tc.TraceID, "chat_hash", ch, "outcome", "new_conversation", "total_ms", time.Since(started).Milliseconds())
 		return
 	}
-	if b.handleMemoryCommand(ctx, chat, ch, tc.TraceID, text, started) {
+	if b.handleMemoryCommand(ctx, chat, ch, tc.TraceID, text, started, u.Message.Chat.Shared(), u.Message.Forwarded()) {
 		return
 	}
 	// Best effort: turns take seconds, so show "typing..." first. A failure

@@ -24,6 +24,7 @@ import (
 
 const rulesJSON = `{"callers":[
  {"name":"bridge","serviceAccount":{"namespace":"gw","name":"bridge"},"agents":["kagent/assistant"],"userId":{"prefix":"telegram:"}},
+ {"name":"bridge-mem","serviceAccount":{"namespace":"gw","name":"bridge-mem"},"agents":["kagent/assistant"],"userId":{"prefix":"telegram:"},"memory":true,"methods":["SendMessage"]},
  {"name":"schedule-x","serviceAccount":{"namespace":"sch","name":"schedule-x"},"agents":["kagent/assistant"],"userId":{"exact":"schedule:x"},"methods":["SendMessage"]},
  {"name":"kourier-b","key":true,"agents":["kagent/assistant"],"userId":{"fixed":"kourier:b"},"methods":["SendMessage","SendStreamingMessage","GetTask","SubscribeToTask","CancelTask"]}
 ]}`
@@ -35,10 +36,11 @@ func jwt(who string, exp time.Time, aud string) string {
 }
 
 var (
-	tokBridge   = jwt("bridge", time.Now().Add(time.Hour), "aud")
-	tokSchedule = jwt("schedule", time.Now().Add(time.Hour), "aud")
-	tokExpired  = jwt("expired", time.Now().Add(-time.Hour), "aud")
-	tokOtherAud = jwt("other", time.Now().Add(time.Hour), "other")
+	tokBridge    = jwt("bridge", time.Now().Add(time.Hour), "aud")
+	tokSchedule  = jwt("schedule", time.Now().Add(time.Hour), "aud")
+	tokBridgeMem = jwt("bridge-mem", time.Now().Add(time.Hour), "aud")
+	tokExpired   = jwt("expired", time.Now().Add(-time.Hour), "aud")
+	tokOtherAud  = jwt("other", time.Now().Add(time.Hour), "other")
 )
 
 const (
@@ -56,6 +58,8 @@ func (fakeReviewer) Review(_ context.Context, token, _ string) (string, error) {
 	switch token {
 	case tokBridge:
 		return "system:serviceaccount:gw:bridge", nil
+	case tokBridgeMem:
+		return "system:serviceaccount:gw:bridge-mem", nil
 	case tokSchedule:
 		return "system:serviceaccount:sch:schedule-x", nil
 	}

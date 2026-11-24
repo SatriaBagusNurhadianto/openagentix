@@ -14,7 +14,7 @@ What it does for each request:
 2. Finds the caller's rule in the rules file (JSON, rendered by the chart, holds no secret): the agents the
    caller may reach (`namespace/name`) and the user ids it may assert (`exact`, `prefix` or `fixed`).
 3. Passes only these routes, for an allowed agent, and answers 403 for everything else (gRPC and gRPC-Web
-   included, content type `application/grpc*`):
+   included, content type `application/grpc*`, except the two memory RPCs below for a caller with `memory: true`):
    - `POST /agents/<ns>/<name>` (JSON-RPC) and `POST .../message:send`, `message:stream` (also under `/v1/`);
    - `GET /agents/<ns>/<name>/.well-known/agent-card.json` (and `agent.json`).
 
@@ -28,6 +28,18 @@ What it does for each request:
    If the method cannot be determined (a larger body, a batch, no or two `method` members, text that is not JSON,
    data after the object) the gate **fails closed**: 403, `reason: method`, and nothing reaches the agent.
    The audit field `rpc` carries the method.
+   **Memory RPCs (opt-in per caller).** A caller whose rule has `memory: true` may also call two RPCs of kagent's
+   `MemoryService` over binary gRPC-Web, and nothing else of any gRPC service: `POST /kagent.runtime.v1.MemoryService/List` and
+   `POST /kagent.runtime.v1.MemoryService/Delete` (content type `application/grpc-web` or `application/grpc-web+proto`; no native
+   gRPC, no base64 text mode, no compression). Every other path, method, content type and RPC stays 403, `Search`, `AddSession` and
+   `AddSessionBatch` included. Which user is meant is **not in the message**: kagent takes it from the authenticated principal, which in
+   `insecure` mode is `X-User-Id` (kagent `go/core/internal/service/memory/service.go` `managementScope`, `go/core/internal/grpcserver/interceptors.go`
+   forwards the `x-user-id` metadata). The gate therefore sets `X-User-Id` from the caller's rule exactly as for A2A (a user id outside
+   the rule gets 403, `reason: user_id`). The message holds only `agent_name`; the gate reads the one frame (at most 600 bytes, within the sniff
+   timeout), requires exactly one string field number 1 and nothing else (a second, repeated or unknown field, a trailer or compressed
+   frame, a wrong length, bytes after the frame, invalid UTF-8 are all refused with `reason: frame`), requires the agent to be one the rule allows
+   (`reason: agent`), and forwards exactly the bytes it verified. The audit line has `rpc` = `MemoryService/List` or `MemoryService/Delete`, the agent, the
+   hashed user id and never any content. Without `memory: true`: 403, `reason: memory`.
 4. Removes `Authorization`, `Cookie`, `X-User-Id`, `X-Agent-Name`, `X-Share-Token`, `Baggage`, the `X-Forwarded-*`
    headers and the whole query string (kagent reads `?user_id=` before `X-User-Id`), then sets `X-User-Id`
    itself from the rule. The controller stays in `insecure` mode and never sees a caller credential.

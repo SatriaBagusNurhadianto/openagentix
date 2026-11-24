@@ -130,3 +130,19 @@ func TestMethodsRejectBadValues(t *testing.T) {
 		}
 	}
 }
+
+func TestMemoryFlag(t *testing.T) {
+	r, err := Parse([]byte(`{"callers":[
+ {"name":"a","key":true,"agents":["k/a"],"userId":{"fixed":"x"},"memory":true},
+ {"name":"b","key":true,"agents":["k/a"],"userId":{"fixed":"y"},"memory":false},
+ {"name":"c","key":true,"agents":["k/a"],"userId":{"fixed":"z"}}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.ByName("a").Memory || r.ByName("b").Memory || r.ByName("c").Memory {
+		t.Fatal("memory must be true only where the rule says so (default false)")
+	}
+	if _, err := Parse([]byte(`{"callers":[{"name":"a","key":true,"agents":["k/a"],"userId":{"fixed":"x"},"memory":"yes"}]}`)); err == nil {
+		t.Fatal("memory must be a boolean")
+	}
+}

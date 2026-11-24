@@ -42,6 +42,9 @@ type Caller struct {
 	UserID         UserRule        `json:"userId"`
 	// Methods are the JSON-RPC methods the caller may use (A2A names such as SendMessage). Empty: DefaultMethods.
 	Methods []string `json:"methods,omitempty"`
+	// Memory lets the caller use two RPCs of kagent's MemoryService, List and Delete, for the user ids and agents its rule
+	// allows (ADR 0006, round 3). Default false: every gRPC and gRPC-Web call is refused.
+	Memory bool `json:"memory,omitempty"`
 }
 
 // DefaultMethods are what a caller without its own list may use: send a message, and stream one. Reading, cancelling

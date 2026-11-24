@@ -247,6 +247,12 @@ func (h *handler) serve(w *recorder, r *http.Request, a *auditRec) {
 		a.userID = claimed[0][:min(len(claimed[0]), maxAuditUserBytes)]
 	}
 
+	// 2a. the MemoryService (ADR 0006, round 3): List and Delete for a caller whose rule says memory: true, nothing else
+	if strings.HasPrefix(r.URL.Path, memoryService) {
+		h.serveMemory(w, r, a, caller, claimed)
+		return
+	}
+
 	// 2. what is it asking for: only A2A paths, never gRPC or gRPC-Web
 	if ct := strings.ToLower(r.Header.Get("Content-Type")); strings.HasPrefix(ct, "application/grpc") {
 		refuse(http.StatusForbidden, "grpc", "forbidden")

@@ -97,3 +97,36 @@ func TestResolveUser(t *testing.T) {
 		}
 	}
 }
+
+func TestMethodsDefaultAndExplicit(t *testing.T) {
+	r, err := Parse([]byte(`{"callers":[
+ {"name":"a","key":true,"agents":["k/a"],"userId":{"fixed":"x"}},
+ {"name":"b","key":true,"agents":["k/a"],"userId":{"fixed":"x"},"methods":["SendMessage","GetTask"]}
+]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, b := r.ByName("a"), r.ByName("b")
+	for _, m := range DefaultMethods {
+		if !a.AllowsMethod(m) {
+			t.Errorf("the default list must allow %s", m)
+		}
+	}
+	for _, m := range []string{"GetTask", "CancelTask", "ListTasks", "SubscribeToTask", "CreateTaskPushNotificationConfig", "", "message/send"} {
+		if a.AllowsMethod(m) {
+			t.Errorf("the default list must not allow %q", m)
+		}
+	}
+	if !b.AllowsMethod("GetTask") || b.AllowsMethod("SendStreamingMessage") {
+		t.Error("an explicit list replaces the default")
+	}
+}
+
+func TestMethodsRejectBadValues(t *testing.T) {
+	for name, m := range map[string]string{"empty list": `[]`, "empty name": `[""]`, "space": `["Send Message"]`, "duplicate": `["A","A"]`, "star": `["*"]`} {
+		_, err := Parse([]byte(`{"callers":[{"name":"a","key":true,"agents":["k/a"],"userId":{"fixed":"x"},"methods":` + m + `}]}`))
+		if err == nil {
+			t.Errorf("%s: want an error", name)
+		}
+	}
+}

@@ -22,6 +22,9 @@ import (
 	"github.com/openagentix/openagentix/services/a2a-gate/internal/rules"
 )
 
+// maxHeaderBytes is the largest request header block the server reads (the net/http default is 1 MiB).
+const maxHeaderBytes = 16 << 10
+
 // version is stamped at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
@@ -76,7 +79,7 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 			}},
 		}),
 		Audit:       slog.New(slog.NewJSONHandler(d.Stdout, nil)),
-		AuditUserID: cfg.AuditUserID, Salt: salt, SniffBytes: cfg.SniffBytes, MaxBody: cfg.MaxBody,
+		AuditUserID: cfg.AuditUserID, Salt: salt, SniffBytes: cfg.SniffBytes, MaxBody: cfg.MaxBody, MaxInFlight: cfg.MaxInFlight,
 	})
 	if err != nil {
 		return err
@@ -94,8 +97,10 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 	if d.OnListen != nil {
 		d.OnListen(ln.Addr().String())
 	}
-	// No write timeout: an A2A stream (SSE) can run for minutes. Slow headers are cut.
-	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second}
+	// No write timeout: an A2A stream (SSE) can run for minutes. Slow headers are cut, and a header block above 16 KiB
+	// is refused (431): the real callers send well under 4 KiB (a ServiceAccount token is about 1 KiB). The start of
+	// a body has its own read deadline in the gate.
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 120 * time.Second, MaxHeaderBytes: maxHeaderBytes}
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {

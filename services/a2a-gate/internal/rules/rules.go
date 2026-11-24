@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode"
 )
@@ -39,7 +40,15 @@ type Caller struct {
 	Key            bool            `json:"key,omitempty"` // authenticates with a static key (SHA-256 in the keys Secret, file named like the caller)
 	Agents         []string        `json:"agents"`        // "namespace/name"
 	UserID         UserRule        `json:"userId"`
+	// Methods are the JSON-RPC methods the caller may use (A2A names such as SendMessage). Empty: DefaultMethods.
+	Methods []string `json:"methods,omitempty"`
 }
+
+// DefaultMethods are what a caller without its own list may use: send a message, and stream one. Reading, cancelling
+// or listing tasks, and push notification settings, are not in it.
+var DefaultMethods = []string{"SendMessage", "SendStreamingMessage"}
+
+var methodRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_./:-]{0,63}$`)
 
 // Rules is the parsed file.
 type Rules struct {
@@ -103,6 +112,18 @@ func Parse(b []byte) (*Rules, error) {
 				return nil, fmt.Errorf("caller %q: agent %q must be namespace/name", c.Name, a)
 			}
 		}
+		if c.Methods != nil {
+			if len(c.Methods) == 0 {
+				return nil, fmt.Errorf("caller %q: methods must not be empty (leave it out for the default list)", c.Name)
+			}
+			seen := map[string]bool{}
+			for _, m := range c.Methods {
+				if !methodRe.MatchString(m) || seen[m] {
+					return nil, fmt.Errorf("caller %q: method %q is not a valid method name, or is listed twice", c.Name, m)
+				}
+				seen[m] = true
+			}
+		}
 		set := 0
 		for _, v := range []string{c.UserID.Exact, c.UserID.Prefix, c.UserID.Fixed} {
 			if v != "" {
@@ -152,6 +173,15 @@ func (c *Caller) AllowsAgent(ns, name string) bool {
 
 // ResolveUser applies the caller's user id rule to the X-User-Id values the request carried. It returns the
 // value to send upstream, or false when the request must be refused.
+// AllowsMethod reports whether the caller may use a JSON-RPC method.
+func (c *Caller) AllowsMethod(m string) bool {
+	list := c.Methods
+	if len(list) == 0 {
+		list = DefaultMethods
+	}
+	return slices.Contains(list, m)
+}
+
 func (c *Caller) ResolveUser(inbound []string) (string, bool) {
 	switch {
 	case c.UserID.Fixed != "":

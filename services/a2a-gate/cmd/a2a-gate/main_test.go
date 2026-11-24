@@ -46,7 +46,7 @@ func TestRunServesAndStops(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("did not start")
 	}
-	req, _ := http.NewRequest("POST", "http://"+a+"/agents/kagent/assistant", strings.NewReader(`{"params":{"message":{"contextId":"c1"}}}`))
+	req, _ := http.NewRequest("POST", "http://"+a+"/agents/kagent/assistant", strings.NewReader(`{"method":"SendMessage","params":{"message":{"contextId":"c1"}}}`))
 	req.Header.Set("Authorization", "Bearer the-key")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != 200 {
@@ -55,6 +55,17 @@ func TestRunServesAndStops(t *testing.T) {
 	resp.Body.Close()
 	if gotUser != "kourier:k" {
 		t.Errorf("upstream user %q", gotUser)
+	}
+	// a header block above 16 KiB is refused by the server before the gate sees it
+	big, _ := http.NewRequest("GET", "http://"+a+"/healthz", nil)
+	big.Header.Set("X-Pad", strings.Repeat("p", 20<<10))
+	if resp, err := http.DefaultClient.Do(big); err != nil || resp.StatusCode != http.StatusRequestHeaderFieldsTooLarge {
+		t.Errorf("20 KiB header: %v %v, want 431", resp, err)
+	}
+	small, _ := http.NewRequest("GET", "http://"+a+"/healthz", nil)
+	small.Header.Set("X-Pad", strings.Repeat("p", 4<<10))
+	if resp, err := http.DefaultClient.Do(small); err != nil || resp.StatusCode != http.StatusOK {
+		t.Errorf("4 KiB header: %v %v, want 200", resp, err)
 	}
 	resp, _ = http.Get("http://" + a + "/agents/kagent/assistant")
 	if resp.StatusCode != 401 {

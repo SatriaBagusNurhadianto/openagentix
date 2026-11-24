@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -53,7 +54,14 @@ func newAuth(t *testing.T, rv Reviewer, keys Keys, now func() time.Time) *Authen
 	return New(Options{Rules: r, Audience: "openagentix-a2a", Keys: keys, Reviewer: rv, Now: now})
 }
 
-const jwtShaped = "aaa.bbb.ccc"
+// jwtShaped is what a projected ServiceAccount token looks like to the pre-filter: audience, issuer and expiry present.
+var jwtShaped = makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "iss": "https://kubernetes.default.svc", "exp": time.Now().Add(time.Hour).Unix(), "sub": "a"})
+
+// makeJWT builds an unsigned, JWT-shaped string with the given payload (the gate never checks the signature itself).
+func makeJWT(claims map[string]any) string {
+	b, _ := json.Marshal(claims)
+	return "eyJhbGciOiJSUzI1NiJ9." + base64.RawURLEncoding.EncodeToString(b) + ".c2ln"
+}
 
 func TestStaticKey(t *testing.T) {
 	rv := &fakeReviewer{}
@@ -234,4 +242,177 @@ func TestDirKeysReportsUnreadableFilesOnce(t *testing.T) {
 			t.Fatal("a hash was reported")
 		}
 	}
+}
+
+func TestOversizedBearerIsRefusedWithoutReview(t *testing.T) {
+	rv := &fakeReviewer{user: "system:serviceaccount:openagentix-gateway:telegram-bridge"}
+	a := newAuth(t, rv, fakeKeys{}, nil)
+	big := makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "iss": "i", "exp": time.Now().Add(time.Hour).Unix(), "pad": strings.Repeat("x", MaxTokenBytes)})
+	if len(big) <= MaxTokenBytes {
+		t.Fatal("test token is not big enough")
+	}
+	if _, err := a.Authenticate(context.Background(), big); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("got %v", err)
+	}
+	if rv.calls != 0 {
+		t.Fatalf("an oversized token cost %d TokenReviews", rv.calls)
+	}
+}
+
+func TestPreFilterSpendsNoReviewOnImplausibleTokens(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	future, past := now.Add(time.Hour).Unix(), now.Add(-time.Hour).Unix()
+	cases := map[string]string{
+		"wrong audience":   makeJWT(map[string]any{"aud": []string{"other"}, "iss": "i", "exp": future}),
+		"no audience":      makeJWT(map[string]any{"iss": "i", "exp": future}),
+		"no issuer":        makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "exp": future}),
+		"expired":          makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "iss": "i", "exp": past}),
+		"no expiry":        makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "iss": "i"}),
+		"payload not b64":  "aaa.!!!.ccc",
+		"payload not json": "aaa." + base64.RawURLEncoding.EncodeToString([]byte("nope")) + ".ccc",
+		"three dots":       "a.b.c.d",
+	}
+	for name, tok := range cases {
+		rv := &fakeReviewer{user: "system:serviceaccount:openagentix-gateway:telegram-bridge"}
+		a := newAuth(t, rv, fakeKeys{}, func() time.Time { return now })
+		if _, err := a.Authenticate(context.Background(), tok); !errors.Is(err, ErrUnauthenticated) {
+			t.Errorf("%s: got %v", name, err)
+		}
+		if rv.calls != 0 {
+			t.Errorf("%s: %d TokenReviews, want 0", name, rv.calls)
+		}
+	}
+	// the audience may be a plain string, and an array may hold other audiences too
+	for name, aud := range map[string]any{"string": "openagentix-a2a", "array": []string{"x", "openagentix-a2a"}} {
+		rv := &fakeReviewer{user: "system:serviceaccount:openagentix-gateway:telegram-bridge"}
+		a := newAuth(t, rv, fakeKeys{}, func() time.Time { return now })
+		tok := makeJWT(map[string]any{"aud": aud, "iss": "i", "exp": future})
+		if c, err := a.Authenticate(context.Background(), tok); err != nil || c.Name != "bridge" {
+			t.Errorf("aud as %s: %v %v", name, c, err)
+		}
+	}
+}
+
+type slowReviewer struct {
+	mu          sync.Mutex
+	calls       int
+	inFlight    int
+	maxInFlight int
+	release     chan struct{}
+	user        string
+	err         error
+}
+
+func (s *slowReviewer) Review(ctx context.Context, token, _ string) (string, error) {
+	s.mu.Lock()
+	s.calls++
+	s.inFlight++
+	if s.inFlight > s.maxInFlight {
+		s.maxInFlight = s.inFlight
+	}
+	s.mu.Unlock()
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	s.mu.Lock()
+	s.inFlight--
+	s.mu.Unlock()
+	return s.user, s.err
+}
+
+func uniqueJWT(i int) string {
+	return makeJWT(map[string]any{"aud": []string{"openagentix-a2a"}, "iss": "i", "exp": time.Now().Add(time.Hour).Unix(), "n": i})
+}
+
+func TestSameTokenIsReviewedOnceWhileInFlight(t *testing.T) {
+	rv := &slowReviewer{release: make(chan struct{}), user: "system:serviceaccount:openagentix-gateway:telegram-bridge"}
+	a := newAuth(t, rv, fakeKeys{}, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if c, err := a.Authenticate(context.Background(), jwtShaped); err != nil || c.Name != "bridge" {
+				t.Errorf("%v %v", c, err)
+			}
+		}()
+	}
+	time.Sleep(100 * time.Millisecond)
+	close(rv.release)
+	wg.Wait()
+	if rv.calls != 1 {
+		t.Fatalf("TokenReview calls = %d, want 1 (singleflight)", rv.calls)
+	}
+}
+
+func TestConcurrentReviewsAreLimited(t *testing.T) {
+	rv := &slowReviewer{release: make(chan struct{}), err: ErrUnauthenticated}
+	r, _ := rules.Parse([]byte(rulesJSON))
+	a := New(Options{Rules: r, Audience: "openagentix-a2a", Keys: fakeKeys{}, Reviewer: rv, MaxReviews: 2})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(i int) { defer wg.Done(); _, _ = a.Authenticate(context.Background(), uniqueJWT(i)) }(i)
+	}
+	time.Sleep(150 * time.Millisecond)
+	close(rv.release)
+	wg.Wait()
+	if rv.maxInFlight > 2 || rv.maxInFlight == 0 {
+		t.Fatalf("max concurrent reviews = %d, want 1..2", rv.maxInFlight)
+	}
+}
+
+func TestReviewQueueGivesUpWhenFull(t *testing.T) {
+	rv := &slowReviewer{release: make(chan struct{}), err: ErrUnauthenticated}
+	r, _ := rules.Parse([]byte(rulesJSON))
+	a := New(Options{Rules: r, Audience: "openagentix-a2a", Keys: fakeKeys{}, Reviewer: rv, MaxReviews: 1, ReviewWait: 50 * time.Millisecond})
+	go func() { _, _ = a.Authenticate(context.Background(), uniqueJWT(1)) }()
+	time.Sleep(50 * time.Millisecond)
+	if _, err := a.Authenticate(context.Background(), uniqueJWT(2)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("got %v, want ErrUnavailable (fail closed, no unbounded queue)", err)
+	}
+	close(rv.release)
+}
+
+func TestNegativeFloodDoesNotEvictPositiveEntries(t *testing.T) {
+	good := &countingReviewer{}
+	a := newAuth(t, good, fakeKeys{}, nil)
+	if _, err := a.Authenticate(context.Background(), jwtShaped); err != nil {
+		t.Fatal(err)
+	}
+	good.user, good.err = "", ErrUnauthenticated
+	for i := 0; i < 5000; i++ {
+		_, _ = a.Authenticate(context.Background(), uniqueJWT(i))
+	}
+	before := good.calls
+	if _, err := a.Authenticate(context.Background(), jwtShaped); err != nil {
+		t.Fatal(err)
+	}
+	if good.calls != before {
+		t.Fatalf("the positive entry was evicted by a flood of bad tokens (%d extra TokenReviews)", good.calls-before)
+	}
+	a.mu.Lock()
+	n := len(a.neg)
+	a.mu.Unlock()
+	if n > 2048 {
+		t.Fatalf("negative cache holds %d entries, want a bounded number", n)
+	}
+}
+
+type countingReviewer struct {
+	mu    sync.Mutex
+	calls int
+	user  string
+	err   error
+}
+
+func (c *countingReviewer) Review(context.Context, string, string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls++
+	if c.err != nil {
+		return "", c.err
+	}
+	return "system:serviceaccount:openagentix-gateway:telegram-bridge", nil
 }

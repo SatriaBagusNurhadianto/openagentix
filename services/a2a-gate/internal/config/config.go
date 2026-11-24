@@ -19,6 +19,7 @@ type Config struct {
 	AuditUserID string // hash | raw
 	SniffBytes  int
 	MaxBody     int64
+	MaxInFlight int // requests handled at once; the next gets 503
 	LogLevel    string
 }
 
@@ -36,6 +37,7 @@ func Load(getenv func(string) string) (Config, error) {
 		AuditUserID: or(getenv("A2A_GATE_AUDIT_USER_ID"), "hash"),
 		SniffBytes:  64 << 10,
 		MaxBody:     8 << 20,
+		MaxInFlight: 128,
 		LogLevel:    or(getenv("A2A_GATE_LOG_LEVEL"), "info"),
 	}
 	u, err := url.Parse(c.Upstream)
@@ -54,6 +56,13 @@ func Load(getenv func(string) string) (Config, error) {
 			return c, fmt.Errorf("A2A_GATE_SNIFF_BYTES must be 1..%d", MaxSniffBytes)
 		}
 		c.SniffBytes = n
+	}
+	if v := getenv("A2A_GATE_MAX_INFLIGHT"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 10000 {
+			return c, errors.New("A2A_GATE_MAX_INFLIGHT must be 1..10000")
+		}
+		c.MaxInFlight = n
 	}
 	if v := getenv("A2A_GATE_MAX_BODY"); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)

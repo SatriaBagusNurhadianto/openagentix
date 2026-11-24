@@ -14,6 +14,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -42,12 +43,20 @@ type Options struct {
 	Salt        []byte       // for the hash; random per process by default (set in main)
 	SniffBytes  int          // how much of a request body is read to find the contextId (default 64 KiB)
 	MaxBody     int64        // largest request body accepted (default 8 MiB)
-	Transport   http.RoundTripper
+	// MaxInFlight caps the requests handled at once (default 128); the next one gets 503. Health probes do not count.
+	MaxInFlight int
+	// SniffTimeout is how long the sniffed start of a body may take to arrive (default 10 s). It is cleared before
+	// the request is proxied, so a long upload or a long stream is not cut by it.
+	SniffTimeout time.Duration
+	Transport    http.RoundTripper
 }
 
 const (
-	defaultSniff   = 64 << 10
-	defaultMaxBody = 8 << 20
+	defaultSniff       = 64 << 10
+	defaultMaxBody     = 8 << 20
+	defaultMaxInFlight = 128
+	defaultSniffWait   = 10 * time.Second
+	maxAuditUserBytes  = 128
 )
 
 // request-scoped values for the proxy's Rewrite
@@ -63,6 +72,7 @@ type userVal struct {
 type handler struct {
 	o     Options
 	proxy *httputil.ReverseProxy
+	slots chan struct{}
 }
 
 // New builds the gate handler.
@@ -77,10 +87,16 @@ func New(o Options) (http.Handler, error) {
 	if o.MaxBody <= 0 {
 		o.MaxBody = defaultMaxBody
 	}
+	if o.MaxInFlight <= 0 {
+		o.MaxInFlight = defaultMaxInFlight
+	}
+	if o.SniffTimeout <= 0 {
+		o.SniffTimeout = defaultSniffWait
+	}
 	if o.Audit == nil {
 		o.Audit = slog.New(slog.DiscardHandler)
 	}
-	h := &handler{o: o}
+	h := &handler{o: o, slots: make(chan struct{}, o.MaxInFlight)}
 	h.proxy = &httputil.ReverseProxy{
 		Rewrite:       h.rewrite(up),
 		FlushInterval: -1, // SSE: write every chunk through at once
@@ -162,7 +178,7 @@ func deny(w http.ResponseWriter, code int, text string) {
 
 // fields of the audit line, filled in as the request goes
 type auditRec struct {
-	caller, agent, userID, contextID, traceID, reason string
+	caller, agent, userID, contextID, traceID, reason, rpc string
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -187,6 +203,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		h.writeAudit(r, a, st, time.Since(start))
 	}()
+	select {
+	case h.slots <- struct{}{}:
+		defer func() { <-h.slots }()
+	default:
+		a.reason = "busy"
+		rec.Header().Set("Retry-After", "1")
+		deny(rec, http.StatusServiceUnavailable, "service unavailable")
+		return
+	}
 	h.serve(rec, r, a)
 }
 
@@ -196,9 +221,6 @@ func (h *handler) serve(w *recorder, r *http.Request, a *auditRec) {
 		deny(w, code, text)
 	}
 	claimed := r.Header.Values("X-User-Id")
-	if len(claimed) > 0 {
-		a.userID = claimed[0] // audited (hashed) even when refused: it says what the caller tried
-	}
 
 	// 1. who is calling
 	token, ok := bearer(r)
@@ -219,6 +241,11 @@ func (h *handler) serve(w *recorder, r *http.Request, a *auditRec) {
 		return
 	}
 	a.caller = caller.Name
+	if len(claimed) > 0 {
+		// Recorded only now, after authentication: an unauthenticated caller cannot put a chosen string in the log.
+		// Hashed by default, and cut short in any case.
+		a.userID = claimed[0][:min(len(claimed[0]), maxAuditUserBytes)]
+	}
 
 	// 2. what is it asking for: only A2A paths, never gRPC or gRPC-Web
 	if ct := strings.ToLower(r.Header.Get("Content-Type")); strings.HasPrefix(ct, "application/grpc") {
@@ -229,7 +256,8 @@ func (h *handler) serve(w *recorder, r *http.Request, a *auditRec) {
 		refuse(http.StatusForbidden, "path", "forbidden")
 		return
 	}
-	ns, name, card, okPath := a2aPath(r)
+	ns, name, route, okPath := a2aPath(r)
+	card := route == routeCard
 	if !okPath {
 		refuse(http.StatusForbidden, "path", "forbidden")
 		return
@@ -256,14 +284,44 @@ func (h *handler) serve(w *recorder, r *http.Request, a *auditRec) {
 		a.userID = id
 	}
 
-	// 4. the body: bounded read for the contextId, the rest streams through untouched
+	// 4. the body. Only its start is read (SniffBytes, within SniffTimeout), to learn the JSON-RPC method and the
+	// contextId; the rest streams through untouched. On the JSON-RPC route the whole body must fit in that start:
+	// the method is then checked on exactly the bytes the agent will read, duplicate keys included.
 	if r.Method == http.MethodPost {
 		if r.ContentLength > h.o.MaxBody {
 			refuse(http.StatusRequestEntityTooLarge, "body_too_large", "request too large")
 			return
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, h.o.MaxBody)
-		a.contextID = h.sniff(r)
+		head, over, err := h.sniff(w, r)
+		var tooBig *http.MaxBytesError
+		switch {
+		case errors.As(err, &tooBig):
+			refuse(http.StatusRequestEntityTooLarge, "body_too_large", "request too large")
+			return
+		case err != nil:
+			// close the connection: the server would otherwise wait for the rest of the body before it answers
+			w.Header().Set("Connection", "close")
+			refuse(http.StatusRequestTimeout, "body_timeout", "request timeout")
+			return
+		}
+		method := route
+		if route == routeRPC {
+			m, ctxID, ok := parseJSONRPC(head)
+			if over || !ok {
+				a.rpc = "unknown"
+				refuse(http.StatusForbidden, "method", "forbidden") // fail closed: no method, no call
+				return
+			}
+			method, a.contextID = m, ctxID
+		} else {
+			a.contextID = contextIDFromText(head)
+		}
+		a.rpc = auditMethod(method)
+		if !caller.AllowsMethod(method) {
+			refuse(http.StatusForbidden, "method", "forbidden")
+			return
+		}
 	}
 	h.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), keyUser, uv)))
 }
@@ -283,12 +341,18 @@ func bearer(r *http.Request) (string, bool) {
 
 var k8sName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$`)
 
+// Routes of a2aPath. The REST routes name their method in the path; the JSON-RPC route carries it in the body.
+const (
+	routeCard = "card"
+	routeRPC  = "rpc"
+)
+
 // a2aPath accepts the A2A routes of one agent and nothing else:
 //
 //	POST /agents/<ns>/<name>                (JSON-RPC; a trailing slash is fine)
-//	POST /agents/<ns>/<name>/[v1/]message:send|message:stream
+//	POST /agents/<ns>/<name>/[v1/]message:send|message:stream   (method SendMessage | SendStreamingMessage)
 //	GET  /agents/<ns>/<name>/.well-known/agent-card.json|agent.json
-func a2aPath(r *http.Request) (ns, name string, card, ok bool) {
+func a2aPath(r *http.Request) (ns, name, route string, ok bool) {
 	p := r.URL.EscapedPath()
 	if p != r.URL.Path || strings.Contains(p, "//") || strings.Contains(p, "%") || strings.Contains(p, "\\") {
 		return
@@ -301,13 +365,17 @@ func a2aPath(r *http.Request) (ns, name string, card, ok bool) {
 	switch r.Method {
 	case http.MethodPost:
 		switch rest {
-		case "", "message:send", "message:stream", "v1/message:send", "v1/message:stream":
-			return seg[1], seg[2], false, true
+		case "":
+			return seg[1], seg[2], routeRPC, true
+		case "message:send", "v1/message:send":
+			return seg[1], seg[2], "SendMessage", true
+		case "message:stream", "v1/message:stream":
+			return seg[1], seg[2], "SendStreamingMessage", true
 		}
 	case http.MethodGet:
 		switch rest {
 		case ".well-known/agent-card.json", ".well-known/agent.json":
-			return seg[1], seg[2], true, true
+			return seg[1], seg[2], routeCard, true
 		}
 	}
 	return
@@ -316,25 +384,149 @@ func a2aPath(r *http.Request) (ns, name string, card, ok bool) {
 var contextIDRe = regexp.MustCompile(`"contextId"\s*:\s*"([^"\\]{0,1000})"`)
 var contextIDOK = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
 
-// sniff reads at most SniffBytes of the request body to find the contextId, then puts the bytes back in
-// front of the rest of the body. Only the id is returned; the text is never kept or logged.
-func (h *handler) sniff(r *http.Request) string {
-	buf := make([]byte, h.o.SniffBytes)
-	n, _ := io.ReadFull(r.Body, buf)
-	buf = buf[:n]
+// sniffSize is how many bytes of a body the gate keeps for a request with this Content-Length (-1: unknown).
+func sniffSize(contentLength int64, window int) int {
+	if contentLength >= 0 && contentLength < int64(window) {
+		return int(contentLength)
+	}
+	return window
+}
+
+// sniff reads the start of the body (at most SniffBytes, and only as many bytes as Content-Length announces) within
+// SniffTimeout, then puts the bytes back in front of the rest. over is true when the body is longer than the window.
+// The read deadline is cleared before sniff returns. Only ids ever leave this function, never text.
+func (h *handler) sniff(w http.ResponseWriter, r *http.Request) (head []byte, over bool, err error) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Now().Add(h.o.SniffTimeout))
+	defer func() { _ = rc.SetReadDeadline(time.Time{}) }()
+	n := sniffSize(r.ContentLength, h.o.SniffBytes)
+	var buf bytes.Buffer
+	buf.Grow(n + 1)
+	_, err = io.CopyN(&buf, r.Body, int64(n)+1) // one byte more than the window tells whether there is more
+	if errors.Is(err, io.EOF) {
+		err = nil
+	}
+	head = buf.Bytes()
+	over = len(head) > n
+	if over {
+		head = head[:n]
+	}
+	if err != nil {
+		return nil, false, err
+	}
 	orig := r.Body
 	r.Body = struct {
 		io.Reader
 		io.Closer
-	}{io.MultiReader(bytes.NewReader(buf), orig), orig}
+	}{io.MultiReader(bytes.NewReader(buf.Bytes()), orig), orig}
+	return head, over, nil
+}
+
+var methodNameOK = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_./:-]{0,63}$`)
+
+// auditMethod is the method name for the audit line: the name when it looks like one, else "invalid".
+func auditMethod(m string) string {
+	if methodNameOK.MatchString(m) {
+		return m
+	}
+	return "invalid"
+}
+
+// parseJSONRPC reads a complete JSON-RPC request body. ok is false when the body is not exactly one JSON object with
+// exactly one string "method" member. Member names are compared the way Go's decoder (which the agent side uses)
+// does, ignoring case, so {"method":..,"Method":..} is refused instead of read two ways. contextID is
+// params.message.contextId, "" when absent and "invalid" when it is not a plain id.
+func parseJSONRPC(b []byte) (method, contextID string, ok bool) {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return "", "", false
+	}
+	found := 0
+	for dec.More() {
+		kt, err := dec.Token()
+		key, isStr := kt.(string)
+		if err != nil || !isStr {
+			return "", "", false
+		}
+		if strings.EqualFold(key, "method") {
+			vt, err := dec.Token()
+			v, isStr := vt.(string)
+			if err != nil || !isStr || v == "" {
+				return "", "", false
+			}
+			found++
+			method = v
+			continue
+		}
+		if !skipValue(dec) {
+			return "", "", false
+		}
+	}
+	if t, err := dec.Token(); err != nil || t != json.Delim('}') {
+		return "", "", false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) { // nothing may follow the object
+		return "", "", false
+	}
+	if found != 1 {
+		return "", "", false
+	}
+	var in struct {
+		Params struct {
+			Message struct {
+				ContextID string `json:"contextId"`
+			} `json:"message"`
+		} `json:"params"`
+	}
+	_ = json.Unmarshal(b, &in) // a wrong type just leaves the id empty: the id is for the log only
+	return method, checkContextID(in.Params.Message.ContextID), true
+}
+
+// skipValue reads one JSON value, whatever its depth.
+func skipValue(dec *json.Decoder) bool {
+	t, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	d, isDelim := t.(json.Delim)
+	if !isDelim || d == '}' || d == ']' {
+		return !isDelim
+	}
+	depth := 1
+	for depth > 0 {
+		t, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		if d, ok := t.(json.Delim); ok {
+			if d == '{' || d == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		}
+	}
+	return true
+}
+
+func checkContextID(id string) string {
+	switch {
+	case id == "":
+		return ""
+	case contextIDOK.MatchString(id):
+		return id
+	}
+	return "invalid"
+}
+
+// contextIDFromText finds the contextId in the start of a body that is not JSON-RPC (the REST routes), where it may be
+// cut off: the first "contextId" member, if it is a plain id.
+func contextIDFromText(buf []byte) string {
 	m := contextIDRe.FindSubmatch(buf)
 	if m == nil {
 		return ""
 	}
-	if !contextIDOK.Match(m[1]) {
-		return "invalid"
-	}
-	return string(m[1])
+	return checkContextID(string(m[1]))
 }
 
 func traceID(tp string) string {
@@ -365,6 +557,9 @@ func (h *handler) writeAudit(r *http.Request, a *auditRec, status int, d time.Du
 	attrs := []any{
 		"caller", a.caller, "agent", a.agent, "user_id", h.hashUser(a.userID), "context_id", a.contextID,
 		"trace_id", a.traceID, "status", status, "duration_ms", d.Milliseconds(), "method", r.Method,
+	}
+	if a.rpc != "" {
+		attrs = append(attrs, "rpc", a.rpc) // the JSON-RPC (A2A) method, e.g. SendMessage
 	}
 	if a.reason != "" {
 		attrs = append(attrs, "reason", a.reason)

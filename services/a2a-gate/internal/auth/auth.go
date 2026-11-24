@@ -11,7 +11,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -34,7 +36,17 @@ var (
 const (
 	PositiveTTL = 30 * time.Second
 	NegativeTTL = 5 * time.Second
-	maxCache    = 2048
+	maxPositive = 1024 // entries that cost a successful TokenReview: only holders of a valid token can add one
+	maxNegative = 1024 // entries any caller can add: kept apart so a flood of bad tokens cannot push a good one out
+)
+
+// MaxTokenBytes is the longest bearer value the gate looks at. A projected ServiceAccount token is about 1 KiB.
+const MaxTokenBytes = 8 << 10
+
+// Defaults of the TokenReview limits (Options.MaxReviews, Options.ReviewWait).
+const (
+	defaultMaxReviews = 8
+	defaultReviewWait = 2 * time.Second
 )
 
 // Reviewer checks a ServiceAccount token for an audience and returns the user name (system:serviceaccount:ns:name).
@@ -55,13 +67,27 @@ type Options struct {
 	Keys     Keys
 	Reviewer Reviewer
 	Now      func() time.Time // default time.Now
+	// MaxReviews caps the TokenReviews running at once (default 8). A review that cannot start within ReviewWait
+	// (default 2 s) fails with ErrUnavailable: the gate does not queue without bound.
+	MaxReviews int
+	ReviewWait time.Duration
 }
 
 // Authenticator maps a bearer token to a caller rule.
 type Authenticator struct {
-	o     Options
-	mu    sync.Mutex
-	cache map[[32]byte]cached
+	o      Options
+	mu     sync.Mutex
+	pos    map[[32]byte]cached // reviewed and valid (30 s)
+	neg    map[[32]byte]cached // reviewed and refused (5 s)
+	flight map[[32]byte]*flight
+	slots  chan struct{}
+}
+
+// flight is one TokenReview in progress; every caller of the same token waits for it instead of starting another.
+type flight struct {
+	done chan struct{}
+	user string
+	err  error
 }
 
 type cached struct {
@@ -75,19 +101,25 @@ func New(o Options) *Authenticator {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Authenticator{o: o, cache: map[[32]byte]cached{}}
+	if o.MaxReviews <= 0 {
+		o.MaxReviews = defaultMaxReviews
+	}
+	if o.ReviewWait <= 0 {
+		o.ReviewWait = defaultReviewWait
+	}
+	return &Authenticator{o: o, pos: map[[32]byte]cached{}, neg: map[[32]byte]cached{}, flight: map[[32]byte]*flight{}, slots: make(chan struct{}, o.MaxReviews)}
 }
 
 // Authenticate returns the caller rule for a bearer token.
 func (a *Authenticator) Authenticate(ctx context.Context, token string) (*rules.Caller, error) {
-	if token == "" {
+	if token == "" || len(token) > MaxTokenBytes {
 		return nil, ErrUnauthenticated
 	}
 	if c := a.matchKey(token); c != nil {
 		return c, nil
 	}
-	if !looksLikeJWT(token) {
-		return nil, ErrUnauthenticated
+	if !looksLikeJWT(token) || !a.plausible(token) {
+		return nil, ErrUnauthenticated // no TokenReview is spent on a string that cannot be one of ours
 	}
 	user, err := a.review(ctx, token)
 	if err != nil {
@@ -122,6 +154,40 @@ func (a *Authenticator) matchKey(token string) *rules.Caller {
 	return found
 }
 
+// plausible is a cheap check of the UNVERIFIED payload: it names our audience, has an issuer and has not expired.
+// It only saves TokenReviews; the API server still decides.
+func (a *Authenticator) plausible(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
+	if err != nil {
+		return false
+	}
+	var p struct {
+		Aud json.RawMessage `json:"aud"`
+		Iss string          `json:"iss"`
+		Exp *float64        `json:"exp"`
+	}
+	if json.Unmarshal(raw, &p) != nil || p.Iss == "" || p.Exp == nil || float64(a.o.Now().Unix()) >= *p.Exp {
+		return false
+	}
+	var one string
+	if json.Unmarshal(p.Aud, &one) == nil {
+		return one == a.o.Audience
+	}
+	var many []string
+	if json.Unmarshal(p.Aud, &many) == nil {
+		for _, v := range many {
+			if v == a.o.Audience {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (a *Authenticator) review(ctx context.Context, token string) (string, error) {
 	if a.o.Reviewer == nil {
 		return "", ErrUnavailable
@@ -129,31 +195,74 @@ func (a *Authenticator) review(ctx context.Context, token string) (string, error
 	k := sha256.Sum256([]byte(token))
 	now := a.o.Now()
 	a.mu.Lock()
-	if e, ok := a.cache[k]; ok && now.Before(e.expires) {
-		a.mu.Unlock()
-		return e.user, e.err
+	for _, m := range []map[[32]byte]cached{a.pos, a.neg} {
+		if e, ok := m[k]; ok && now.Before(e.expires) {
+			a.mu.Unlock()
+			return e.user, e.err
+		}
 	}
+	if f, ok := a.flight[k]; ok { // the same token is being reviewed: wait for that answer
+		a.mu.Unlock()
+		select {
+		case <-f.done:
+			return f.user, f.err
+		case <-ctx.Done():
+			return "", fmt.Errorf("%w: %v", ErrUnavailable, ctx.Err())
+		}
+	}
+	f := &flight{done: make(chan struct{})}
+	a.flight[k] = f
 	a.mu.Unlock()
+
+	f.user, f.err = a.reviewOnce(ctx, k, token, now)
+	a.mu.Lock()
+	delete(a.flight, k)
+	a.mu.Unlock()
+	close(f.done)
+	return f.user, f.err
+}
+
+func (a *Authenticator) reviewOnce(ctx context.Context, k [32]byte, token string, now time.Time) (string, error) {
+	wait := time.NewTimer(a.o.ReviewWait)
+	defer wait.Stop()
+	select {
+	case a.slots <- struct{}{}:
+		defer func() { <-a.slots }()
+	case <-wait.C:
+		return "", fmt.Errorf("%w: too many token checks at once", ErrUnavailable)
+	case <-ctx.Done():
+		return "", fmt.Errorf("%w: %v", ErrUnavailable, ctx.Err())
+	}
 	user, err := a.o.Reviewer.Review(ctx, token, a.o.Audience)
 	switch {
 	case err == nil:
-		a.put(k, cached{user: user, expires: now.Add(PositiveTTL)})
+		a.put(a.pos, maxPositive, k, cached{user: user, expires: now.Add(PositiveTTL)})
 		return user, nil
 	case errors.Is(err, ErrUnauthenticated):
-		a.put(k, cached{err: ErrUnauthenticated, expires: now.Add(NegativeTTL)})
+		a.put(a.neg, maxNegative, k, cached{err: ErrUnauthenticated, expires: now.Add(NegativeTTL)})
 		return "", ErrUnauthenticated
 	default:
 		return "", fmt.Errorf("%w: %v", ErrUnavailable, err)
 	}
 }
 
-func (a *Authenticator) put(k [32]byte, e cached) {
+// put stores an entry. A full map first drops its expired entries; if it is still full it is emptied, which only
+// costs one more TokenReview per live token (the other map is not touched).
+func (a *Authenticator) put(m map[[32]byte]cached, limit int, k [32]byte, e cached) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if len(a.cache) >= maxCache {
-		a.cache = map[[32]byte]cached{}
+	if len(m) >= limit {
+		now := a.o.Now()
+		for key, v := range m {
+			if !now.Before(v.expires) {
+				delete(m, key)
+			}
+		}
+		if len(m) >= limit {
+			clear(m)
+		}
 	}
-	a.cache[k] = e
+	m[k] = e
 }
 
 func looksLikeJWT(t string) bool { return strings.Count(t, ".") == 2 }

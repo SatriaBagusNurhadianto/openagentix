@@ -1411,6 +1411,118 @@ eg '{allow: ["https://api.github.com"]}'
 eq "kagent.enabled=false: egress.allow renders nothing" "$(count "$(docs -f "$PX" --set kagent.enabled=false)" '.kind=="EgressPolicy"')" 0
 rm -f "$PX"
 
+echo "# memory governance (ADR 0006, round 3): everything is off by default"
+MD="$REPO/components/governance/memory-demo-values.yaml"
+MON=("${GON[@]}" -f "$MD")
+eq "memory.expiry.enabled defaults to false"           "$(yq -c .memory.expiry.enabled "$CHART/values.yaml")" false
+eq "memory.expiry.secretScan defaults to false"        "$(yq -c .memory.expiry.secretScan "$CHART/values.yaml")" false
+eq "memory.expiry.secretScanDelete defaults to false"  "$(yq -c .memory.expiry.secretScanDelete "$CHART/values.yaml")" false
+eq "bridge.memoryCommands defaults to false"           "$(yq -c .bridge.memoryCommands "$CHART/values.yaml")" false
+D=$(docs "${GON[@]}")
+eq "off: no memory-expiry object of any kind"          "$(count "$D" '(.metadata.name|tostring|test("memory-expiry|kagent-pg"))')" 0
+eq "off: the bridge has no memory env"                 "$(q "$D" "$BD|[.spec.template.spec.containers[0].env[]|select(.name|test(\"MEMORY\"))]|length")" 0
+eq "off: no rule has a memory flag"                    "$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|[.callers[]|has("memory")]|any')" false
+
+echo "# memory governance: the expiry CronJob"
+DM=$(docs "${MON[@]}")
+MC='.[]|select(.kind=="CronJob" and .metadata.name=="memory-expiry")'
+MP="$MC|.spec.jobTemplate.spec.template.spec"
+MCT="$MP|.containers[0]"
+eq "one CronJob memory-expiry in the kagent namespace" "$(q "$DM" "[$MC|.metadata.namespace]|join(\",\")")" kagent
+eq "default schedule is nightly"                        "$(q "$DM" "$MC|.spec.schedule")" "17 3 * * *"
+eq "overlapping runs are forbidden"                     "$(q "$DM" "$MC|.spec.concurrencyPolicy")" Forbid
+eq "a failed run is not retried (the next night runs again)" "$(q "$DM" "$MC|.spec.jobTemplate.spec.backoffLimit|tostring")" 0
+eq "the run is bounded in time"                         "$(q "$DM" "$MC|.spec.jobTemplate.spec.activeDeadlineSeconds|tostring")" 300
+eq "image is the server's own pinned image (client matches the server major version)" "$(q "$DM" "$MCT|.image")" "pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd"
+eq "the image is never pulled when present"             "$(q "$DM" "$MCT|.imagePullPolicy")" IfNotPresent
+eq "the database URL comes from the existing Secret by reference" "$(q "$DM" "$MCT|.env[]|select(.name==\"KAGENT_DB_URL\")|.valueFrom.secretKeyRef|[.name,.key]|join(\" \")")" "kagent-postgres-readwrite readWriteConnectionString"
+eq "the database URL has no literal value"              "$(q "$DM" "$MCT|.env[]|select(.name==\"KAGENT_DB_URL\")|has(\"value\")|tostring")" false
+eq "schema and role are passed"                         "$(q "$DM" "$MCT|[.env[]|select(.name==\"MEMORY_SCHEMA\" or .name==\"MEMORY_DB_ROLE\")|.value]|join(\" \")")" "kagent kagent_readwrite"
+eq "secret scan on, delete off in the demo"             "$(q "$DM" "$MCT|[.env[]|select(.name==\"SECRET_SCAN\" or .name==\"SECRET_SCAN_DELETE\")|.value]|join(\" \")")" "1 0"
+eq "runs the mounted script"                            "$(q "$DM" "$MCT|.command|join(\" \")")" "sh /scripts/memory-expiry.sh"
+eq "the script ConfigMap holds the file from the chart" "$(q "$DM" '.[]|select(.kind=="ConfigMap" and .metadata.name=="memory-expiry-script")|.data["memory-expiry.sh"]|test("PruneExpiredMemories") and test("expires_at < NOW\\(\\) AND access_count >= 10") and test("expires_at < NOW\\(\\) AND access_count < 10")')" true
+eq "the script quotes kagent's path and line"           "$(q "$DM" '.[]|select(.kind=="ConfigMap" and .metadata.name=="memory-expiry-script")|.data["memory-expiry.sh"]|test("go/core/internal/database/memory.go lines 125-139")')" true
+eq "the pod rolls when the script changes"              "$(q "$DM" "$MC|.spec.jobTemplate.spec.template.metadata.annotations[\"checksum/script\"]|test(\"^[0-9a-f]{64}\$\")")" true
+eq "pod labels are the ones the database policy admits" "$(q "$DM" "$MC|.spec.jobTemplate.spec.template.metadata.labels|[.app,.[\"openagentix.io/component\"]]|join(\" \")")" "memory-expiry memory-expiry"
+eq "no ServiceAccount token in the pod"                 "$(q "$DM" "$MP|.automountServiceAccountToken|tostring")" false
+eq "non-root, read-only root filesystem, no capabilities" "$(q "$DM" "$MP|[.securityContext.runAsNonRoot,(.containers[0].securityContext.readOnlyRootFilesystem),(.containers[0].securityContext.allowPrivilegeEscalation),(.containers[0].securityContext.capabilities.drop|join(\",\"))]|tostring")" '[true,true,false,"ALL"]'
+eq "restartPolicy Never"                                "$(q "$DM" "$MP|.restartPolicy")" Never
+eq "the job has resource limits"                        "$(q "$DM" "$MCT|.resources.limits|has(\"memory\") and has(\"cpu\")|tostring")" true
+eq "no Secret object and no URL with a password"        "$(q "$DM" '[.[]|select(.kind=="Secret")]|length')" 0
+eq "no rendered document holds a connection string"     "$(q "$DM" 'tostring|test("postgres(ql)?://[^ ]*@")')" false
+DM2=$(docs "${MON[@]}" --set memory.expiry.secretScan=false)
+eq "secretScan=false passes 0"                          "$(q "$DM2" "$MCT|.env[]|select(.name==\"SECRET_SCAN\")|.value")" 0
+DM3=$(docs "${MON[@]}" --set memory.expiry.secretScanDelete=true)
+eq "secretScanDelete=true passes 1"                     "$(q "$DM3" "$MCT|.env[]|select(.name==\"SECRET_SCAN_DELETE\")|.value")" 1
+DM4=$(docs "${MON[@]}" --set 'memory.expiry.schedule=5 4 * * 0' --set memory.expiry.schema=kagent2 --set memory.expiry.secret.name=my-db --set memory.expiry.secret.key=url)
+eq "schedule, schema and Secret are values"             "$(q "$DM4" "[($MC|.spec.schedule),($MCT|.env[]|select(.name==\"MEMORY_SCHEMA\")|.value),($MCT|.env[]|select(.name==\"KAGENT_DB_URL\")|.valueFrom.secretKeyRef.name)]|join(\"|\")")" '5 4 * * 0|kagent2|my-db'
+eq "kagent.enabled=false renders no expiry job"         "$(count "$(docs "${MON[@]}" --set kagent.enabled=false 2>/dev/null)" '.kind=="CronJob" and .metadata.name=="memory-expiry"')" 0
+eq "expiry works without the gate (it needs only the database)" "$(count "$(docs --set memory.expiry.enabled=true)" '.kind=="CronJob" and .metadata.name=="memory-expiry"')" 1
+
+echo "# memory governance: validation"
+badv() { eq "bad value fails the render: $1=$2" "$([ -n "$(render_err "${MON[@]}" --set-string "$1=$2")" ] && echo failed || echo rendered)" failed; }
+eq "secretScanDelete without secretScan fails the render" "$([ -n "$(render_err "${MON[@]}" --set memory.expiry.secretScan=false --set memory.expiry.secretScanDelete=true)" ] && echo failed || echo rendered)" failed
+badv memory.expiry.secretScan yes
+badv memory.expiry.secretScanDelete maybe
+badv memory.expiry.enabled maybe
+badv memory.expiry.schedule nightly
+badv memory.expiry.schedule "* * * *"
+badv memory.expiry.schedule "* * * * * *"
+badv memory.expiry.schema "a;b"
+badv memory.expiry.schema "Kagent"
+badv memory.expiry.schema ""
+badv memory.expiry.role "x y"
+badv memory.expiry.secret.name ""
+badv memory.expiry.secret.name "UPPER"
+badv memory.expiry.activeDeadlineSeconds 5
+eq "an expiry block with a bad value is not checked while it is off" "$([ -z "$(render_err --set memory.expiry.schedule=nightly)" ] && echo rendered || echo failed)" rendered
+
+echo "# memory governance: network policy of kagent's PostgreSQL"
+NPG='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-pg")'
+eq "a policy selects the database pods"                 "$(q "$DM" "$NPG|[.metadata.namespace,(.spec.podSelector.matchLabels|tostring),(.spec.policyTypes|join(\",\"))]|join(\" \")")" 'kagent {"app":"kagent-pg"} Ingress'
+eq "it admits only the controller and the expiry job on 5432" "$(q "$DM" "$NPG|[.spec.ingress[]|.ports[0].port]|tostring")" '[5432]'
+eq "two peers: the controller pods and the job pods"    "$(q "$DM" "$NPG|[.spec.ingress[].from[]|(.podSelector.matchLabels|to_entries|map(.value)|join(\"/\"))]|sort|join(\",\")")" 'controller/kagent,memory-expiry'
+eq "both peers are in the kagent namespace"             "$(q "$DM" "$NPG|[.spec.ingress[].from[].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|unique|join(\",\")")" kagent
+eq "networkPolicy.enabled=false renders no database policy" "$(count "$(docs "${MON[@]}" --set networkPolicy.enabled=false)" '.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-pg"')" 0
+eq "networkPolicy.enabled=false still renders the job"  "$(count "$(docs "${MON[@]}" --set networkPolicy.enabled=false)" '.kind=="CronJob" and .metadata.name=="memory-expiry"')" 1
+eq "pod labels of the database are a value"             "$(q "$(docs "${MON[@]}" --set networkPolicy.kagentPostgres.podLabels.app=pg2)" "$NPG|.spec.podSelector.matchLabels.app")" pg2
+
+echo "# memory governance: the bridge commands and the gate rule"
+BM='.spec.template.spec.containers[0].env'
+eq "bridge: the gate URL is the memory URL"             "$(q "$DM" "$BD|$BM[]|select(.name==\"MEMORY_GATE_URL\")|.value")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080
+eq "bridge: the agent is the bridge's agent"            "$(q "$DM" "$BD|$BM[]|select(.name==\"MEMORY_AGENT\")|.value")" kagent/assistant
+eq "the bridge has no new volume or token"              "$(q "$DM" "$BD|[.spec.template.spec.volumes[].name]|join(\",\")")" a2a-token
+RM=$(q "$DM" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]')
+eq "rules: the bridge has memory true"                  "$(jq -r '.callers[]|select(.name=="bridge")|.memory|tostring' <<<"$RM")" true
+eq "rules: no other caller has a memory flag, except the demo canary" "$(jq -r '[.callers[]|select(.name!="bridge" and .name!="memory-canary")|has("memory")]|any|tostring' <<<"$RM")" false
+eq "rules: the demo canary may use memory for probe: ids only" "$(jq -r '.callers[]|select(.name=="memory-canary")|[.memory,.userId.prefix,(.agents|join(","))]|map(tostring)|join(" ")' <<<"$RM")" "true probe: kagent/assistant"
+eq "the memory demo alone (gate off) fails the render, it needs the gate demo" "$([ -n "$(render_err -f "$MD")" ] && echo failed || echo rendered)" failed
+eq "rules: the bridge keeps SendMessage as its only A2A method" "$(jq -r '.callers[]|select(.name=="bridge")|.methods|join(",")' <<<"$RM")" SendMessage
+eq "memoryCommands without the gate fails the render"   "$([ -n "$(render_err "${GOFF[@]}" --set bridge.memoryCommands=true)" ] && echo failed || echo rendered)" failed
+eq "memoryCommands without the bridge fails the render" "$([ -n "$(render_err "${GON[@]}" --set bridge.memoryCommands=true --set bridge.enabled=false)" ] && echo failed || echo rendered)" failed
+eq "memoryCommands must be a boolean"                   "$([ -n "$(render_err "${GON[@]}" --set bridge.memoryCommands=yes)" ] && echo failed || echo rendered)" failed
+eq "the bridge A2A_URL override does not move the memory URL" "$(q "$(docs "${MON[@]}" --set bridge.a2aUrl=http://x/y)" "$BD|$BM[]|select(.name==\"MEMORY_GATE_URL\")|.value")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080
+MX="$(dirname "$0")/.memory-variant.yaml"
+yq -y '{agents: (.agents|map(if .name=="assistant" then del(.memory) else . end))}' "$CHART/values.yaml" > "$MX"
+E=$(render_err "${MON[@]}" -f "$MX")
+eq "the bridge agent must have memory on"               "$(printf '%s' "$E" | command grep -c 'memoryCommands.*memory.enabled')" 1
+printf 'bridge:\n  agent: ghost\n  memoryCommands: true\n' > "$MX"
+eq "an unknown bridge agent fails the render"           "$([ -n "$(render_err "${GON[@]}" -f "$MX")" ] && echo failed || echo rendered)" failed
+cat > "$MX" <<'YAML'
+governance:
+  a2a:
+    callers:
+      - {name: ci-mem, serviceAccount: {namespace: ci, name: mem}, agents: [assistant], userId: {prefix: "ci:"}, memory: true}
+      - {name: ci-plain, serviceAccount: {namespace: ci, name: plain}, agents: [assistant], userId: {prefix: "ci2:"}}
+YAML
+RX=$(q "$(docs "${GON[@]}" -f "$MX")" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]')
+eq "an extra caller can have memory: true"              "$(jq -r '.callers[]|select(.name=="ci-mem")|.memory|tostring' <<<"$RX")" true
+eq "and one without it has no flag"                     "$(jq -r '.callers[]|select(.name=="ci-plain")|has("memory")|tostring' <<<"$RX")" false
+printf 'governance:\n  a2a:\n    callers:\n      - {name: ci-mem, serviceAccount: {namespace: ci, name: mem}, agents: [assistant], userId: {prefix: "ci:"}, memory: "yes"}\n' > "$MX"
+eq "memory: must be a boolean for an extra caller"      "$([ -n "$(render_err "${GON[@]}" -f "$MX")" ] && echo failed || echo rendered)" failed
+rm -f "$MX"
+eq "no Secret object with everything on"                "$(count "$(docs "${MON[@]}" "${PALL[@]:0:0}")" '.kind=="Secret"')" 0
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

@@ -32,6 +32,12 @@ networkPolicy:
       app.kubernetes.io/name: kagent
     port: 8080
     allowFrom: []
+  # kagent's own PostgreSQL. Without memory.expiry nothing selects it (it is open to every pod, as before). With memory.expiry
+  # on, a policy admits the controller and the expiry job only (round 3, ADR 0006). `kubectl exec` into the pod is not
+  # affected (the connection is inside the pod).
+  kagentPostgres:
+    podLabels: {app: kagent-pg}          # the pod label set by components/runtime/manifests/kagent-postgres.yaml
+    port: 5432
 
 # ---- Channels and triggers (Agent Kourier, optional) --------------------------------------------
 # Agent Kourier (https://github.com/agentkourier/agent-kourier) connects chat platforms (Slack) and signed webhooks to
@@ -109,6 +115,11 @@ bridge:
   # Prefix of the per-chat user id the bridge sends to kagent (X-User-Id = prefix + Telegram chat id); kagent keys
   # sessions and long-term memory by it. Empty = the bridge default "telegram:". Set it to tell several bots apart.
   userIdPrefix: ""
+  # /memories (list what is stored for this chat) and /forget, then /forget confirm (delete it), answered by the bridge itself
+  # through the A2A gate (ADR 0006, round 3). The gate lets the bridge call two RPCs of kagent's MemoryService, only for the
+  # bridge's agent and for user ids that start with the prefix above. Needs governance.a2a.enabled, bridge.agent in agents[]
+  # (same namespace as kagent) with memory.enabled. OFF: both commands are plain text for the agent, as before.
+  memoryCommands: false
   sourceHash: ""                  # install.sh sets it to a hash of bridges/telegram, so a code change rolls the pod (tag stays "dev")
   existingSecret: telegram-bridge # Secret in bridge.namespace, created by install.sh
   tokenKey: TELEGRAM_BOT_TOKEN
@@ -462,6 +473,7 @@ governance:
     #    agents: [assistant]                         # agents[] names (or namespace/name)
     #    userId: {exact: "ci:smoke"}                 # or {prefix: "ci:"} or {fixed: "ci:smoke"} (the gate sets it)
     #    methods: [SendMessage, SendStreamingMessage]   # optional: the JSON-RPC methods it may use (this is the default; GetTask, CancelTask, ... must be listed)
+    #    memory: true                                # optional, default false: may call MemoryService List and Delete (and nothing else) for its agents and user ids
     resources:
       requests: {cpu: 10m, memory: 24Mi}
       limits: {cpu: 250m, memory: 64Mi}
@@ -509,6 +521,29 @@ memory:
     context; use them. When the user tells you something worth keeping across conversations (a preference, a
     project name, a codename, a standing instruction) or asks you to remember something, call the save_memory tool
     with one short, self-contained sentence. Never store passwords, tokens or other secrets.
+  # Memory governance (ADR 0006, round 3). kagent 1.0.1 has a function that deletes expired memories and nothing calls it, and
+  # its search ignores `expires_at` (go/core/internal/database/memory.go lines 53-66 and 125-139): a memory never expires.
+  # `expiry` is a CronJob in kagent.namespace that runs kagent's own two prune statements against kagent's PostgreSQL, with the
+  # existing Secret `secret` (referenced, never copied). OFF by default: nothing below renders. With it on, a NetworkPolicy
+  # admits only the controller and this job to the database pods (networkPolicy.kagentPostgres). The log has counts only.
+  expiry:
+    enabled: false
+    schedule: "17 3 * * *"            # five fields, in the controller's time zone (UTC on most clusters)
+    # The image of kagent's own database (same major version as the server, psql included), pinned by digest; it is on the node already.
+    image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+    pullPolicy: IfNotPresent
+    secret: {name: kagent-postgres-readwrite, key: readWriteConnectionString}   # the controller's own read/write login, by reference
+    schema: kagent                    # schema of kagent's tables (kagent config database.schema)
+    role: kagent_readwrite            # the role the login assumes after connecting (kagent does the same)
+    activeDeadlineSeconds: 300
+    # secretScan: also COUNT memories that match well-known secret shapes (private key headers, AWS, GitHub, Slack, Google, Stripe,
+    # Telegram and provider key prefixes, bearer and JWT shapes), per pattern name. Report only.
+    secretScan: false
+    # secretScanDelete: also DELETE those rows. Needs secretScan. Off: the owner of the data decides.
+    secretScanDelete: false
+    resources:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 250m, memory: 128Mi}
 
 # ---- Observability (traces, metrics, tool-call audit) -----------------------------------------------
 # OFF by default: with `enabled: false` the chart renders nothing below and the output is byte-identical to a chart without it.

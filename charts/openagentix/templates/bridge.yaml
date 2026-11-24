@@ -1,3 +1,4 @@
+{{- $_ := include "oa.bridgeMemoryCheck" . }}
 {{- if .Values.bridge.enabled }}
 {{- $b := .Values.bridge }}
 apiVersion: apps/v1
@@ -70,6 +71,11 @@ spec:
             {{- if include "oa.a2aGateOn" . }}
             # a projected ServiceAccount token (audience of the A2A gate), re-read by the bridge on every request
             - {name: A2A_TOKEN_FILE, value: /var/run/a2a/token}
+            {{- end }}
+            {{- if $b.memoryCommands }}
+            # /memories and /forget: two RPCs of kagent's memory service through the gate (ADR 0006, round 3). The gate checks the user id and the agent.
+            - {name: MEMORY_GATE_URL, value: {{ include "oa.a2aGateUrl" . | quote }}}
+            - {name: MEMORY_AGENT, value: {{ printf "%s/%s" $b.agentNamespace $b.agent | quote }}}
             {{- end }}
           ports:
             - {name: health, containerPort: 8080}

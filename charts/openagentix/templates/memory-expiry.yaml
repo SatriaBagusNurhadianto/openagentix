@@ -1,0 +1,123 @@
+{{- /*
+Memory governance, round 3 (ADR 0006): a CronJob that deletes expired memories from kagent's PostgreSQL. Renders nothing unless
+memory.expiry.enabled is true (and kagent.enabled). The script is files/memory-expiry.sh; it runs kagent's own two prune
+statements (kagent go/core/internal/database/memory.go lines 125-139). The database login is the controller's own read/write
+Secret, referenced by name: the chart never holds a value of it.
+*/ -}}
+{{- $x := .Values.memory.expiry }}
+{{- if not (kindIs "bool" $x.enabled) }}{{ fail "memory.expiry.enabled must be true or false" }}{{ end }}
+{{- if and $x.enabled .Values.kagent.enabled }}
+{{- if not (kindIs "bool" $x.secretScan) }}{{ fail "memory.expiry.secretScan must be true or false" }}{{ end }}
+{{- if not (kindIs "bool" $x.secretScanDelete) }}{{ fail "memory.expiry.secretScanDelete must be true or false" }}{{ end }}
+{{- if and $x.secretScanDelete (not $x.secretScan) }}{{ fail "memory.expiry.secretScanDelete needs memory.expiry.secretScan=true (the scan finds the rows, the delete removes them)" }}{{ end }}
+{{- if not (regexMatch "^[^ ]+( [^ ]+){4}$" (toString $x.schedule)) }}{{ fail (printf "memory.expiry.schedule must be a cron expression with five fields, got %q" (toString $x.schedule)) }}{{ end }}
+{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" (toString $x.schema)) }}{{ fail (printf "memory.expiry.schema %q is not a plain schema name (lower case letters, digits, underscore)" (toString $x.schema)) }}{{ end }}
+{{- if not (regexMatch "^[a-z_][a-z0-9_]{0,62}$" (toString $x.role)) }}{{ fail (printf "memory.expiry.role %q is not a plain role name (lower case letters, digits, underscore)" (toString $x.role)) }}{{ end }}
+{{- if not (and $x.secret (regexMatch "^[a-z0-9]([-a-z0-9.]{0,251}[a-z0-9])?$" (toString $x.secret.name)) (regexMatch "^[-._a-zA-Z0-9]{1,253}$" (toString $x.secret.key))) }}{{ fail "memory.expiry.secret needs a Secret name and a key (the controller's read/write connection string)" }}{{ end }}
+{{- if not (and (kindIs "float64" $x.activeDeadlineSeconds) (ge (int $x.activeDeadlineSeconds) 30) (le (int $x.activeDeadlineSeconds) 3600)) }}{{ fail "memory.expiry.activeDeadlineSeconds must be a number from 30 to 3600" }}{{ end }}
+{{- $ns := .Values.kagent.namespace }}
+{{- $script := .Files.Get "files/memory-expiry.sh" }}
+{{- if not $script }}{{ fail "files/memory-expiry.sh is missing from the chart" }}{{ end }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: memory-expiry-script
+  namespace: {{ $ns }}
+  labels:
+    app: memory-expiry
+    {{- include "oa.labels" . | nindent 4 }}
+data:
+  # files/memory-expiry.sh of the chart, unchanged. Not a secret: it holds no connection string.
+  memory-expiry.sh: |
+    {{- $script | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: memory-expiry
+  namespace: {{ $ns }}
+  labels:
+    app: memory-expiry
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  schedule: {{ $x.schedule | quote }}
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 3600
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      # A failed run is not retried: the next scheduled run does the same work, and a retry loop on a broken login only adds load.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ int $x.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            app: memory-expiry
+            openagentix.io/component: memory-expiry
+            {{- include "oa.labels" . | nindent 12 }}
+          annotations:
+            checksum/script: {{ $script | sha256sum | quote }}
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false   # the job talks to the database only, never to the Kubernetes API
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999                       # the postgres user of the image
+            runAsGroup: 999
+            seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: expire
+              image: {{ $x.image | quote }}
+              imagePullPolicy: {{ $x.pullPolicy }}
+              command: ["sh", "/scripts/memory-expiry.sh"]
+              env:
+                # The controller's own read/write login, by reference. Its value never appears in the chart, the pod spec or the log.
+                - name: KAGENT_DB_URL
+                  valueFrom:
+                    secretKeyRef: {name: {{ $x.secret.name | quote }}, key: {{ $x.secret.key | quote }}}
+                - {name: MEMORY_SCHEMA, value: {{ $x.schema | quote }}}
+                - {name: MEMORY_DB_ROLE, value: {{ $x.role | quote }}}
+                - {name: SECRET_SCAN, value: {{ ternary "1" "0" $x.secretScan | quote }}}
+                - {name: SECRET_SCAN_DELETE, value: {{ ternary "1" "0" $x.secretScanDelete | quote }}}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: {drop: [ALL]}
+              volumeMounts:
+                - {name: script, mountPath: /scripts, readOnly: true}
+                - {name: tmp, mountPath: /tmp}
+              resources: {{- toYaml $x.resources | nindent 16 }}
+          volumes:
+            - name: script
+              configMap: {name: memory-expiry-script}
+            - name: tmp
+              emptyDir: {sizeLimit: 16Mi}
+{{- if .Values.networkPolicy.enabled }}
+{{- $n := .Values.networkPolicy }}
+---
+# kagent's PostgreSQL was open to every pod. With the expiry job on, only the controller (its one client) and the job's pods may
+# connect. `kubectl exec` into the database pod is not affected: that connection is inside the pod. Whoever may create pods with the
+# job's label in the kagent namespace can reach the database: the boundary is the RBAC for creating pods there.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-kagent-pg
+  namespace: {{ $ns }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- toYaml $n.kagentPostgres.podLabels | nindent 6 }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: {{ $n.kagentPostgres.port }}}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $ns }}}}
+          podSelector:
+            matchLabels: {{- toYaml $n.controllerPodLabels | nindent 14 }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $ns }}}}
+          podSelector:
+            matchLabels: {openagentix.io/component: memory-expiry}
+{{- end }}
+{{- end }}

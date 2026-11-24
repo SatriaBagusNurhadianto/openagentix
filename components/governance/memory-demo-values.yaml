@@ -1,0 +1,31 @@
+# Demo for the local kind cluster: memory governance ON (ADR 0006, round 3). Combine it with the gate demo, which it needs:
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml components/knowledge/graph-demo-values.yaml components/governance/demo-values.yaml components/governance/profiles-demo-values.yaml components/governance/memory-demo-values.yaml" ./install.sh
+# What it switches on:
+#   1. memory.expiry: a CronJob that deletes expired memories from kagent's PostgreSQL every night (kagent 1.0.1 never does), and
+#      counts the rows that look like secrets (report only: nothing is deleted for that reason; set secretScanDelete: true to delete them).
+#      It uses the existing Secret kagent-postgres-readwrite by reference and logs counts only.
+#   2. bridge.memoryCommands: the Telegram bridge answers /memories (what is stored for this chat) and /forget (then /forget confirm
+#      deletes it), through the A2A gate, only for this chat's own user id. Needs governance.a2a.enabled (the gate demo file).
+memory:
+  expiry:
+    enabled: true
+    secretScan: true
+bridge:
+  memoryCommands: true
+
+# Only used with the A2A gate on (inert otherwise): one more caller with memory: true and a user id prefix of its own, so an operator can
+# try the two memory RPCs by hand without touching a real user's memories. The ServiceAccount must be created by you, in a namespace
+# the gate admits (the schedules namespace is), and the pod that calls the gate needs the label openagentix.io/component=schedule:
+#   kubectl -n openagentix-schedules create serviceaccount memory-canary
+#   TOKEN=$(kubectl -n openagentix-schedules create token memory-canary --audience openagentix-a2a --duration 10m)
+# Delete this entry in a real cluster. It may list and delete memories of user ids that start with "probe:" and nothing else.
+# `callers` is a list, so this file REPLACES the list of profiles-demo-values.yaml (its `profile-canary` caller is then gone; the profile
+# agent itself is not affected). Keep that in mind when you use both files and need that caller.
+governance:
+  a2a:
+    callers:
+      - name: memory-canary
+        serviceAccount: {namespace: openagentix-schedules, name: memory-canary}
+        agents: [assistant]
+        userId: {prefix: "probe:"}
+        memory: true

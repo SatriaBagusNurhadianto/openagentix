@@ -224,7 +224,9 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- $callers := list -}}
 {{- if .Values.bridge.enabled -}}
 {{- $b := .Values.bridge -}}
-{{- $callers = append $callers (dict "name" "bridge" "serviceAccount" (dict "namespace" $b.namespace "name" "telegram-bridge") "agents" (list (printf "%s/%s" $b.agentNamespace $b.agent)) "userId" (dict "prefix" (default "telegram:" $b.userIdPrefix)) "methods" (list "SendMessage")) -}}
+{{- $bridge := dict "name" "bridge" "serviceAccount" (dict "namespace" $b.namespace "name" "telegram-bridge") "agents" (list (printf "%s/%s" $b.agentNamespace $b.agent)) "userId" (dict "prefix" (default "telegram:" $b.userIdPrefix)) "methods" (list "SendMessage") -}}
+{{- if $b.memoryCommands }}{{ $_ := set $bridge "memory" true }}{{ end -}}
+{{- $callers = append $callers $bridge -}}
 {{- end -}}
 {{- range .Values.schedules -}}
 {{- $callers = append $callers (dict "name" (printf "schedule-%s" .name) "serviceAccount" (dict "namespace" $.Values.scheduling.namespace "name" (printf "schedule-%s" .name)) "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "exact" (default (printf "schedule:%s" .name) .userId)) "methods" (list "SendMessage")) -}}
@@ -265,6 +267,10 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- end -}}
 {{- $entry := dict "name" $c.name "serviceAccount" (dict "namespace" $c.serviceAccount.namespace "name" $c.serviceAccount.name) "agents" $full "userId" (pick $u "exact" "prefix" "fixed") -}}
 {{- if $methods }}{{ $_ := set $entry "methods" $methods }}{{ end -}}
+{{- if hasKey $c "memory" -}}
+{{- if not (kindIs "bool" $c.memory) }}{{ fail (printf "governance.a2a.callers[%s]: memory must be true or false" $c.name) }}{{ end -}}
+{{- if $c.memory }}{{ $_ := set $entry "memory" true }}{{ end -}}
+{{- end -}}
 {{- $callers = append $callers $entry -}}
 {{- end -}}
 {{- /* a caller of the controller's port that was admitted by networkPolicy.extraA2ACallers must have a rule, or it would be cut off silently */ -}}
@@ -274,6 +280,21 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- if not $has }}{{ fail (printf "networkPolicy.extraA2ACallers: namespace %q has no matching entry in governance.a2a.callers (serviceAccount.namespace). With the A2A gate on every caller needs a rule." $x.namespace) }}{{ end -}}
 {{- end -}}
 {{- toJson (dict "callers" $callers) -}}
+{{- end -}}
+
+{{/* bridge.memoryCommands (ADR 0006, round 3): fails the render when the switch is not usable. Prints nothing.
+Needs the A2A gate (the only way to the MemoryService), the bridge, and the bridge's agent in agents[] with memory on. */}}
+{{- define "oa.bridgeMemoryCheck" -}}
+{{- $b := .Values.bridge -}}
+{{- if not (kindIs "bool" $b.memoryCommands) }}{{ fail "bridge.memoryCommands must be true or false" }}{{ end -}}
+{{- if $b.memoryCommands -}}
+{{- if not $b.enabled }}{{ fail "bridge.memoryCommands needs bridge.enabled=true" }}{{ end -}}
+{{- if not (include "oa.a2aGateOn" .) }}{{ fail "bridge.memoryCommands needs governance.a2a.enabled=true: the gate is the only way to the memory service, and it decides who may list or delete" }}{{ end -}}
+{{- $found := false -}}{{- $mem := false -}}
+{{- if eq $b.agentNamespace .Values.kagent.namespace }}{{ range .Values.agents }}{{ if eq .name $b.agent }}{{ $found = true }}{{ if and .memory .memory.enabled }}{{ $mem = true }}{{ end }}{{ end }}{{ end }}{{ end -}}
+{{- if not $found }}{{ fail (printf "bridge.memoryCommands needs bridge.agent %q to be in agents[] in the namespace %q" $b.agent .Values.kagent.namespace) }}{{ end -}}
+{{- if not $mem }}{{ fail (printf "bridge.memoryCommands needs memory.enabled on the agent %q (agents[].memory.enabled): without memory there is nothing to list or forget" $b.agent) }}{{ end -}}
+{{- end -}}
 {{- end -}}
 
 {{/* ---- Tool profiles (ADR 0006, round 2): mcp.profiles ------------------------------------------------------ */}}

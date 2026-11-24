@@ -275,3 +275,97 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- end -}}
 {{- toJson (dict "callers" $callers) -}}
 {{- end -}}
+
+{{/* ---- Tool profiles (ADR 0006, round 2): mcp.profiles ------------------------------------------------------ */}}
+
+{{/* JSON list of the backends (workloads) a profile may name: mcp.servers, plus the knowledge and notify MCPServerEntry when enabled. */}}
+{{- define "oa.profileWorkloads" -}}
+{{- $w := list -}}
+{{- range .Values.mcp.servers }}{{ $w = append $w .name }}{{ end -}}
+{{- if .Values.knowledge.enabled }}{{ $w = append $w .Values.knowledge.mcp.entryName }}{{ end -}}
+{{- if .Values.notify.enabled }}{{ $w = append $w .Values.notify.mcp.entryName }}{{ end -}}
+{{- $w | toJson -}}
+{{- end -}}
+
+{{/* Names of the tools a profile advertises, as the agent sees them (prefixFormat applied), plus execute_tool_script with code mode. JSON list.
+Argument: dict "root" <top-level context> "profile" <one mcp.profiles entry>. */}}
+{{- define "oa.profileToolNames" -}}
+{{- $root := .root -}}
+{{- $names := list -}}
+{{- range $w := (keys .profile.tools | sortAlpha) -}}
+{{- $pfx := replace "{workload}" $w $root.Values.mcp.virtual.prefixFormat -}}
+{{- range $t := (index $.profile.tools $w) }}{{ $names = append $names (printf "%s%s" $pfx $t) }}{{ end -}}
+{{- end -}}
+{{- if .profile.codeMode }}{{ $names = append $names "execute_tool_script" }}{{ end -}}
+{{- $names | toJson -}}
+{{- end -}}
+
+{{/* Fails the render when mcp.profiles is malformed. Prints nothing. Safe to include from several templates. */}}
+{{- define "oa.profilesCheck" -}}
+{{- $m := .Values.mcp -}}
+{{- if $m.profiles -}}
+{{- if not (kindIs "slice" $m.profiles) }}{{ fail "mcp.profiles must be a list" }}{{ end -}}
+{{- if ne $m.virtual.incomingAuth.type "oidc" }}{{ fail "mcp.profiles needs mcp.virtual.incomingAuth.type oidc: a profile is told apart by its own audience, and an anonymous vMCP has none" }}{{ end -}}
+{{- $workloads := include "oa.profileWorkloads" . | fromJsonArray -}}
+{{- $seen := list -}}
+{{- $auds := list $m.virtual.incomingAuth.oidc.audience -}}
+{{- range $p := $m.profiles -}}
+{{- if not (kindIs "map" $p) }}{{ fail "every mcp.profiles entry must be a map with name and tools" }}{{ end -}}
+{{- if not (and (kindIs "string" $p.name) (regexMatch "^[a-z][a-z0-9]*(-[a-z0-9]+)*$" $p.name) (le (len $p.name) 20)) }}{{ fail (printf "profile name %q is not valid: use lower case letters, digits and single dashes, starting with a letter, at most 20 characters" (toString $p.name)) }}{{ end -}}
+{{- if has $p.name $seen }}{{ fail (printf "duplicate profile name %q in mcp.profiles" $p.name) }}{{ end -}}
+{{- $seen = append $seen $p.name -}}
+{{- $aud := printf "%s-%s" $m.virtual.incomingAuth.oidc.audience $p.name -}}
+{{- if has $aud $auds }}{{ fail (printf "profile %q would use the audience %q, which another vMCP already has: audiences must be unique" $p.name $aud) }}{{ end -}}
+{{- $auds = append $auds $aud -}}
+{{- if and (hasKey $p "codeMode") (not (kindIs "bool" $p.codeMode)) }}{{ fail (printf "profile %q: codeMode must be true or false" $p.name) }}{{ end -}}
+{{- if or (not (kindIs "map" $p.tools)) (not $p.tools) }}{{ fail (printf "profile %q needs a non-empty tools map (backend name: list of tool names)" $p.name) }}{{ end -}}
+{{- range $w, $l := $p.tools -}}
+{{- if not (has $w $workloads) }}{{ fail (printf "profile %q: workload %q is not a backend of the tool group (%s)" $p.name $w (join ", " $workloads)) }}{{ end -}}
+{{- if or (not (kindIs "slice" $l)) (not $l) }}{{ fail (printf "profile %q: workload %q needs a non-empty tools list" $p.name $w) }}{{ end -}}
+{{- range $t := $l }}{{ if not (and (kindIs "string" $t) (regexMatch "^[A-Za-z0-9_.-]+$" $t)) }}{{ fail (printf "profile %q: workload %q lists a tool name that is not valid: %v" $p.name $w $t) }}{{ end }}{{ end -}}
+{{- if ne (len $l) (len (uniq $l)) }}{{ fail (printf "profile %q: workload %q lists a tool twice" $p.name $w) }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/* The agent's tool profile as JSON ({} when it has none). Fails for a profile that does not exist. Argument: dict "root" <top> "agent" <agent>. */}}
+{{- define "oa.agentProfile" -}}
+{{- $a := .agent -}}
+{{- $found := dict -}}
+{{- if $a.toolProfile -}}
+{{- if not (kindIs "string" $a.toolProfile) }}{{ fail (printf "agent %q: toolProfile must be a profile name (a string)" $a.name) }}{{ end -}}
+{{- if not .root.Values.mcp.enabled }}{{ fail (printf "agent %q uses toolProfile %q but mcp.enabled is false" $a.name $a.toolProfile) }}{{ end -}}
+{{- if not .root.Values.kagent.remoteMCPServer.enabled }}{{ fail (printf "agent %q uses toolProfile %q but kagent.remoteMCPServer.enabled is false: a profile is reached through its own RemoteMCPServer" $a.name $a.toolProfile) }}{{ end -}}
+{{- $names := list -}}
+{{- range $p := .root.Values.mcp.profiles }}{{ $names = append $names $p.name }}{{ if eq $p.name $a.toolProfile }}{{ $found = $p }}{{ end }}{{ end -}}
+{{- if not $found }}{{ fail (printf "agent %q: toolProfile %q is not defined in mcp.profiles (defined: %s)" $a.name $a.toolProfile (join ", " $names)) }}{{ end -}}
+{{- end -}}
+{{- $found | toJson -}}
+{{- end -}}
+
+{{/* Fails the render when agents[].egress is malformed; returns the allow list as JSON ([] when there is none).
+Argument: dict "root" <top> "agent" <agent>. The entries follow kagent's EgressPolicy origin pattern: scheme, lower case DNS name
+(a wildcard replaces one leftmost label), optional port, no path. Names inside the MCP tools namespace are refused: they would
+reach a vMCP or an unauthenticated backend proxy around the profile. */}}
+{{- define "oa.agentEgress" -}}
+{{- $a := .agent -}}
+{{- $m := .root.Values.mcp -}}
+{{- $allow := list -}}
+{{- if $a.egress -}}
+{{- if not (kindIs "map" $a.egress) }}{{ fail (printf "agent %q: egress must be a map with an allow list" $a.name) }}{{ end -}}
+{{- if hasKey $a.egress "allow" -}}
+{{- if not (kindIs "slice" $a.egress.allow) }}{{ fail (printf "agent %q: egress.allow must be a list of origins" $a.name) }}{{ end -}}
+{{- if gt (len $a.egress.allow) 64 }}{{ fail (printf "agent %q: egress.allow has %d origins; at most 64 are allowed" $a.name (len $a.egress.allow)) }}{{ end -}}
+{{- range $o := $a.egress.allow -}}
+{{- if not (and (kindIs "string" $o) (regexMatch "^https?://(\\*\\.([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+|([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)*)[a-z]([-a-z0-9]{0,61}[a-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$" $o) (le (len $o) 270)) }}{{ fail (printf "agent %q: egress.allow entry %v is not an origin: use https://host[:port] or http://host[:port], a lower case DNS name (a wildcard replaces exactly one leftmost label, as in https://*.example.com), no path, no query, no address" $a.name $o) }}{{ end -}}
+{{- if has $o $allow }}{{ fail (printf "agent %q: egress.allow lists %q twice" $a.name $o) }}{{ end -}}
+{{- $host := regexReplaceAll "^https?://([^:/]+).*$" $o "${1}" | trimPrefix "*." -}}
+{{- $ns := $m.namespace -}}
+{{- if or (eq $host $ns) (eq $host (printf "%s.svc" $ns)) (eq $host (printf "%s.svc.cluster.local" $ns)) (hasSuffix (printf ".%s" $ns) $host) (hasSuffix (printf ".%s.svc" $ns) $host) (hasSuffix (printf ".%s.svc.cluster.local" $ns) $host) }}{{ fail (printf "agent %q: egress.allow entry %q is inside the tools namespace %q: that would reach a vMCP or a tool server around the profile" $a.name $o $ns) }}{{ end -}}
+{{- $allow = append $allow $o -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $allow | toJson -}}
+{{- end -}}

@@ -224,6 +224,14 @@ mcp:
   serverResources:
     limits: {cpu: 100m, memory: 128Mi}
     requests: {cpu: 20m, memory: 32Mi}
+  # Tool profiles (ADR 0006, round 2): each renders one more vMCP (`<virtual.name>-<profile>`) on the same group that advertises
+  # only the listed tools, its own OIDC audience (`<oidc.audience>-<profile>`) and a RemoteMCPServer (`<remoteMCPServer.name>-<profile>`).
+  # An agent with `toolProfile: <name>` takes its tools from that server only. Empty: only the shared vMCP, as before. One extra pod each.
+  #   - name: lookup               # lower case letters, digits, dashes
+  #     codeMode: false            # true adds execute_tool_script, which can call only this profile's tools
+  #     tools:                     # backend name (mcp.servers, knowledge.mcp.entryName, notify.mcp.entryName) -> its own tool names
+  #       osv: [query_vulnerability, get_vulnerability]
+  profiles: []
   virtual:
     name: tools                   # the operator serves it as Service vmcp-<name>:4483
     port: 4483
@@ -611,6 +619,9 @@ agents:
       Use the available tools when they help; say when you used one.
     tools:                               # server defaults to kagent.remoteMCPServer.name
       - tools: [execute_tool_script, fetch_fetch, osv_get_vulnerability, osv_query_vulnerabilities_batch, osv_query_vulnerability]
+    # toolProfile: lookup                # take the tools from mcp.profiles[].name `lookup` only (its own vMCP and RemoteMCPServer); every tool listed must be in the profile
+    # egress:                            # extra origins the sandbox may reach (renders an EgressPolicy `<name>-egress`); the model gateway, the tool server and the controller are always allowed
+    #   allow: ["https://api.github.com"]
     skills: [openagentix-canary]         # names from the top-level skills map
     knowledge: true                      # adds the knowledge base tools and prompt (needs knowledge.enabled and mcp.enabled)
     # notify: {enabled: true}            # adds the two notify tools and prompt (needs notify.enabled and mcp.enabled); off unless listed

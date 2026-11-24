@@ -1233,6 +1233,184 @@ eq "an invalid gate block is not checked while it is off" "$([ -z "$(render_err 
 eq "the gate alone (no channels, no schedules) renders" "$(q "$(docs --set governance.a2a.enabled=true)" '[.[]|select(.metadata.name|tostring|test("a2a"))|.kind]|sort|join(",")')" ClusterRoleBinding,ConfigMap,Deployment,NetworkPolicy,Service,ServiceAccount
 eq "stray secret-looking values are never rendered with the gate on" "$(q "$(docs "${GON[@]}" --set bridge.token=SENTINEL-GATE-123 --set governance.a2a.apiKey=SENTINEL-GATE-123)" 'tostring|contains("SENTINEL-GATE-123")')" false
 
+echo "# profiles and egress (ADR 0006, round 2): everything is off by default"
+PV="$REPO/components/governance/profiles-demo-values.yaml"
+PX="$(dirname "$0")/.profiles-variant.yaml"
+eq "mcp.profiles defaults to an empty list"           "$(yq -c '.mcp.profiles' "$CHART/values.yaml")" '[]'
+D=$(docs)
+eq "default: no vMCP besides the shared one"           "$(q "$D" '[.[]|select(.kind=="VirtualMCPServer")|.metadata.name]|join(",")')" tools
+eq "default: no EgressPolicy"                          "$(count "$D" '.kind=="EgressPolicy"')" 0
+eq "default: no Agent has egressPolicyRefs"            "$(q "$D" '[.[]|select(.kind=="Agent")|.spec|has("egressPolicyRefs")]|any')" false
+eq "default: the shared vMCP has no tool filter"       "$(q "$D" '.[]|select(.kind=="VirtualMCPServer")|.spec.config.aggregation|has("tools") or has("defaultToolVisibility")')" false
+eq "default: one RemoteMCPServer"                      "$(count "$D" '.kind=="RemoteMCPServer"')" 1
+
+echo "# profiles: what one profile renders"
+PALL=(-f "$REPO/components/channels/demo-values.yaml" -f "$REPO/components/schedules/demo-values.yaml" -f "$REPO/components/notify/demo-values.yaml" -f "$REPO/components/observability/demo-values.yaml" -f "$REPO/components/knowledge/graph-demo-values.yaml" -f "$REPO/components/governance/demo-values.yaml" -f "$PV" $GKAPI)
+PNG=(-f "$REPO/components/notify/demo-values.yaml" -f "$REPO/components/observability/demo-values.yaml" -f "$REPO/components/knowledge/graph-demo-values.yaml" -f "$PV")   # no gate, no bridge rule: tests may replace agents
+DP=$(docs "${PALL[@]}")
+VS='.[]|select(.kind=="VirtualMCPServer" and .metadata.name=="tools")'
+VP='.[]|select(.kind=="VirtualMCPServer" and .metadata.name=="tools-lookup")'
+eq "the demo file renders"                             "$([ -z "$(render_err "${PALL[@]}")" ] && echo rendered || echo failed)" rendered
+eq "two vMCP servers: the shared one and tools-lookup" "$(q "$DP" '[.[]|select(.kind=="VirtualMCPServer")|.metadata.name]|sort|join(",")')" tools,tools-lookup
+eq "the profile vMCP serves the same MCPGroup"         "$(q "$DP" "$VP|.spec.groupRef.name")" "$(q "$DP" "$VS|.spec.groupRef.name")"
+eq "the profile vMCP is in the mcp namespace"          "$(q "$DP" "$VP|.metadata.namespace")" mcp-tools
+eq "profile: unlisted backends advertise nothing (deny)" "$(q "$DP" "$VP|.spec.config.aggregation.defaultToolVisibility")" deny
+eq "profile: osv filter holds only the listed tools"   "$(q "$DP" "$VP|.spec.config.aggregation.tools[]|select(.workload==\"osv\")|.filter|sort|join(\",\")")" get_vulnerability,query_vulnerability
+eq "profile: the MCPServerEntry backend has its filter" "$(q "$DP" "$VP|.spec.config.aggregation.tools[]|select(.workload==\"knowledge\")|.filter|join(\",\")")" kb_search
+eq "profile: fetch and delivery have no entry (so they contribute nothing)" "$(q "$DP" "$VP|[.spec.config.aggregation.tools[].workload]|sort|join(\",\")")" knowledge,osv
+eq "profile: conflict resolution and prefix as the shared vMCP" "$(q "$DP" "$VP|.spec.config.aggregation|[.conflictResolution,.conflictResolutionConfig.prefixFormat]|join(\" \")")" "prefix {workload}_"
+eq "profile: code mode on (profile value), with the shared limits" "$(q "$DP" "$VP|.spec.config.codeMode|[.enabled,.stepLimit,.toolCallTimeout]|map(tostring)|join(\" \")")" "true 100000 30s"
+eq "profile: incoming auth is oidc with its own audience" "$(q "$DP" "$VP|.spec.incomingAuth|[.type,.oidcConfigRef.name,.oidcConfigRef.audience]|join(\" \")")" "oidc substrate-actor-jwt openagentix-vmcp-lookup"
+eq "the audiences of all vMCP servers are unique"      "$(q "$DP" '[.[]|select(.kind=="VirtualMCPServer")|.spec.incomingAuth.oidcConfigRef.audience]|(length==(unique|length))|tostring')" true
+eq "the shared vMCP keeps its audience"                "$(q "$DP" "$VS|.spec.incomingAuth.oidcConfigRef.audience")" openagentix-vmcp
+eq "the profile vMCP is authorized by an explicit allow-all policy (the filter is the limit)" "$(q "$DP" "$VP|.spec.incomingAuth.authzConfig.inline.policies|join(\" \")")" 'permit(principal, action, resource);'
+eq "profile: outgoing auth discovered like the shared one" "$(q "$DP" "$VP|.spec.outgoingAuth.source")" discovered
+eq "profile: telemetry and audit follow observability" "$(q "$DP" "$VP|[(.spec.telemetryConfigRef.name),(.spec.config.audit.enabled|tostring)]|join(\" \")")" "openagentix-telemetry true"
+eq "the shared vMCP is unchanged by the profile"       "$(q "$DP" "$VS|.spec.config.aggregation|has(\"tools\")")" false
+eq "the OIDC config is shared (issuer and keys are the same), one object" "$(count "$DP" '.kind=="MCPOIDCConfig"')" 1
+eq "a RemoteMCPServer per profile"                     "$(q "$DP" '[.[]|select(.kind=="RemoteMCPServer")|.metadata.name]|sort|join(",")')" toolhive-vmcp,toolhive-vmcp-lookup
+RP='.[]|select(.kind=="RemoteMCPServer" and .metadata.name=="toolhive-vmcp-lookup")'
+eq "profile RemoteMCPServer points at its own vMCP Service" "$(q "$DP" "$RP|.spec.url")" http://vmcp-tools-lookup.mcp-tools.svc.cluster.local:4483/mcp
+eq "profile RemoteMCPServer asks Substrate for its own audience" "$(q "$DP" "$RP|.spec.actorJwt|[(.audiences|join(\",\")),(.expirationSeconds|tostring)]|join(\" \")")" "openagentix-vmcp-lookup 3600"
+eq "the shared RemoteMCPServer still asks for the shared audience" "$(q "$DP" '.[]|select(.kind=="RemoteMCPServer" and .metadata.name=="toolhive-vmcp")|.spec.actorJwt.audiences|join(",")')" openagentix-vmcp
+eq "profile RemoteMCPServer keeps timeout and protocol" "$(q "$DP" "$RP|[.spec.timeout,.spec.protocol]|join(\" \")")" "60s STREAMABLE_HTTP"
+
+echo "# profiles: the agents"
+AP='.[]|select(.kind=="AgentTemplate" and .metadata.name=="profile-demo-template")'
+AS='.[]|select(.kind=="AgentTemplate" and .metadata.name=="assistant-template")'
+eq "the profile agent exists beside assistant"         "$(q "$DP" '[.[]|select(.kind=="Agent")|.metadata.name]|sort|join(",")')" assistant,profile-demo
+eq "the profile agent takes tools only from its profile server" "$(q "$DP" "$AP|[.spec.tools[].mcp.server.name]|unique|join(\",\")")" toolhive-vmcp-lookup
+eq "the profile agent's tool list"                     "$(q "$DP" "$AP|[.spec.tools[].mcp.tools[]]|sort|join(\",\")")" execute_tool_script,knowledge_kb_search,osv_get_vulnerability,osv_query_vulnerability
+eq "assistant stays on the shared vMCP, unchanged"     "$(q "$DP" "$AS|[.spec.tools[].mcp.server.name]|unique|join(\",\")")" toolhive-vmcp
+eq "assistant keeps every tool it had (and the knowledge and notify ones)" "$(q "$DP" "$AS|[.spec.tools[].mcp.tools[]]|map(select(test(\"^(fetch_fetch|osv_|knowledge_|delivery_|execute_)\")))|length")" 13
+eq "the profile agent renders an EgressPolicy"         "$(q "$DP" '.[]|select(.kind=="EgressPolicy")|[.metadata.name,.metadata.namespace,(.spec.destinations|map(.origin)|join(","))]|join(" ")')" "profile-demo-egress kagent https://api.osv.dev"
+eq "exactly one EgressPolicy"                          "$(count "$DP" '.kind=="EgressPolicy"')" 1
+eq "the EgressPolicy grants no credentials"            "$(q "$DP" '.[]|select(.kind=="EgressPolicy")|[.spec.destinations[]|has("authentication")]|any')" false
+eq "the Agent refers to it"                            "$(q "$DP" '.[]|select(.kind=="Agent" and .metadata.name=="profile-demo")|.spec.egressPolicyRefs|map(.name)|join(",")')" profile-demo-egress
+eq "assistant has no egressPolicyRefs"                 "$(q "$DP" '.[]|select(.kind=="Agent" and .metadata.name=="assistant")|.spec|has("egressPolicyRefs")|tostring')" false
+eq "the profile agent has its own model config and key" "$(q "$DP" '.[]|select(.kind=="ModelConfig" and .metadata.annotations["openagentix.io/agent"]=="profile-demo")|[.metadata.name,.spec.apiKeySecret]|join(" ")')" "gateway-profile-demo profile-demo-virtual-key"
+eq "profiles render no Secret"                         "$(count "$DP" '.kind=="Secret"')" 0
+
+eq "with the gate on, the demo caller may call the profile agent and assistant" "$(q "$DP" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="profile-canary")|[(.agents|sort|join(",")),.userId.exact]|join(" ")')" "kagent/assistant,kagent/profile-demo canary:profiles"
+eq "the profile demo file alone (gate off) renders without the caller rule" "$(count "$(docs -f "$PV")" '.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules"')" 0
+
+echo "# profiles: network policies"
+NI='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress")'
+NP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress-lookup")'
+eq "the profile vMCP has its own ingress policy"       "$(q "$DP" "$NP|.spec.podSelector.matchLabels|[.app,.[\"toolhive-name\"]]|join(\" \")")" "virtualmcpserver tools-lookup"
+eq "its peers and ports equal the shared vMCP's"       "$(q "$DP" "[($NP|.spec.ingress),($NI|.spec.ingress)]|(.[0]==.[1])|tostring")" true
+eq "the shared vMCP policy still selects only the shared pod" "$(q "$DP" "$NI|.spec.podSelector.matchLabels[\"toolhive-name\"]")" tools
+eq "a metrics policy per profile (observability on)"   "$(q "$DP" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-metrics-lookup")|[.spec.podSelector.matchLabels["toolhive-name"],(.spec.ingress[0].ports[0].port|tostring)]|join(" ")')" "tools-lookup 9464"
+eq "the kb admits the profile vMCP (every vMCP of the group connects to every backend, or it reports Degraded)" "$(q "$DP" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-ingress")|[.spec.ingress[0].from[]|.podSelector.matchLabels["toolhive-name"]]|sort|join(",")')" tools,tools-lookup
+eq "notify admits the profile vMCP too, although the profile lists no notify tool" "$(q "$DP" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="notify-ingress")|[.spec.ingress[0].from[]|.podSelector.matchLabels["toolhive-name"]]|sort|join(",")')" tools,tools-lookup
+eq "networkPolicy.enabled=false: no profile policy"    "$(count "$(docs "${PALL[@]}" --set networkPolicy.enabled=false)" '.kind=="NetworkPolicy"')" 0
+eq "observability off: no profile metrics policy"      "$(count "$(docs -f "$PV")" '.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-metrics-lookup"')" 0
+printf 'agents:\n  - {name: pd, model: claude-haiku, systemPrompt: x}\n' > "$PX"
+eq "mcp.enabled=false: no profile object and no vMCP" "$(count "$(docs "${PNG[@]}" -f "$PX" --set mcp.enabled=false --set knowledge.enabled=false)" '(.metadata.name|tostring|test("lookup")) or .kind=="VirtualMCPServer" or (.kind=="RemoteMCPServer" and .metadata.name!="toolhive-vmcp")')" 0
+eq "kagent.enabled=false: no profile RemoteMCPServer (the vMCP still renders)" "$(count "$(docs "${PNG[@]}" -f "$PX" --set kagent.enabled=false)" '.kind=="RemoteMCPServer" or (.kind=="VirtualMCPServer" and .metadata.name=="tools-lookup")')" 1
+
+echo "# profiles: a second profile, notify tools and no code mode"
+cat > "$PX" <<'YAML'
+mcp:
+  profiles:
+    - name: lookup
+      codeMode: true
+      tools: {osv: [query_vulnerability]}
+    - name: Notifier2
+      tools: {delivery: [notify_send]}
+agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x}
+YAML
+eq "an uppercase profile name fails the render"        "$([ -n "$(render_err "${PNG[@]}" -f "$PX")" ] && echo failed || echo rendered)" failed
+sed -i.bak 's/Notifier2/sender/' "$PX"; rm -f "$PX.bak"
+DN=$(docs "${PNG[@]}" -f "$PX")
+eq "the lookup profile in this file has one workload"  "$(q "$DN" '.[]|select(.kind=="VirtualMCPServer" and .metadata.name=="tools-lookup")|.spec.config.aggregation.tools|length')" 1
+eq "a profile without codeMode renders no codeMode block" "$(q "$DN" '.[]|select(.kind=="VirtualMCPServer" and .metadata.name=="tools-sender")|.spec.config|has("codeMode")|tostring')" false
+eq "each profile has its own audience"                 "$(q "$DN" '[.[]|select(.kind=="VirtualMCPServer")|.spec.incomingAuth.oidcConfigRef.audience]|sort|join(",")')" openagentix-vmcp,openagentix-vmcp-lookup,openagentix-vmcp-sender
+eq "notify admits every profile vMCP"                  "$(q "$DN" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="notify-ingress")|[.spec.ingress[0].from[]|.podSelector.matchLabels["toolhive-name"]]|sort|join(",")')" tools,tools-lookup,tools-sender
+eq "the kb admits every profile vMCP"                  "$(q "$DN" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="kb-ingress")|[.spec.ingress[0].from[]|.podSelector.matchLabels["toolhive-name"]]|sort|join(",")')" tools,tools-lookup,tools-sender
+eq "two profiles, two RemoteMCPServers more"           "$(count "$DN" '.kind=="RemoteMCPServer"')" 3
+
+echo "# profiles: render-time failures"
+perr() { # perr <description> <expected text in the error> <yaml for -f after the demo profile file>
+  printf '%s\n' "$3" > "$PX"
+  local e; e=$(render_err "${PNG[@]}" -f "$PX")
+  eq "$1" "$(printf '%s' "$e" | command grep -c -- "$2")" 1
+}
+perr "an unknown profile fails the render" 'toolProfile.*nope' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: nope, tools: [{tools: [osv_query_vulnerability]}]}'
+perr "a tool that is not in the profile fails the render" 'fetch_fetch.*profile.*lookup' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: lookup, tools: [{tools: [osv_query_vulnerability, fetch_fetch]}]}'
+perr "a tool of the profile's workload that the filter hides fails the render" 'osv_query_vulnerabilities_batch.*lookup' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: lookup, tools: [{tools: [osv_query_vulnerabilities_batch]}]}'
+perr "knowledge: true on a profile that lacks the other kb tools fails" 'knowledge_kb_get_document.*lookup' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: lookup, knowledge: true, tools: [{tools: [osv_query_vulnerability]}]}'
+perr "duplicate profile names fail the render" 'duplicate.*lookup' 'mcp:
+  profiles:
+    - {name: lookup, tools: {osv: [query_vulnerability]}}
+    - {name: lookup, tools: {osv: [get_vulnerability]}}'
+perr "a profile name that would collide with the shared vMCP naming fails" 'profile name' 'mcp:
+  profiles:
+    - {name: "a b", tools: {osv: [query_vulnerability]}}'
+perr "a profile with an unknown workload fails the render" 'workload.*ghost' 'mcp:
+  profiles:
+    - {name: lookup, tools: {ghost: [x]}}'
+perr "a profile workload with no tools fails the render" 'lookup.*osv.*tools' 'mcp:
+  profiles:
+    - {name: lookup, tools: {osv: []}}'
+perr "a profile without any workload fails the render" 'lookup.*tools' 'mcp:
+  profiles:
+    - {name: lookup, tools: {}}'
+perr "execute_tool_script without codeMode on the profile fails" 'execute_tool_script.*codeMode' 'mcp:
+  profiles:
+    - {name: lookup, tools: {osv: [query_vulnerability]}}'
+perr "a profile agent that names another server fails the render (a path around the profile)" 'another server' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: lookup, tools: [{server: toolhive-vmcp, tools: [osv_query_vulnerability]}]}'
+perr "profiles need oidc incoming auth" 'incomingAuth.type oidc' 'mcp:
+  virtual: {incomingAuth: {type: anonymous}}'
+perr "a profile agent needs the RemoteMCPServer switch" 'remoteMCPServer' 'kagent:
+  remoteMCPServer: {enabled: false}'
+perr "toolProfile with mcp.enabled=false fails" 'toolProfile.*mcp.enabled' 'mcp: {enabled: false}'
+perr "toolProfile must be a string" 'toolProfile' 'agents:
+  - {name: pd, model: claude-haiku, systemPrompt: x, toolProfile: [lookup]}'
+eq "profiles without agents on them render (a profile may be unused)" "$(printf 'agents:\n  - {name: pd, model: claude-haiku, systemPrompt: x}\n' > "$PX"; [ -z "$(render_err "${PNG[@]}" -f "$PX")" ] && echo rendered || echo failed)" rendered
+
+echo "# egress.allow: renders an EgressPolicy, fails on bad entries"
+eg() { printf 'agents:\n  - name: pd\n    model: claude-haiku\n    systemPrompt: x\n    egress: %s\n' "$1" > "$PX"; }
+eg '{allow: ["https://api.github.com", "https://*.example.com:8443", "http://svc.example.org"]}'
+DE=$(docs -f "$PX")
+eq "an agent on the shared vMCP can have egress.allow" "$(q "$DE" '.[]|select(.kind=="EgressPolicy")|[.metadata.name,(.spec.destinations|map(.origin)|join(","))]|join(" ")')" "pd-egress https://api.github.com,https://*.example.com:8443,http://svc.example.org"
+eq "the Agent carries egressPolicyRefs"                "$(q "$DE" '.[]|select(.kind=="Agent")|.spec.egressPolicyRefs|map(.name)|join(",")')" pd-egress
+eq "the EgressPolicy is in the agent's namespace"      "$(q "$DE" '.[]|select(.kind=="EgressPolicy")|.metadata.namespace')" kagent
+eg '{allow: []}'
+eq "an empty allow list renders nothing"               "$(count "$(docs -f "$PX")" '.kind=="EgressPolicy"')" 0
+eq "an empty allow list adds no egressPolicyRefs"      "$(q "$(docs -f "$PX")" '.[]|select(.kind=="Agent")|.spec|has("egressPolicyRefs")|tostring')" false
+eg '{}'
+eq "egress without allow renders nothing"              "$(count "$(docs -f "$PX")" '.kind=="EgressPolicy"')" 0
+for bad in '"api.github.com"' '"ftp://example.com"' '"https://example.com/path"' '"https://Example.com"' '"https://1.2.3.4"' '"https://*"' '"https://*.com"' '"https://exa mple.com"' '"https://example.com:0"' '"https://example.com:99999"' '"https://user@example.com"' '"https://example.com?x=1"' '""' '5'; do
+  eg "{allow: [$bad]}"
+  eq "malformed entry $bad fails the render"           "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+done
+eg '{allow: ["https://example.com", "https://example.com"]}'
+eq "a duplicate entry fails the render"               "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '{allow: "https://example.com"}'
+eq "allow must be a list"                              "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '[https://example.com]'
+eq "egress must be a map"                              "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '{allow: ["http://vmcp-tools.mcp-tools.svc.cluster.local:4483"]}'
+eq "an origin that is the shared vMCP fails the render" "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '{allow: ["http://vmcp-tools-lookup.mcp-tools.svc.cluster.local:4483"]}'
+eq "an origin that is a profile vMCP fails the render" "$([ -n "$(render_err -f "$PV" -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '{allow: ["http://vmcp-tools.mcp-tools.svc.cluster.local:4483"]}'
+eq "and the same origin on a profile agent as well"    "$([ -n "$(render_err -f "$PV" -f "$PX")" ] && echo failed || echo rendered)" failed
+eg "{allow: [$(for i in $(seq 1 17); do printf '"https://h%s.example.com",' $i; done | sed 's/,$//')]}"
+eq "more than 16 origins is fine (limit is 64)"        "$([ -z "$(render_err -f "$PX")" ] && echo rendered || echo failed)" rendered
+eg "{allow: [$(for i in $(seq 1 65); do printf '"https://h%s.example.com",' $i; done | sed 's/,$//')]}"
+eq "more than 64 origins fails the render"             "$([ -n "$(render_err -f "$PX")" ] && echo failed || echo rendered)" failed
+eg '{allow: ["https://api.github.com"]}'
+eq "kagent.enabled=false: egress.allow renders nothing" "$(count "$(docs -f "$PX" --set kagent.enabled=false)" '.kind=="EgressPolicy"')" 0
+rm -f "$PX"
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

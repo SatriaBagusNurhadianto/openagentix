@@ -42,6 +42,31 @@ spec:
           podSelector:
             matchLabels: {{- toYaml $n.controllerPodLabels | nindent 14 }}
         {{- end }}
+{{- range $p := $m.profiles }}
+---
+# Tool profile {{ $p.name }}: the same ingress as the shared vMCP (the egress proxy and the controller), for its own pod.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-vmcp-ingress-{{ $p.name }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: virtualmcpserver, toolhive-name: {{ printf "%s-%s" $m.virtual.name $p.name | quote }}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: {{ $m.virtual.port }}}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $n.substrate.namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml $n.substrate.egressPodLabels | nindent 14 }}
+        {{- if $.Values.kagent.enabled }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $.Values.kagent.namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml $n.controllerPodLabels | nindent 14 }}
+        {{- end }}
+{{- end }}
 {{- if and (include "oa.obsOn" .) .Values.observability.bundled.enabled }}
 ---
 # The bundled VictoriaMetrics scrapes the vMCP's Prometheus port (ToolHive diagnostics, 9464). Nothing else is added.
@@ -60,6 +85,24 @@ spec:
       from:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.observability.namespace }}}}
           podSelector: {matchLabels: {app: victoria-metrics}}
+{{- range $p := $m.profiles }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-vmcp-metrics-{{ $p.name }}
+  namespace: {{ $m.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: virtualmcpserver, toolhive-name: {{ printf "%s-%s" $m.virtual.name $p.name | quote }}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports: [{protocol: TCP, port: 9464}]
+      from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $.Values.observability.namespace }}}}
+          podSelector: {matchLabels: {app: victoria-metrics}}
+{{- end }}
 {{- end }}
 {{- end }}
 {{- if .Values.kagent.enabled }}

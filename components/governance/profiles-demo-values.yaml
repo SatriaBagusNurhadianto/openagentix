@@ -1,0 +1,60 @@
+# Demo for the local kind cluster: ONE tool profile and a second, small agent that uses it (ADR 0006, round 2).
+# Combine it with the other demo files; it must come LAST, because `agents` is a list and a later file REPLACES it:
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml components/knowledge/graph-demo-values.yaml components/governance/demo-values.yaml components/governance/profiles-demo-values.yaml" ./install.sh
+# The profile costs one more vMCP pod (see docs/decisions/0006-governance.md, "Round 2 results", for the measured numbers). The
+# 6 CPU / 8 GB demo node carries exactly one.
+mcp:
+  profiles:
+    - name: lookup
+      codeMode: true          # adds execute_tool_script, which can call only the tools below
+      tools:                  # backend (workload) name -> that backend's own tool names, without the vMCP prefix
+        osv: [query_vulnerability, get_vulnerability]
+        knowledge: [kb_search]   # an MCPServerEntry backend: the filter applies to it like to an MCPServer
+
+agents:
+  # The default `assistant` again (charts/openagentix/values.yaml), plus `notify`, exactly as components/notify/demo-values.yaml has it:
+  # it stays on the shared vMCP and keeps every tool. Keep the two in sync when you change the default agent. `notify` is ignored
+  # when notify.enabled is false.
+  - name: assistant
+    description: General assistant reachable from messaging channels
+    model: claude-haiku
+    modelConfigName: gateway-claude-haiku
+    systemPrompt: |
+      You are a concise, helpful assistant running on a Kubernetes-native agent
+      platform. Answers are read in a chat app, so keep them short and use plain text.
+      Use the available tools when they help; say when you used one.
+    tools:
+      - tools: [execute_tool_script, fetch_fetch, osv_get_vulnerability, osv_query_vulnerabilities_batch, osv_query_vulnerability]
+    skills: [openagentix-canary]
+    knowledge: true
+    notify: {enabled: true}
+    memory:
+      enabled: true
+      ttlDays: 30
+
+  # A small agent on the profile: its tools come only from the vMCP `tools-lookup`, and its sandbox may reach one extra host.
+  - name: profile-demo
+    description: Narrow demo agent on the tool profile "lookup"
+    model: claude-haiku
+    systemPrompt: |
+      You answer questions about software vulnerabilities and the platform's own documents. Keep answers to two sentences.
+      You have only the tools that are listed for you.
+    toolProfile: lookup
+    tools:
+      - tools: [execute_tool_script, osv_query_vulnerability, osv_get_vulnerability, knowledge_kb_search]
+    egress:
+      allow: ["https://api.osv.dev"]   # one extra origin for the sandbox (bash, scripts); anything else is refused by the egress proxy
+
+# Only used with the A2A gate on (components/governance/demo-values.yaml; inert otherwise). One more caller, so an operator can ask the profile
+# agent a question by hand: the ServiceAccount must be created by you, in a namespace the gate admits (the schedules namespace
+# is), for example
+#   kubectl -n openagentix-schedules create serviceaccount profile-canary
+#   TOKEN=$(kubectl -n openagentix-schedules create token profile-canary --audience openagentix-a2a --duration 10m)
+# and the pod that calls the gate needs the label openagentix.io/component=schedule. Delete this entry in a real cluster.
+governance:
+  a2a:
+    callers:
+      - name: profile-canary
+        serviceAccount: {namespace: openagentix-schedules, name: profile-canary}
+        agents: [profile-demo, assistant]
+        userId: {exact: "canary:profiles"}

@@ -459,6 +459,12 @@ spec:
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.mcp.namespace }}}}
           podSelector:
             matchLabels: {app: virtualmcpserver, toolhive-name: {{ .Values.mcp.virtual.name | quote }}}
+        {{- range $p := .Values.mcp.profiles }}
+        # tool profile {{ $p.name }}: every vMCP of the group connects to every backend (discovery, health), whichever tools it advertises
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $.Values.mcp.namespace }}}}
+          podSelector:
+            matchLabels: {app: virtualmcpserver, toolhive-name: {{ printf "%s-%s" $.Values.mcp.virtual.name $p.name | quote }}}
+        {{- end }}
         {{- end }}
         {{- range $kb.ingestFrom }}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace }}}}

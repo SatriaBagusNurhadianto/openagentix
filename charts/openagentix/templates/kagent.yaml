@@ -22,6 +22,27 @@ spec:
     audiences: [{{ .Values.mcp.virtual.incomingAuth.oidc.audience | quote }}]
     expirationSeconds: {{ .Values.mcp.virtual.incomingAuth.oidc.tokenExpirationSeconds }}
   {{- end }}
+{{- if and .Values.mcp.enabled .Values.mcp.profiles }}
+{{- $_ := include "oa.profilesCheck" . }}
+{{- range $p := .Values.mcp.profiles }}
+---
+# One RemoteMCPServer per tool profile: an agent with toolProfile {{ $p.name }} reaches only this vMCP, with an actor JWT of this audience.
+apiVersion: api.kagent.dev/v1alpha3
+kind: RemoteMCPServer
+metadata:
+  name: {{ $k.remoteMCPServer.name }}-{{ $p.name }}
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  description: ToolHive VirtualMCPServer {{ $.Values.mcp.virtual.name }}-{{ $p.name }} (tool profile {{ $p.name }})
+  url: http://vmcp-{{ $.Values.mcp.virtual.name }}-{{ $p.name }}.{{ $.Values.mcp.namespace }}.svc.cluster.local:{{ $.Values.mcp.virtual.port }}/mcp
+  protocol: STREAMABLE_HTTP
+  timeout: {{ $k.remoteMCPServer.timeout }}
+  actorJwt:
+    audiences: [{{ printf "%s-%s" $.Values.mcp.virtual.incomingAuth.oidc.audience $p.name | quote }}]
+    expirationSeconds: {{ $.Values.mcp.virtual.incomingAuth.oidc.tokenExpirationSeconds }}
+{{- end }}
+{{- end }}
 {{- end }}
 {{- range $a := .Values.agents }}
 {{- if not (has $a.model $modelNames) }}
@@ -91,6 +112,9 @@ spec:
   {{- if $nt }}{{ $prompt = printf "%s\n%s" (trim $prompt) (include "oa.notifyAgentPrompt" $ | trim) }}{{ end }}
   {{- if and $a.memory $a.memory.enabled }}{{ $prompt = printf "%s\n%s" (trim $prompt) (trim $.Values.memory.agentPrompt) }}{{ end }}
   systemPrompt: {{ $prompt | toJson }}
+  {{- $prof := include "oa.agentProfile" (dict "root" $ "agent" $a) | fromJson }}
+  {{- $srv := $k.remoteMCPServer.name }}
+  {{- if $prof }}{{ $srv = printf "%s-%s" $k.remoteMCPServer.name $prof.name }}{{ end }}
   {{- $entries := list }}
   {{- $merged := false }}
   {{- $extra := list }}
@@ -99,9 +123,19 @@ spec:
   {{- range $t := $a.tools }}
   {{- $names := $t.tools }}
   {{- if and $extra (not $merged) (not $t.server) }}{{ $names = concat $names $extra }}{{ $merged = true }}{{ end }}
-  {{- $entries = append $entries (dict "server" (default $k.remoteMCPServer.name $t.server) "tools" $names) }}
+  {{- if and $prof $t.server (ne $t.server $srv) }}{{ fail (printf "agent %q uses toolProfile %q, so its tools cannot name another server (%q): that would be a path around the profile" $a.name $prof.name $t.server) }}{{ end }}
+  {{- $entries = append $entries (dict "server" (default $srv $t.server) "tools" $names) }}
   {{- end }}
-  {{- if and $extra (not $merged) }}{{ $entries = append $entries (dict "server" $k.remoteMCPServer.name "tools" $extra) }}{{ end }}
+  {{- if and $extra (not $merged) }}{{ $entries = append $entries (dict "server" $srv "tools" $extra) }}{{ end }}
+  {{- if $prof }}
+  {{- $allowed := include "oa.profileToolNames" (dict "root" $ "profile" $prof) | fromJsonArray }}
+  {{- range $t := $entries }}{{ range $n := $t.tools }}
+  {{- if not (has $n $allowed) }}
+  {{- if eq $n "execute_tool_script" }}{{ fail (printf "agent %q lists tool \"execute_tool_script\" but profile %q has codeMode off (set codeMode: true on the profile)" $a.name $prof.name) }}{{ end }}
+  {{- fail (printf "agent %q lists tool %q which is not in profile %q (the profile offers: %s)" $a.name $n $prof.name (join ", " $allowed)) }}
+  {{- end }}
+  {{- end }}{{ end }}
+  {{- end }}
   {{- if $entries }}
   tools:
     {{- range $t := $entries }}
@@ -122,6 +156,22 @@ spec:
         oci: {{ $sk.oci }}
     {{- end }}
   {{- end }}
+{{- $allow := include "oa.agentEgress" (dict "root" $ "agent" $a) | fromJsonArray }}
+{{- if $allow }}
+---
+# Extra origins the sandbox of {{ $a.name }} may reach (agents[].egress.allow). The egress proxy matches host and port only.
+apiVersion: api.kagent.dev/v1alpha3
+kind: EgressPolicy
+metadata:
+  name: {{ $a.name }}-egress
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  destinations:
+    {{- range $o := $allow }}
+    - origin: {{ $o | quote }}
+    {{- end }}
+{{- end }}
 ---
 apiVersion: api.kagent.dev/v1alpha3
 kind: Agent
@@ -132,5 +182,9 @@ metadata:
 spec:
   template: {ref: {name: {{ $a.name }}-template}}
   harnessRef: {name: {{ $a.name }}-harness}
+  {{- if $allow }}
+  egressPolicyRefs:
+    - name: {{ $a.name }}-egress
+  {{- end }}
 {{- end }}
 {{- end }}

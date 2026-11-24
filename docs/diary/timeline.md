@@ -137,3 +137,10 @@ The owner decided to stay on kagent 1.0.1, so the three weak points of ADR 0005 
 - Prompt caching: the gateway adds Anthropic cache marks only when asked. `spec.backend.ai.promptCaching` is now in the chart policy and on by default. Cache reads of 6,635 tokens on every new conversation, 8,036 inside one, cost per call down 74%. Model time is unchanged. kagent itself still shows 0 cached tokens.
 - Slow start: the 10 s wait is inside the kagent controller, before it sends to the router. Substrate, the restore, DNS and the node load are not the cause. Not solved; there is no setting for it. The demo node was also found in a restart loop (1 s probe timeouts on a full node), which explains part of the earlier concurrency result.
 - The assistant key reached its 1,000,000 tokens per hour after about 125 test calls and the next call got a 429.
+
+## 2026-11-24: public repository and documentation site
+
+- The repository is public under Apache-2.0 at `https://github.com/openagentix/openagentix`. This diary is published at `https://openagentix.github.io/openagentix/` by the `docs` workflow on every push that touches `docs/` or `website/`.
+- Layout change before publishing: the kagent and Substrate bring-up moved to `components/runtime/`, the benchmark harness to `components/bench/compare/`. Exploratory spike code and the original product brief are not part of the public repository.
+- Memory saving stays automatic (owner decision). The save-on-request variant is documented in ADR 0005.
+- Not verified: a fresh install from an empty cluster after the layout change. Syntax checks, chart tests (625) and a re-run of the installer on the existing cluster passed.

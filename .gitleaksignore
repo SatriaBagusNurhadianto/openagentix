@@ -1,0 +1,3 @@
+# Synthetic secret-shaped strings: fixtures of the memory secret-scan test. Not credentials.
+f8174d2e73d4cc790ca4382b61951f87f7a92a59:charts/openagentix/tests/memory-expiry-integration.sh:jwt:114
+f8174d2e73d4cc790ca4382b61951f87f7a92a59:charts/openagentix/tests/memory-expiry-integration.sh:stripe-access-token:116

@@ -41,6 +41,9 @@
 # pinned Kourier release (components/channels/kourier.sh, cosign-verified when cosign exists) BEFORE the chart, generates the
 # Secret of each webhook connection when absent (random, never printed), and the chart admits Kourier's pod to the kagent controller.
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
+# Tool profiles and per-agent egress (ADR 0006, round 2) are opt-in too: mcp.profiles, agents[].toolProfile and agents[].egress.allow
+# (components/governance/profiles-demo-values.yaml, which must come LAST in VALUES_FILE because it restates the agents list). This script
+# only waits for the extra vMCP of each profile; there is nothing else to create, and no Secret.
 # The A2A gate (ADR 0006, round 1) is opt-in too: the ONE switch is the chart value governance.a2a.enabled (components/governance/demo-values.yaml).
 # When the chart renders the gate, this script builds and loads its image, creates one static key per Kourier binding (Secret a2a-key-<binding> in the
 # channels namespace, only when absent, random, never printed) and writes the SHA-256 of each key into the gate's hash Secret (a2a-gate-keys), all
@@ -504,6 +507,12 @@ if [ -n "$A2A_GATE_DEP" ]; then
   log "A2A gate"
   $K rollout status deployment/a2a-gate -n "$GATE_NS" --timeout=180s
 fi
+
+# Tool profiles (mcp.profiles, ADR 0006 round 2): each is one more vMCP pod; an agent on a profile finds no tools until its vMCP is Ready.
+for row in $(jq -r 'select(.kind=="VirtualMCPServer" and (.metadata.annotations["openagentix.io/tool-profile"]//"")!="")|.metadata.namespace+"/"+.metadata.name' <<<"$RENDERED"); do
+  log "tool profile vMCP ${row##*/}"
+  $K wait "virtualmcpserver/${row##*/}" -n "${row%%/*}" --for=condition=Ready --timeout=300s || echo "WARN: ${row##*/} not Ready yet: $K get virtualmcpserver ${row##*/} -n ${row%%/*} -o yaml"
+done
 
 log "waiting for agents (first start builds a golden snapshot, ~1-2 min each)"
 for a in $(jq -r 'select(.kind=="Agent")|.metadata.name' <<<"$RENDERED"); do

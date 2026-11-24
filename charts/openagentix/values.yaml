@@ -21,6 +21,17 @@ networkPolicy:
   # {namespace: <ns>, podLabels: {k: v}} (podLabels optional; omitted admits every pod of that namespace).
   extraA2ACallers: []
   controllerPort: 8083                   # A2A, REST API and the sandbox task-store gRPC share this port
+  # The kagent UI (nginx) proxies /api/, /a2a/ and /mcp to the controller and forwards X-User-Id, and the controller serves
+  # every API (memory, sessions, A2A) on /api/ over gRPC-Web. A pod that could reach the UI could therefore go around the
+  # A2A gate, so the UI is closed to every pod by default (round 1 review, ADR 0006). Open it with `kubectl port-forward`
+  # (the kubelet connects inside the pod, no policy applies), or list the peers that may reach it here, each
+  # {namespace: <ns>, podLabels: {k: v}} (podLabels optional; omitted admits every pod of that namespace).
+  kagentUI:
+    podLabels:                           # the kagent UI pods (labels set by the kagent chart)
+      app.kubernetes.io/component: ui
+      app.kubernetes.io/name: kagent
+    port: 8080
+    allowFrom: []
 
 # ---- Channels and triggers (Agent Kourier, optional) --------------------------------------------
 # Agent Kourier (https://github.com/agentkourier/agent-kourier) connects chat platforms (Slack) and signed webhooks to
@@ -420,8 +431,8 @@ notify:
 # reverse proxy (services/a2a-gate) stands in front of the kagent controller's A2A port. It checks who calls (a projected
 # ServiceAccount token, or a static key for Agent Kourier), lets a caller reach only the agents and user ids its rule allows,
 # removes every credential and identity header the caller sent and sets X-User-Id itself, and writes one audit line per request.
-# The controller stays in `insecure` mode. Port 8083 then admits only the gate, the Substrate egress proxy and the kagent
-# namespace (the last one is not narrowed yet). The bridge, every schedule and every Kourier binding call the gate instead.
+# The controller stays in `insecure` mode. Port 8083 then admits only the gate, the Substrate egress proxy and the kagent UI pods (the UI itself is closed, see networkPolicy.kagentUI).
+# The bridge, every schedule and every Kourier binding call the gate instead.
 # install.sh creates the static keys (Secret `a2a-key-<binding>` in the channels namespace, hashes in `keysSecret`), never prints them.
 governance:
   a2a:
@@ -431,6 +442,7 @@ governance:
     sourceHash: ""                    # install.sh sets it to a hash of services/a2a-gate (the tag stays "dev")
     audience: openagentix-a2a         # projected ServiceAccount tokens must carry this audience
     keysSecret: a2a-gate-keys         # SHA-256 hashes of the static keys, one key per caller (install.sh creates it; never rendered here)
+    maxInFlight: 128                  # requests the gate handles at once; the next gets 503 (a memory cap: the pod limit is small)
     audit:
       userId: hash                    # hash | raw: the user id in the gate's audit line is a salted hash, or the id itself with raw
     # Rules for the chart's own callers are derived: the bridge (user id prefix bridge.userIdPrefix), each schedule (exactly
@@ -441,6 +453,7 @@ governance:
     #    serviceAccount: {namespace: ci, name: smoke}   # its projected token: kubectl create token smoke -n ci --audience openagentix-a2a
     #    agents: [assistant]                         # agents[] names (or namespace/name)
     #    userId: {exact: "ci:smoke"}                 # or {prefix: "ci:"} or {fixed: "ci:smoke"} (the gate sets it)
+    #    methods: [SendMessage, SendStreamingMessage]   # optional: the JSON-RPC methods it may use (this is the default; GetTask, CancelTask, ... must be listed)
     resources:
       requests: {cpu: 10m, memory: 24Mi}
       limits: {cpu: 250m, memory: 64Mi}

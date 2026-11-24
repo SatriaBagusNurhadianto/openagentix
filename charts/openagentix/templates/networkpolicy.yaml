@@ -66,7 +66,7 @@ spec:
 {{- $k := .Values.kagent }}
 ---
 # kagent controller: A2A and the REST API were open to every pod. Allowed on its port: the Telegram bridge pod
-# (by pod label), kagent's own namespace (UI, tools, worker pool) and the Substrate egress proxy that carries
+# (by pod label), the kagent UI pods and the Substrate egress proxy that carries
 # the sandboxes' task-store calls. Any other port stays reachable, as before (the controller serves only this one).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -81,7 +81,11 @@ spec:
   ingress:
     - ports: [{protocol: TCP, port: {{ $n.controllerPort }}}]
       from:
+        # The kagent UI proxies /api/ to the controller. No other pod of the kagent namespace calls this port: the tools
+        # server and the worker pool do not, and the sandboxes' calls arrive through the egress proxy below.
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $k.namespace }}}}
+          podSelector:
+            matchLabels: {{- toYaml $n.kagentUI.podLabels | nindent 14 }}
         - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ $n.substrate.namespace }}}}
           podSelector:
             matchLabels: {{- toYaml $n.substrate.egressPodLabels | nindent 14 }}
@@ -115,5 +119,33 @@ spec:
     - ports:
         - {protocol: TCP, port: 1, endPort: {{ sub (int $n.controllerPort) 1 }}}
         - {protocol: TCP, port: {{ add (int $n.controllerPort) 1 }}, endPort: 65535}
+---
+# kagent UI: closed to every pod. Its nginx forwards X-User-Id and proxies the controller's whole API (memory, sessions, A2A over
+# gRPC-Web), so an open UI is an open relay around the A2A gate. `kubectl port-forward` still works (the kubelet connects
+# inside the pod's network namespace). Peers that may reach it: networkPolicy.kagentUI.allowFrom.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openagentix-kagent-ui
+  namespace: {{ $k.namespace }}
+  labels: {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {{- toYaml $n.kagentUI.podLabels | nindent 6 }}
+  policyTypes: [Ingress]
+  {{- if $n.kagentUI.allowFrom }}
+  ingress:
+    - ports: [{protocol: TCP, port: {{ $n.kagentUI.port }}}]
+      from:
+        {{- range $n.kagentUI.allowFrom }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace | quote }}}}
+          {{- if .podLabels }}
+          podSelector:
+            matchLabels: {{- toYaml .podLabels | nindent 14 }}
+          {{- end }}
+        {{- end }}
+  {{- else }}
+  ingress: []
+  {{- end }}
 {{- end }}
 {{- end }}

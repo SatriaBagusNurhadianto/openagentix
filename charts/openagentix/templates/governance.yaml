@@ -92,6 +92,7 @@ spec:
             - {name: A2A_GATE_RULES, value: /etc/a2a-gate/rules/rules.json}
             - {name: A2A_GATE_KEYS_DIR, value: /etc/a2a-gate/keys}
             - {name: A2A_GATE_AUDIT_USER_ID, value: {{ $g.audit.userId | quote }}}
+            - {name: A2A_GATE_MAX_INFLIGHT, value: {{ $g.maxInFlight | default 128 | quote }}}
           volumeMounts:
             - {name: rules, mountPath: /etc/a2a-gate/rules, readOnly: true}
             - {name: keys, mountPath: /etc/a2a-gate/keys, readOnly: true}

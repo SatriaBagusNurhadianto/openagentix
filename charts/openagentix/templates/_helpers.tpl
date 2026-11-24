@@ -214,7 +214,9 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- end -}}
 
 {{- /* The caller rules of the A2A gate, as JSON. Derived from the bridge, the schedules and the Kourier bindings, plus
-       governance.a2a.callers. It holds no secret. Used for the rules ConfigMap and its checksum. */ -}}
+       governance.a2a.callers. Each caller lists the JSON-RPC methods it may use: what the chart's own callers really send
+       (the bridge and the schedules: SendMessage; Kourier: send, stream, read, subscribe, cancel). It holds no secret.
+       Used for the rules ConfigMap and its checksum. */ -}}
 {{- define "oa.a2aRules" -}}
 {{- $a := .Values.governance.a2a -}}
 {{- $kns := .Values.kagent.namespace -}}
@@ -222,14 +224,14 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- $callers := list -}}
 {{- if .Values.bridge.enabled -}}
 {{- $b := .Values.bridge -}}
-{{- $callers = append $callers (dict "name" "bridge" "serviceAccount" (dict "namespace" $b.namespace "name" "telegram-bridge") "agents" (list (printf "%s/%s" $b.agentNamespace $b.agent)) "userId" (dict "prefix" (default "telegram:" $b.userIdPrefix))) -}}
+{{- $callers = append $callers (dict "name" "bridge" "serviceAccount" (dict "namespace" $b.namespace "name" "telegram-bridge") "agents" (list (printf "%s/%s" $b.agentNamespace $b.agent)) "userId" (dict "prefix" (default "telegram:" $b.userIdPrefix)) "methods" (list "SendMessage")) -}}
 {{- end -}}
 {{- range .Values.schedules -}}
-{{- $callers = append $callers (dict "name" (printf "schedule-%s" .name) "serviceAccount" (dict "namespace" $.Values.scheduling.namespace "name" (printf "schedule-%s" .name)) "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "exact" (default (printf "schedule:%s" .name) .userId))) -}}
+{{- $callers = append $callers (dict "name" (printf "schedule-%s" .name) "serviceAccount" (dict "namespace" $.Values.scheduling.namespace "name" (printf "schedule-%s" .name)) "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "exact" (default (printf "schedule:%s" .name) .userId)) "methods" (list "SendMessage")) -}}
 {{- end -}}
 {{- if .Values.channels.kourier.enabled -}}
 {{- range .Values.channels.bindings -}}
-{{- $callers = append $callers (dict "name" (printf "kourier-%s" .name) "key" true "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "fixed" (default (printf "kourier:%s" .name) .userId))) -}}
+{{- $callers = append $callers (dict "name" (printf "kourier-%s" .name) "key" true "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "fixed" (default (printf "kourier:%s" .name) .userId)) "methods" (list "SendMessage" "SendStreamingMessage" "GetTask" "SubscribeToTask" "CancelTask")) -}}
 {{- end -}}
 {{- end -}}
 {{- $seen := list -}}
@@ -252,7 +254,18 @@ http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
 {{- $u := $c.userId | default dict -}}
 {{- $set := 0 -}}{{- range $k := list "exact" "prefix" "fixed" }}{{ if get $u $k }}{{ $set = add $set 1 }}{{ end }}{{ end -}}
 {{- if ne (int $set) 1 }}{{ fail (printf "governance.a2a.callers[%s]: userId needs exactly one of exact, prefix and fixed" $c.name) }}{{ end -}}
-{{- $callers = append $callers (dict "name" $c.name "serviceAccount" (dict "namespace" $c.serviceAccount.namespace "name" $c.serviceAccount.name) "agents" $full "userId" (pick $u "exact" "prefix" "fixed")) -}}
+{{- $methods := list -}}
+{{- if hasKey $c "methods" -}}
+{{- if or (not (kindIs "slice" $c.methods)) (not $c.methods) }}{{ fail (printf "governance.a2a.callers[%s]: methods must be a non-empty list (leave it out for the gate's default: SendMessage, SendStreamingMessage)" $c.name) }}{{ end -}}
+{{- range $c.methods -}}
+{{- if not (regexMatch "^[A-Za-z][A-Za-z0-9_./:-]{0,63}$" (toString .)) }}{{ fail (printf "governance.a2a.callers[%s]: method %q is not a valid method name" $c.name (toString .)) }}{{ end -}}
+{{- if has (toString .) $methods }}{{ fail (printf "governance.a2a.callers[%s]: method %q is listed twice" $c.name (toString .)) }}{{ end -}}
+{{- $methods = append $methods (toString .) -}}
+{{- end -}}
+{{- end -}}
+{{- $entry := dict "name" $c.name "serviceAccount" (dict "namespace" $c.serviceAccount.namespace "name" $c.serviceAccount.name) "agents" $full "userId" (pick $u "exact" "prefix" "fixed") -}}
+{{- if $methods }}{{ $_ := set $entry "methods" $methods }}{{ end -}}
+{{- $callers = append $callers $entry -}}
 {{- end -}}
 {{- /* a caller of the controller's port that was admitted by networkPolicy.extraA2ACallers must have a rule, or it would be cut off silently */ -}}
 {{- range $x := .Values.networkPolicy.extraA2ACallers -}}

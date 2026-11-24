@@ -177,7 +177,7 @@ D=$(docs)
 VP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-vmcp-ingress")'
 CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
 BP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-mcp-tools-default")'
-eq "3 platform NetworkPolicies by default (knowledge ns excluded)" "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory"')" 3
+eq "4 platform NetworkPolicies by default (knowledge ns excluded)" "$(count "$D" '.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory"')" 4
 eq "mcp-tools default policy lives in mcp-tools"       "$(q "$D" "$BP|.metadata.namespace")" mcp-tools
 eq "mcp-tools default policy selects every pod"        "$(q "$D" "$BP|.spec.podSelector|length")" 0
 eq "mcp-tools default policy is ingress-only"          "$(q "$D" "$BP|.spec.policyTypes|join(\",\")")" Ingress
@@ -188,13 +188,22 @@ eq "vMCP: sources are egress proxy and kagent controller" "$(q "$D" "$VP|[.spec.
 eq "vMCP: egress source scoped to ate-system namespace" "$(q "$D" "$VP|[.spec.ingress[].from[]|select(.podSelector.matchLabels.app==\"atenet-egress\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" ate-system
 eq "controller policy lives in kagent"                 "$(q "$D" "$CP|.metadata.namespace")" kagent
 eq "controller policy selects the controller pod"      "$(q "$D" "$CP|.spec.podSelector.matchLabels[\"app.kubernetes.io/component\"]")" controller
-eq "controller: 8083 sources are bridge pod, kagent ns, egress proxy" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|(.podSelector.matchLabels|if .==null then \"any-pod\" else to_entries[0].value end)]|sort|join(\",\")")" any-pod,atenet-egress,telegram-bridge
+eq "controller: 8083 sources are bridge pod, kagent UI pods, egress proxy" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|(.podSelector.matchLabels|if .==null then \"any-pod\" else to_entries[0].value end)]|sort|join(\",\")")" atenet-egress,telegram-bridge,ui
 eq "controller: bridge source is pod-scoped (ns AND pod label in one entry)" "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" openagentix-gateway
 eq "controller: ports other than 8083 stay open"       "$(q "$D" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
+UP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-ui")'
+eq "kagent UI policy lives in kagent and selects the UI pods" "$(q "$D" "$UP|.metadata.namespace+\" \"+(.spec.podSelector.matchLabels|to_entries|map(.key+\"=\"+.value)|sort|join(\",\"))")" "kagent app.kubernetes.io/component=ui,app.kubernetes.io/name=kagent"
+eq "kagent UI policy is ingress-only and denies all by default" "$(q "$D" "$UP|[(.spec.policyTypes|join(\",\")),((.spec.ingress//[])|length|tostring)]|join(\" \")")" "Ingress 0"
+D2=$(docs --set 'networkPolicy.kagentUI.allowFrom[0].namespace=ops' --set 'networkPolicy.kagentUI.allowFrom[0].podLabels.app=proxy')
+eq "kagentUI.allowFrom adds a peer scoped by namespace AND pod labels, on the UI port only" "$(q "$D2" "$UP|.spec.ingress|map([(.from[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]),(.from[0].podSelector.matchLabels.app),(.ports[0].port|tostring)]|join(\"/\"))|join(\",\")")" "ops/proxy/8080"
+eq "kagentUI.allowFrom without podLabels admits the namespace" "$(q "$(docs --set 'networkPolicy.kagentUI.allowFrom[0].namespace=ops')" "$UP|.spec.ingress[0].from[0]|has(\"podSelector\")|tostring")" false
+eq "kagent.enabled=false renders no UI policy"        "$(count "$(docs --set kagent.enabled=false)" '.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-ui"')" 0
+eq "no controller peer admits the whole kagent namespace" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|select(has(\"podSelector\")|not)]|length")" 0
+eq "the UI pods are a controller peer (the UI proxies /api to it)" "$(q "$D" "$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]|select(.podSelector.matchLabels[\"app.kubernetes.io/component\"]==\"ui\")|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|join(\",\")")" kagent
 D=$(docs --set networkPolicy.enabled=false)
 eq "networkPolicy.enabled=false renders none (also in the knowledge ns)" "$(count "$D" '.kind=="NetworkPolicy"')" 0
 D=$(docs --set mcp.enabled=false)
-eq "mcp.enabled=false: only the controller policy"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory")|.metadata.name]|join(",")')" openagentix-kagent-controller
+eq "mcp.enabled=false: only the controller and UI policies"     "$(q "$D" '[.[]|select(.kind=="NetworkPolicy" and .metadata.namespace!="openagentix-knowledge" and .metadata.namespace!="openagentix-memory")|.metadata.name]|join(",")')" openagentix-kagent-controller,openagentix-kagent-ui
 D=$(docs --set bridge.enabled=false)
 eq "bridge.enabled=false drops the bridge source"      "$(q "$D" "$CP|[.spec.ingress[].from[]?|select(.podSelector.matchLabels.app==\"telegram-bridge\")]|length")" 0
 D=$(docs --set kagent.enabled=false)
@@ -345,7 +354,7 @@ eq "knowledge.enabled=false renders nothing in the knowledge ns" "$(count "$D" '
 eq "knowledge.enabled=false: no embed-default, no MCPServerEntry, no MCPExternalAuthConfig" "$(count "$D" '.kind=="MCPServerEntry" or .kind=="MCPExternalAuthConfig" or (.kind=="AgentgatewayModel" and .metadata.name=="embed-default")')" 0
 eq "knowledge.enabled=false: assistant keeps its original 5 tools" "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.tools[0].mcp.tools|length')" 5
 eq "knowledge.enabled=false: prompt has no knowledge text" "$(q "$D" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("knowledge")')" false
-eq "knowledge.enabled=false: platform NetworkPolicies unchanged (3)" "$(count "$D" '.kind=="NetworkPolicy"')" 3
+eq "knowledge.enabled=false: platform NetworkPolicies unchanged (4)" "$(count "$D" '.kind=="NetworkPolicy"')" 4
 eq "knowledge.enabled=false: one model, one policy, 2 MCPServers" "$(count "$D" '.kind=="AgentgatewayModel" or .kind=="AgentgatewayPolicy" or .kind=="MCPServer"')" 4
 eq "knowledge.enabled=false: no Deployment but the bridge" "$(count "$D" '.kind=="Deployment" or .kind=="StatefulSet"')" 1
 D=$(docs --set mcp.enabled=false)
@@ -1117,6 +1126,10 @@ eq "rules: callers are the bridge, the schedule and the bindings" "$(jq -r '[.ca
 eq "rules: bridge may call its agent with the telegram: prefix" "$(jq -r '.callers[]|select(.name=="bridge")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.prefix]|join(" ")' <<<"$R")" "openagentix-gateway telegram-bridge kagent/assistant telegram:"
 eq "rules: the schedule has its own ServiceAccount and an exact user id" "$(jq -r '.callers[]|select(.name=="schedule-demo-brief")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.exact]|join(" ")' <<<"$R")" "openagentix-schedules schedule-demo-brief kagent/assistant schedule:demo-brief"
 eq "rules: a Kourier binding has a key and a fixed user id" "$(jq -r '.callers[]|select(.name=="kourier-demo-assistant")|[.key,(.agents|join(",")),.userId.fixed,(has("serviceAccount")|tostring)]|join(" ")' <<<"$R")" "true kagent/assistant kourier:demo-assistant false"
+eq "rules: the bridge and each schedule may only SendMessage" "$(jq -r '[.callers[]|select(.name=="bridge" or (.name|startswith("schedule-")))|(.methods|join("+"))]|unique|join(",")' <<<"$R")" SendMessage
+eq "rules: a Kourier binding may send, stream, read, subscribe and cancel" "$(jq -r '[.callers[]|select(.name|startswith("kourier-"))|(.methods|sort|join("+"))]|unique|join(",")' <<<"$R")" "CancelTask+GetTask+SendMessage+SendStreamingMessage+SubscribeToTask"
+eq "gate in-flight cap defaults to 128"                "$(q "$DG" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_MAX_INFLIGHT\")|.value")" 128
+eq "gate in-flight cap is a value"                     "$(q "$(docs "${GON[@]}" --set governance.a2a.maxInFlight=32)" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_MAX_INFLIGHT\")|.value")" 32
 eq "rules hold no secret value"                        "$(jq -r 'tostring|test("vk-|sk-|ak-|Bearer|password")' <<<"$R")" false
 eq "audit raw switch is passed on"                     "$(q "$(docs "${GON[@]}" --set governance.a2a.audit.userId=raw)" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_AUDIT_USER_ID\")|.value")" raw
 eq "source hash lands on the pod template"             "$(q "$(docs "${GON[@]}" --set-string governance.a2a.sourceHash=abc123)" "$GD|.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" abc123
@@ -1126,6 +1139,7 @@ CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-co
 P83="$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]"
 eq "port 8083 has exactly three sources"               "$(q "$DG" "$P83|length")" 3
 eq "port 8083 sources: the gate, atenet-egress, kagent" "$(q "$DG" "$P83|map(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]+\"/\"+((.podSelector.matchLabels.app // \"*\")))|sort|join(\",\")")" "ate-system/atenet-egress,kagent/*,openagentix-gateway/a2a-gate"
+eq "gate on: the kagent peer of 8083 is the UI pods only" "$(q "$DG" "$P83|map(select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"kagent\"))|map(.podSelector.matchLabels[\"app.kubernetes.io/component\"])|join(\",\")")" ui
 eq "the Kourier and schedule namespaces are no longer peers of 8083" "$(q "$DG" "$P83|map(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"])|map(select(.==\"agent-kourier\" or .==\"openagentix-schedules\"))|length")" 0
 eq "the bridge pod is not a peer of 8083"              "$(q "$DG" "$P83|map(select(.podSelector.matchLabels.app==\"telegram-bridge\"))|length")" 0
 eq "the port ranges around 8083 stay as they were"     "$(q "$DG" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
@@ -1188,6 +1202,18 @@ eq "an extra caller with a rule renders"               "$([ -z "$(render_err "${
 eq "its rule is in the file"                           "$(q "$DX" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="ci-smoke")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.exact]|join(" ")')" "ci smoke kagent/assistant ci:smoke"
 eq "its peer moves to the gate policy"                 "$(q "$DX" "$GI|[.spec.ingress[].from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"ci\")|.podSelector.matchLabels.app]|join(\",\")")" smoke
 eq "and is not a peer of 8083"                         "$(q "$DX" "$P83|map(select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"ci\"))|length")" 0
+eq "an extra caller without methods gets none in its rule (the gate default applies)" "$(q "$DX" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="ci-smoke")|has("methods")|tostring')" false
+cat > "$GX" <<'YAML'
+governance:
+  a2a:
+    callers:
+      - {name: ci-smoke, serviceAccount: {namespace: ci, name: smoke}, agents: [assistant], userId: {exact: "ci:smoke"}, methods: [SendMessage, GetTask]}
+YAML
+eq "an extra caller's own methods are kept"            "$(q "$(docs "${GON[@]}" -f "$GX")" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="ci-smoke")|.methods|join(",")')" SendMessage,GetTask
+for bad in '[]' '[""]' '["Send Message"]' '[SendMessage, SendMessage]' 'SendMessage'; do
+  printf 'governance:\n  a2a:\n    callers:\n      - {name: ci-smoke, serviceAccount: {namespace: ci, name: smoke}, agents: [assistant], userId: {exact: "ci:smoke"}, methods: %s}\n' "$bad" > "$GX"
+  eq "invalid methods $bad fail the render"            "$([ -n "$(render_err "${GON[@]}" -f "$GX")" ] && echo failed || echo rendered)" failed
+done
 printf 'networkPolicy:\n  extraA2ACallers:\n    - namespace: ci\n' > "$GX"
 E=$(render_err "${GON[@]}" -f "$GX")
 eq "extraA2ACallers without a caller rule fails the render" "$(printf '%s' "$E" | command grep -c 'extraA2ACallers.*ci.*governance.a2a.callers')" 1

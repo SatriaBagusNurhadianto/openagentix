@@ -167,3 +167,16 @@ func TestLoad_UserIDPrefixRejectsUnsafeCharacters(t *testing.T) {
 		}
 	}
 }
+
+func TestLoad_TokenFile(t *testing.T) {
+	base := map[string]string{"TELEGRAM_BOT_TOKEN": "tok", "A2A_URL": "http://agent", "TELEGRAM_ALLOW_ALL": "true"}
+	c, err := Load(env(base))
+	if err != nil || c.A2ATokenFile != "" {
+		t.Fatalf("default: %+v %v", c, err)
+	}
+	base["A2A_TOKEN_FILE"] = "/var/run/a2a/token"
+	c, err = Load(env(base))
+	if err != nil || c.A2ATokenFile != "/var/run/a2a/token" {
+		t.Fatalf("set: %+v %v", c, err)
+	}
+}

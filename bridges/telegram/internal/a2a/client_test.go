@@ -313,3 +313,50 @@ func TestSend_NoUserIDHeaderWithoutContextValue(t *testing.T) {
 		t.Fatalf("X-User-Id must be absent, got %q", cap.header.Get("X-User-Id"))
 	}
 }
+
+func TestSend_TokenFileIsReReadOnEveryRequest(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"message":{"messageId":"x","role":"ROLE_AGENT","parts":[{"text":"ok"}]}}}`))
+	}))
+	defer srv.Close()
+	f := t.TempDir() + "/token"
+	if err := os.WriteFile(f, []byte("first-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClient(srv.URL, "", srv.Client()).WithTokenFile(f)
+	if _, _, err := c.Send(context.Background(), "", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f, []byte("rotated-token"), 0o600); err != nil { // the kubelet rotates the projected token
+		t.Fatal(err)
+	}
+	if _, _, err := c.Send(context.Background(), "", "hi"); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0] != "Bearer first-token" || got[1] != "Bearer rotated-token" {
+		t.Fatalf("Authorization headers = %q", got)
+	}
+}
+
+func TestSend_MissingTokenFileIsAClearError(t *testing.T) {
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { called = true }))
+	defer srv.Close()
+	dir := t.TempDir()
+	c := NewClient(srv.URL, "", srv.Client()).WithTokenFile(dir + "/nope")
+	_, _, err := c.Send(context.Background(), "", "hi")
+	if err == nil || !strings.Contains(err.Error(), "A2A_TOKEN_FILE") {
+		t.Fatalf("err = %v", err)
+	}
+	if called {
+		t.Fatal("a request without its token must not be sent")
+	}
+	empty := dir + "/empty"
+	_ = os.WriteFile(empty, []byte("  \n"), 0o600)
+	if _, _, err := NewClient(srv.URL, "", srv.Client()).WithTokenFile(empty).Send(context.Background(), "", "hi"); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("empty file: %v", err)
+	}
+}

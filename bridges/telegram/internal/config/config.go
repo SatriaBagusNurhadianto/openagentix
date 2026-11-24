@@ -13,6 +13,7 @@ type Config struct {
 	BotToken           string
 	A2AURL             string
 	A2AToken           string
+	A2ATokenFile       string // A2A_TOKEN_FILE: a bearer token read again on every request (a projected ServiceAccount token)
 	UserIDPrefix       string // A2A_USER_ID_PREFIX; the agent-side user id is this prefix + the Telegram chat id
 	APIBase            string
 	AgentTimeout       time.Duration
@@ -29,6 +30,7 @@ func Load(getenv func(string) string) (Config, error) {
 		BotToken:           getenv("TELEGRAM_BOT_TOKEN"),
 		A2AURL:             getenv("A2A_URL"),
 		A2AToken:           getenv("A2A_TOKEN"),
+		A2ATokenFile:       getenv("A2A_TOKEN_FILE"),
 		APIBase:            getenv("TELEGRAM_API_BASE"),
 		AgentTimeout:       120 * time.Second,
 		AllowedChatIDs:     map[int64]bool{},

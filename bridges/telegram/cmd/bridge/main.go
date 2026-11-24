@@ -40,6 +40,9 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	// per-call deadlines come from ctx. The agent client is bounded by AgentTimeout via ctx too.
 	tg := telegram.NewClient(cfg.APIBase, cfg.BotToken, &http.Client{})
 	agent := a2a.NewClient(cfg.A2AURL, cfg.A2AToken, &http.Client{})
+	if cfg.A2ATokenFile != "" {
+		agent = agent.WithTokenFile(cfg.A2ATokenFile)
+	}
 	b := &bridge.Bridge{
 		Telegram:           tg,
 		Agent:              agent,

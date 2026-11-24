@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -33,6 +34,7 @@ type Config struct {
 	Timeout     time.Duration // whole call, connect to last byte
 	MaxResponse int64         // response body limit in bytes; 0 = DefaultMaxResponse
 	HTTPClient  *http.Client  // optional; redirects are never followed either way
+	TokenFile   string        // optional (A2A_TOKEN_FILE): a bearer token read from this file for the request, e.g. a projected ServiceAccount token
 	Traceparent string        // optional incoming W3C traceparent to continue; empty or malformed starts a new trace
 }
 
@@ -125,6 +127,10 @@ func Run(ctx context.Context, c Config) (res Result, _ error) {
 	if limit <= 0 {
 		limit = DefaultMaxResponse
 	}
+	token, err := readToken(c.TokenFile)
+	if err != nil {
+		return res, err
+	}
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": "1", "method": "SendMessage",
 		"params": map[string]any{"message": message{MessageID: newID(), Role: "ROLE_USER", Parts: []part{{Text: c.Prompt}}}},
@@ -142,6 +148,9 @@ func Run(ctx context.Context, c Config) (res Result, _ error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("A2A-Version", "1.0")
 	req.Header.Set("X-User-Id", c.UserID)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	tp, traceID := newTraceparent(c.Traceparent)
 	req.Header.Set("traceparent", tp) // traceparent only: no baggage, so no id or user id rides to model providers
 	res.TraceID = traceID
@@ -203,6 +212,23 @@ func Run(ctx context.Context, c Config) (res Result, _ error) {
 		return res, &NotCompletedError{State: t.Status.State, Detail: clip(strings.Join(detail, " "))}
 	}
 	return res, nil
+}
+
+// readToken returns the token in path, or "" when no file is configured. A configured file that cannot be read or
+// is empty is an error: the call is never sent without the token it was set up to carry.
+func readToken(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read the token file named by A2A_TOKEN_FILE: %w", errors.Unwrap(err))
+	}
+	t := strings.TrimSpace(string(b))
+	if t == "" {
+		return "", errors.New("the token file named by A2A_TOKEN_FILE is empty")
+	}
+	return t, nil
 }
 
 func wrapNet(ctx context.Context, err error) error {

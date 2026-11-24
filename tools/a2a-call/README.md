@@ -21,6 +21,7 @@ against kagent 1.0.1). A response without `result.task` (a bare message, an empt
 |---|---|
 | `A2A_URL` | agent endpoint, `http` or `https` (required) |
 | `A2A_USER_ID` | caller identity (required) |
+| `A2A_TOKEN_FILE` | optional path of a bearer token, sent as `Authorization: Bearer`. Read for each call; a missing or empty file stops the call before anything is sent. The chart sets it when the A2A gate is on (a projected ServiceAccount token) |
 | `PROMPT_FILE` / `PROMPT` | the prompt; the file wins |
 | `A2A_TIMEOUT` | whole-call timeout, Go duration, default `300s` |
 | `MAX_RESPONSE_BYTES` | response body limit, default 4 MiB; larger is an error |

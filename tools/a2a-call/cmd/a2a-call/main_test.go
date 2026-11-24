@@ -185,3 +185,30 @@ func TestRun_TraceparentEnvIsContinued(t *testing.T) {
 }
 
 func asString(v any) string { s, _ := v.(string); return s }
+
+func TestRun_TokenFileFromEnvAndMissingFile(t *testing.T) {
+	var auth string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"1","result":{"task":{"id":"t","status":{"state":"TASK_STATE_COMPLETED"},"artifacts":[{"parts":[{"text":"ok"}]}]}}}`))
+	}))
+	defer s.Close()
+	f := filepath.Join(t.TempDir(), "token")
+	_ = os.WriteFile(f, []byte("tok-123"), 0o600)
+	e := map[string]string{"A2A_URL": s.URL, "A2A_USER_ID": "schedule:x", "PROMPT": "hi", "A2A_TOKEN_FILE": f}
+	if code, out, errs := do(t, e); code != 0 {
+		t.Fatalf("code=%d out=%q err=%q", code, out, errs)
+	}
+	if auth != "Bearer tok-123" {
+		t.Fatalf("Authorization = %q", auth)
+	}
+	e["A2A_TOKEN_FILE"] = filepath.Join(t.TempDir(), "missing")
+	auth = ""
+	code, out, errs := do(t, e)
+	if code != 1 || !strings.Contains(errs, "A2A_TOKEN_FILE") || auth != "" {
+		t.Fatalf("code=%d err=%q sent=%q", code, errs, auth)
+	}
+	if strings.Contains(out, "tok-123") || strings.Contains(errs, "tok-123") {
+		t.Fatal("the token leaked")
+	}
+}

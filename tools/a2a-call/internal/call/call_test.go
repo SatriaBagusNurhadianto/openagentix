@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -283,3 +284,61 @@ func TestRun_Validation(t *testing.T) {
 		}
 	}
 }
+
+func TestRun_TokenFileIsReadForTheRequest(t *testing.T) {
+	var c captured
+	s := server(t, &c, 200, task("TASK_STATE_COMPLETED", "ok", ""))
+	f := t.TempDir() + "/token"
+	if err := writeFile(f, "projected-token\n"); err != nil {
+		t.Fatal(err)
+	}
+	cf := cfg(s.URL)
+	cf.TokenFile = f
+	if _, err := Run(context.Background(), cf); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.headers[0].Get("Authorization"); got != "Bearer projected-token" {
+		t.Fatalf("Authorization = %q", got)
+	}
+	// rotated between two calls: the second call sees the new value
+	_ = writeFile(f, "rotated-token")
+	if _, err := Run(context.Background(), cf); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.headers[1].Get("Authorization"); got != "Bearer rotated-token" {
+		t.Fatalf("Authorization after rotation = %q", got)
+	}
+}
+
+func TestRun_NoTokenFileSendsNoAuthorization(t *testing.T) {
+	var c captured
+	s := server(t, &c, 200, task("TASK_STATE_COMPLETED", "ok", ""))
+	if _, err := Run(context.Background(), cfg(s.URL)); err != nil {
+		t.Fatal(err)
+	}
+	if v := c.headers[0].Values("Authorization"); len(v) != 0 {
+		t.Fatalf("Authorization = %v", v)
+	}
+}
+
+func TestRun_MissingOrEmptyTokenFileIsAClearErrorAndNothingIsSent(t *testing.T) {
+	var c captured
+	s := server(t, &c, 200, task("TASK_STATE_COMPLETED", "ok", ""))
+	dir := t.TempDir()
+	cf := cfg(s.URL)
+	cf.TokenFile = dir + "/missing"
+	_, err := Run(context.Background(), cf)
+	if err == nil || !strings.Contains(err.Error(), "A2A_TOKEN_FILE") {
+		t.Fatalf("missing: %v", err)
+	}
+	_ = writeFile(dir+"/empty", " \n")
+	cf.TokenFile = dir + "/empty"
+	if _, err = Run(context.Background(), cf); err == nil || !strings.Contains(err.Error(), "A2A_TOKEN_FILE") {
+		t.Fatalf("empty: %v", err)
+	}
+	if len(c.headers) != 0 {
+		t.Fatal("a call without its token must not be sent")
+	}
+}
+
+func writeFile(path, s string) error { return os.WriteFile(path, []byte(s), 0o600) }

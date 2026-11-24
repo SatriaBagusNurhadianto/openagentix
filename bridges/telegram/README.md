@@ -40,6 +40,7 @@ connection from the internet. Go, standard library only.
 | `TELEGRAM_BOT_TOKEN` | required | Bot token. Never logged. |
 | `A2A_URL` | required | A2A JSON-RPC endpoint. |
 | `A2A_TOKEN` | empty | Bearer token for the agent, if it needs one. |
+| `A2A_TOKEN_FILE` | empty | Path of a bearer token file (wins over `A2A_TOKEN`). It is read again on every request, because a projected ServiceAccount token is rotated by the kubelet. A missing or empty file fails the request with a clear error. The chart sets it when the A2A gate is on. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Comma-separated chat ids allowed to talk to the agent. |
 | `TELEGRAM_ALLOW_ALL` | `false` | Set `true` to accept every chat. Startup fails unless this or the allowlist is set (fail closed). |
 | `A2A_USER_ID_PREFIX` | `telegram:` | Prefix of the per-chat user id. Give each bot or bridge its own prefix when several share one agent. Printable ASCII, no spaces, at most 64 characters. |

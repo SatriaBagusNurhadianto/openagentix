@@ -77,6 +77,7 @@ func loadConfig(getenv func(string) string) (cfg call.Config, printAnswer bool, 
 	if u, perr := url.Parse(cfg.URL); perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return cfg, false, errors.New("A2A_URL must be an http or https URL")
 	}
+	cfg.TokenFile = strings.TrimSpace(getenv("A2A_TOKEN_FILE"))
 	cfg.Traceparent = strings.TrimSpace(getenv("TRACEPARENT"))
 	cfg.UserID = strings.TrimSpace(getenv("A2A_USER_ID"))
 	if cfg.UserID == "" {

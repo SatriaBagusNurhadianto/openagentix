@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/openagentix/openagentix/bridges/telegram/internal/httpx"
@@ -30,9 +31,33 @@ func UserIDFromContext(ctx context.Context) string {
 }
 
 type Client struct {
-	url   string
-	token string
-	http  *http.Client
+	url       string
+	token     string
+	tokenFile string
+	http      *http.Client
+}
+
+// WithTokenFile makes the client send the bearer token found in a file, read again on every request: a projected
+// ServiceAccount token is rotated by the kubelet. It wins over a fixed token. A missing or empty file fails the
+// request, it is never sent without its token.
+func (c *Client) WithTokenFile(path string) *Client {
+	c.tokenFile = path
+	return c
+}
+
+func (c *Client) bearer() (string, error) {
+	if c.tokenFile == "" {
+		return c.token, nil
+	}
+	b, err := os.ReadFile(c.tokenFile)
+	if err != nil {
+		return "", fmt.Errorf("a2a: cannot read the token file named by A2A_TOKEN_FILE: %w", errors.Unwrap(err))
+	}
+	t := strings.TrimSpace(string(b))
+	if t == "" {
+		return "", errors.New("a2a: the token file named by A2A_TOKEN_FILE is empty")
+	}
+	return t, nil
 }
 
 func NewClient(url, token string, hc *http.Client) *Client {
@@ -57,6 +82,10 @@ func (c *Client) Send(ctx context.Context, contextID, text string) (string, stri
 			MessageID: newID(), ContextID: contextID, Role: "ROLE_USER", Parts: []part{{Text: text}},
 		}},
 	})
+	token, err := c.bearer()
+	if err != nil {
+		return "", "", err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 	if err != nil {
 		return "", "", err
@@ -72,8 +101,8 @@ func (c *Client) Send(ctx context.Context, contextID, text string) (string, stri
 		tc = NewTrace()
 	}
 	req.Header.Set("traceparent", tc.Traceparent())
-	if c.token != "" {
-		req.Header.Set("Authorization", "Bearer "+c.token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -117,7 +117,9 @@ Owner decision 2026-11-24: stay on kagent 1.0.1, tune it through our layer only 
 
 Root cause. kagent has no automatic save in the Go runtime. The only way a memory is written is the model calling the `save_memory` tool (`go/adk/pkg/runner/adapter.go:45`, `go/adk/pkg/memory/save_memory_tool.go:16`); the session summariser `AddSessionToMemory` exists but nothing calls it and no model is passed to it (`go/adk/cmd/main.go:164`). Harness `spec.kagent.memory` has only `modelConfigRef` and `ttlDays`. So a save is a tool call, and after a tool call the ADK always sends the result back to the model: a second model round trip in the same turn. In the trace of the benchmark's first turn (`baa0fcd619e5469fa19c1cc89b6955be`): model call 1 took 1.5 s (184 output tokens, finish reason tool call), the tool `save_memory` 84 ms, call 2 took 0.67 s, 16,190 prompt tokens in total. The second call cannot be avoided by wording, and the save cannot be moved after the answer. Our own instruction made the model save any preference it was told.
 
-Change. `memory.agentPrompt` in `charts/openagentix/values.yaml`: save only when the user asks to remember something ("remember", "keep in mind", "note that", "from now on", "always"); do not save facts that are merely mentioned. A fact told without a request is answered in one model call and is not kept. This is a deliberate trade: predictable latency and cost over automatic capture.
+Owner decision, 2026-11-24: the change below was measured and then reverted. The default stays automatic saving (the model saves what looks worth keeping), at the price of the second model call. The save-on-request wording is kept here as an option for a values file.
+
+Change tested. `memory.agentPrompt` in `charts/openagentix/values.yaml`: save only when the user asks to remember something ("remember", "keep in mind", "note that", "from now on", "always"); do not save facts that are merely mentioned. A fact told without a request is answered in one model call and is not kept. This is a deliberate trade: predictable latency and cost over automatic capture.
 
 Measured (runtime part of turn 1, wall time minus the wait before dispatch, `assistant`, calm node):
 
@@ -170,6 +172,6 @@ Summary of what is fixed and what is not:
 
 | Weak point | Result | Fixed from our layer |
 |---|---|---|
-| A. save costs a second model call | 1 call instead of 2 for a mentioned fact; saving on request still costs one more call | yes, with a behaviour trade-off |
+| A. save costs a second model call | 1 call instead of 2 for a mentioned fact; saving on request still costs one more call | measured, not adopted (owner decision: keep automatic saving) |
 | B. no cache reads | cache reads on every call, 74% lower cost per call, no latency change | yes (kagent still reports 0) |
 | C. slow start | located in the controller before dispatch, cause not established | no |

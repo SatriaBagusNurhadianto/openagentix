@@ -431,7 +431,8 @@ eq "networkPolicy.enabled=false: no memory policy"     "$(count "$D" '.kind=="Ne
 eq "embedding dimension other than 768 fails the render (kagent stores vector(768))" "$([ -n "$(render_err --set memory.embeddings.model.dim=384)" ] && echo failed || echo rendered)" failed
 eq "memory without the gateway fails the render"       "$([ -n "$(render_err --set gateway.enabled=false)" ] && echo failed || echo rendered)" failed
 eq "memory prompt hint is appended for opted-in agents" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("save_memory")')" true
-eq "memory prompt saves only on request (no model call for a casual fact)" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("only when the user asks you to\\s+remember")')" true
+eq "memory prompt saves facts worth keeping, not only on request" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("worth keeping across conversations")')" true
+eq "memory prompt has no save-only-on-request rule" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("Do not save anything the user merely mentions")')" false
 eq "memory prompt still forbids secrets"            "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("Never store passwords")')" true
 
 echo "# bridge user identity and rollout"

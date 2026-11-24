@@ -313,6 +313,14 @@ memory:
 3. **Memory expiry by our own CronJob** with kagent's database credentials, or wait for upstream to call its own prune function.
 4. **Pod budget for tool profiles** on the fixed 6 CPU / 8 GB VM: how many extra vMCP pods are acceptable.
 
+Settled on 2026-11-24. The owner asked for sane defaults on all four:
+
+- Decision 1: the audit line stores a salted hash of the user id; `raw` is an explicit switch.
+- Decision 2: `bash` stays on. Skills run scripts through it, and the switch is controller-wide. The risk is contained by tool profiles and the deny-by-default egress of round 2.
+- Decision 3: our own expiry CronJob, off by default, reusing kagent's prune statement. It is removed when upstream calls its own prune function.
+- Decision 4: the chart sets no limit on tool profiles. The demo values ship exactly one, which is what the 6 CPU / 8 GB node can carry.
+
+
 ## Not verified
 
 - The egress proxy's actor-JWT injection on the controller origin (F4), and the 403 for undeclared origins (F7), were read in the source, not observed live.

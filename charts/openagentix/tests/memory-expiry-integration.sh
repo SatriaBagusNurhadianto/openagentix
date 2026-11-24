@@ -135,6 +135,12 @@ OUT=$(run_job 0 1 2>&1); RC=$?
 eq "delete without scan is refused" "$RC" 2
 
 echo "# failure modes"
+# the password must not be in a process argument (argv is readable by other users on the node; the environment is not)
+if grep -qE 'psql[^|]*"\$KAGENT_DB_URL"' "$JOB"; then bad "the connection string with the password is not passed as an argument" "psql \"\$KAGENT_DB_URL\"" "PGPASSWORD"; else ok "the connection string with the password is not passed as an argument"; fi
+ins u-enc 'encoded password case' "NOW() + INTERVAL '1 day'" 0
+OUT=$("$DOCKER" exec -i -e KAGENT_DB_URL="postgresql://kagent_readwrite_user:p%40ss%3Aw%2Ford@127.0.0.1:5432/kagent?sslmode=disable" "$NAME" sh -s < "$JOB" 2>&1); RC=$?
+eq "a percent-encoded password still connects" "$RC" 0
+reset
 # (the image trusts 127.0.0.1, so a wrong password cannot be tested here: a closed port stands in for any connection failure)
 OUT=$("$DOCKER" exec -i -e KAGENT_DB_URL="postgresql://kagent_readwrite_user:wrong@127.0.0.1:1/kagent?sslmode=disable" "$NAME" sh -s < "$JOB" 2>&1); RC=$?
 [ "$RC" != 0 ] && ok "a connection failure fails the job" || bad "a connection failure fails the job" "exit 0" "non-zero"

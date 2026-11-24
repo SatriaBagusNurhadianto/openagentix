@@ -29,7 +29,23 @@ export PGCONNECT_TIMEOUT=10
 export PGOPTIONS="-c statement_timeout=120000 -c lock_timeout=15000 -c idle_in_transaction_session_timeout=60000"
 
 # psql prints nothing but our own \echo line: results are taken with \gset, command tags are off with -q.
-psql "$KAGENT_DB_URL" -X -q -v ON_ERROR_STOP=1 -v schema="$SCHEMA" -v role="$ROLE" -v scan="$SCAN" -v scandel="$SCANDEL" <<'SQL'
+# Keep the password out of the process arguments: other users on the node can read a command line, not an environment.
+# The URL is split into a password (PGPASSWORD, percent-decoded) and the same URL without it.
+CONN="$KAGENT_DB_URL"
+_scheme="${CONN%%://*}"; _rest="${CONN#*://}"
+_auth="${_rest%%[/?]*}"; _tail="${_rest#"$_auth"}"
+case "$_auth" in
+  *:*@*)
+    _userinfo="${_auth%@*}"; _host="${_auth##*@}"
+    _user="${_userinfo%%:*}"; _pw="${_userinfo#*:}"
+    PGPASSWORD="$(printf '%s' "$_pw" | perl -pe 's/%([0-9A-Fa-f]{2})/chr(hex($1))/ge')"
+    export PGPASSWORD
+    CONN="$_scheme://$_user@$_host$_tail"
+    ;;
+esac
+unset _scheme _rest _auth _tail _userinfo _host _user _pw
+
+psql "$CONN" -X -q -v ON_ERROR_STOP=1 -v schema="$SCHEMA" -v role="$ROLE" -v scan="$SCAN" -v scandel="$SCANDEL" <<'SQL'
 SET ROLE :"role";
 SET search_path TO :"schema", public;
 \set scan_rows 0

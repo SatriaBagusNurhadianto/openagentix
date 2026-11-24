@@ -1,0 +1,184 @@
+{{- /*
+Governance, round 1 (ADR 0006): the A2A gate. Renders nothing unless governance.a2a.enabled is true. The rules ConfigMap is
+derived from the bridge, the schedules, the Kourier bindings and governance.a2a.callers (helper oa.a2aRules) and holds no
+secret. The hashes of the static keys live in the Secret named by keysSecret, which install.sh creates; the chart never
+renders a Secret. How the callers reach the gate is in bridge.yaml, schedules.yaml, channels.yaml and networkpolicy.yaml.
+*/ -}}
+{{- if include "oa.a2aGateOn" . }}
+{{- $g := .Values.governance.a2a }}
+{{- if not .Values.kagent.enabled }}{{ fail "governance.a2a.enabled needs kagent.enabled=true (the gate stands in front of the kagent controller)" }}{{ end }}
+{{- if not (has (toString $g.audit.userId) (list "hash" "raw")) }}{{ fail (printf "governance.a2a.audit.userId must be hash or raw, got %q" (toString $g.audit.userId)) }}{{ end }}
+{{- $ns := $g.namespace }}
+{{- $rules := include "oa.a2aRules" . }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: a2a-gate
+  namespace: {{ $ns }}
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+---
+# TokenReview is the only cluster-wide permission the gate needs (system:auth-delegator also allows SubjectAccessReview).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: a2a-gate-auth-delegator
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: "system:auth-delegator"}
+subjects:
+  - {kind: ServiceAccount, name: a2a-gate, namespace: {{ $ns }}}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: a2a-gate-rules
+  namespace: {{ $ns }}
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+data:
+  # Who may call which agent, and which user ids each caller may assert. Not a secret: it names callers, never a credential.
+  rules.json: {{ $rules | fromJson | toPrettyJson | toJson }}
+---
+# One replica: the gate is stateless, and the node is small. A restart drops the 30 s TokenReview cache and the audit hash salt.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: a2a-gate
+  namespace: {{ $ns }}
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: a2a-gate}
+  template:
+    metadata:
+      labels:
+        app: a2a-gate
+        {{- include "oa.labels" . | nindent 8 }}
+      annotations:
+        # the gate reads the rules at start: a change of the rules replaces the pod
+        checksum/rules: {{ $rules | sha256sum | quote }}
+        {{- if $g.sourceHash }}
+        # set by install.sh from the content of services/a2a-gate: a code change rolls the pod although the image tag stays "dev"
+        openagentix.io/source-hash: {{ $g.sourceHash | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: a2a-gate
+      automountServiceAccountToken: true   # its own token calls TokenReview
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532   # the key hashes are mounted with mode 0440
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: a2a-gate
+          image: {{ printf "%s:%s" $g.image.repository (toString $g.image.tag) | quote }}
+          imagePullPolicy: {{ $g.image.pullPolicy }}
+          ports:
+            - {name: http, containerPort: 8080}
+          env:
+            - {name: A2A_GATE_ADDR, value: ":8080"}
+            - {name: A2A_GATE_UPSTREAM, value: {{ printf "http://kagent-controller.%s.svc.cluster.local:%v" .Values.kagent.namespace .Values.networkPolicy.controllerPort | quote }}}
+            - {name: A2A_GATE_AUDIENCE, value: {{ $g.audience | quote }}}
+            - {name: A2A_GATE_RULES, value: /etc/a2a-gate/rules/rules.json}
+            - {name: A2A_GATE_KEYS_DIR, value: /etc/a2a-gate/keys}
+            - {name: A2A_GATE_AUDIT_USER_ID, value: {{ $g.audit.userId | quote }}}
+          volumeMounts:
+            - {name: rules, mountPath: /etc/a2a-gate/rules, readOnly: true}
+            - {name: keys, mountPath: /etc/a2a-gate/keys, readOnly: true}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet: {path: /readyz, port: http}
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml $g.resources | nindent 12 }}
+      volumes:
+        - name: rules
+          configMap: {name: a2a-gate-rules}
+        - name: keys
+          secret:
+            secretName: {{ $g.keysSecret | quote }}
+            optional: true   # no Kourier binding, no keys: the gate starts without the Secret
+            defaultMode: 0440
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: a2a-gate
+  namespace: {{ $ns }}
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  selector: {app: a2a-gate}
+  ports:
+    - {name: http, port: 8080, targetPort: http}
+{{- if .Values.networkPolicy.enabled }}
+---
+# Who may reach the gate: the callers the chart knows (the bridge pod, the Kourier broker, the schedule pods) and
+# networkPolicy.extraA2ACallers. They moved here from the controller's policy. Whoever is not listed cannot even try a token.
+# With no caller at all the policy admits nobody (an ingress rule without a peer would admit everyone).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: a2a-gate-ingress
+  namespace: {{ $ns }}
+  labels:
+    app: a2a-gate
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: {app: a2a-gate}
+  policyTypes: [Ingress]
+  {{- $peers := false }}
+  {{- if or .Values.bridge.enabled .Values.channels.kourier.enabled .Values.schedules .Values.networkPolicy.extraA2ACallers }}{{ $peers = true }}{{ end }}
+  {{- if not $peers }}
+  ingress: []
+  {{- else }}
+  ingress:
+    - ports: [{protocol: TCP, port: 8080}]
+      from:
+        {{- if .Values.bridge.enabled }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.bridge.namespace }}}}
+          podSelector: {matchLabels: {app: telegram-bridge}}
+        {{- end }}
+        {{- if .Values.channels.kourier.enabled }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.channels.kourier.broker.namespace | quote }}}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.channels.kourier.broker.podLabels | nindent 14 }}
+        {{- end }}
+        {{- if .Values.schedules }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .Values.scheduling.namespace | quote }}}}
+          podSelector:
+            matchLabels: {{- toYaml .Values.scheduling.podLabel | nindent 14 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.extraA2ACallers }}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: {{ .namespace | quote }}}}
+          {{- if .podLabels }}
+          podSelector:
+            matchLabels: {{- toYaml .podLabels | nindent 14 }}
+          {{- end }}
+        {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}

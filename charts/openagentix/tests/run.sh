@@ -1081,6 +1081,132 @@ eq "graph on: the original knowledge base prompt is kept" "$(q "$DG" "$ATG|.spec
 DT=$(docs "${GR[@]}" --set 'mcp.virtual.incomingAuth.toolAccess[0].atespace=kagent' --set 'mcp.virtual.incomingAuth.toolAccess[0].tools={fetch_fetch}')
 eq "toolAccess is rendered as given, graph tools are never added to it" "$(q "$DT" '[.[]|select(.kind=="VirtualMCPServer")|tostring|test("kb_graph")]|any')" false
 
+echo "# governance: the A2A gate is off by default"
+REPO="$(cd "$CHART/../.." && pwd)"
+GKAPI="--api-versions agentkourier.dev/v1alpha1"
+GOFF=(-f "$REPO/components/channels/demo-values.yaml" -f "$REPO/components/schedules/demo-values.yaml" $GKAPI)
+GON=("${GOFF[@]}" -f "$REPO/components/governance/demo-values.yaml")
+eq "governance.a2a.enabled defaults to false"         "$(yq -c .governance.a2a.enabled "$CHART/values.yaml")" false
+D=$(docs "${GOFF[@]}")
+eq "off: no a2a-gate object of any kind"               "$(count "$D" '(.metadata.name|tostring|test("a2a-gate|a2a-key"))')" 0
+eq "off: bridge talks to the controller directly"      "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|.spec.template.spec.containers[0].env[]|select(.name=="A2A_URL")|.value')" http://kagent-controller.kagent.svc.cluster.local:8083/agents/kagent/assistant
+eq "off: bridge has no token file and no service account" "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")|[([.spec.template.spec.containers[0].env[]|select(.name=="A2A_TOKEN_FILE")]|length),(.spec.template.spec|has("serviceAccountName"))]|tostring')" '[0,false]'
+eq "off: no ServiceAccount and no ClusterRoleBinding rendered" "$(count "$D" '.kind=="ServiceAccount" or .kind=="ClusterRoleBinding"')" 0
+eq "off: Binding has no tokenSecretRef"                "$(q "$D" '[.[]|select(.kind=="Binding")|.spec.identity|has("tokenSecretRef")]|any')" false
+
+echo "# governance: the gate and its wiring"
+DG=$(docs "${GON[@]}")
+GD='.[]|select(.kind=="Deployment" and .metadata.name=="a2a-gate")'
+eq "one gate Deployment in the gateway namespace"      "$(q "$DG" "[$GD|.metadata.namespace]|join(\",\")")" openagentix-gateway
+eq "gate image"                                        "$(q "$DG" "$GD|.spec.template.spec.containers[0].image")" openagentix/a2a-gate:dev
+eq "gate upstream is the controller"                   "$(q "$DG" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_UPSTREAM\")|.value")" http://kagent-controller.kagent.svc.cluster.local:8083
+eq "gate audience"                                     "$(q "$DG" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_AUDIENCE\")|.value")" openagentix-a2a
+eq "gate audit user id defaults to hash"               "$(q "$DG" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_AUDIT_USER_ID\")|.value")" hash
+eq "gate runs as non-root with a read-only root filesystem" "$(q "$DG" "$GD|[.spec.template.spec.securityContext.runAsNonRoot,.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem,.spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation]|tostring")" '[true,true,false]'
+eq "gate pod has an fsGroup so the mounted key hashes (mode 0440) are readable by the non-root user" "$(q "$DG" "$GD|.spec.template.spec.securityContext.fsGroup")" 65532
+eq "gate has its own ServiceAccount, token mounted for TokenReview" "$(q "$DG" "$GD|[.spec.template.spec.serviceAccountName,.spec.template.spec.automountServiceAccountToken]|tostring")" '["a2a-gate",true]'
+eq "ServiceAccount a2a-gate"                           "$(count "$DG" '.kind=="ServiceAccount" and .metadata.name=="a2a-gate" and .metadata.namespace=="openagentix-gateway"')" 1
+eq "ClusterRoleBinding to system:auth-delegator"       "$(q "$DG" '.[]|select(.kind=="ClusterRoleBinding" and .metadata.name=="a2a-gate-auth-delegator")|[.roleRef.kind,.roleRef.name,.subjects[0].name,.subjects[0].namespace]|join(" ")')" "ClusterRole system:auth-delegator a2a-gate openagentix-gateway"
+eq "the gate defines no ClusterRole of its own"        "$(count "$DG" '.kind=="ClusterRole"')" 0
+eq "gate Service on 8080"                              "$(q "$DG" '.[]|select(.kind=="Service" and .metadata.name=="a2a-gate")|.spec.ports[0].port')" 8080
+eq "gate mounts the rules ConfigMap and the key hashes Secret" "$(q "$DG" "$GD|[.spec.template.spec.volumes[]|(.configMap.name // .secret.secretName)]|sort|join(\",\")")" a2a-gate-keys,a2a-gate-rules
+eq "key hashes Secret is optional (the gate starts without it)" "$(q "$DG" "$GD|.spec.template.spec.volumes[]|select(.secret!=null)|.secret.optional")" true
+eq "the pod template carries a checksum of the rules"  "$(q "$DG" "$GD|.spec.template.metadata.annotations[\"checksum/rules\"]|test(\"^[0-9a-f]{64}\$\")")" true
+R=$(q "$DG" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]')
+eq "rules: callers are the bridge, the schedule and the bindings" "$(jq -r '[.callers[].name]|sort|join(",")' <<<"$R")" bridge,kourier-demo-assistant,kourier-demo-assistant-notify,schedule-demo-brief
+eq "rules: bridge may call its agent with the telegram: prefix" "$(jq -r '.callers[]|select(.name=="bridge")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.prefix]|join(" ")' <<<"$R")" "openagentix-gateway telegram-bridge kagent/assistant telegram:"
+eq "rules: the schedule has its own ServiceAccount and an exact user id" "$(jq -r '.callers[]|select(.name=="schedule-demo-brief")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.exact]|join(" ")' <<<"$R")" "openagentix-schedules schedule-demo-brief kagent/assistant schedule:demo-brief"
+eq "rules: a Kourier binding has a key and a fixed user id" "$(jq -r '.callers[]|select(.name=="kourier-demo-assistant")|[.key,(.agents|join(",")),.userId.fixed,(has("serviceAccount")|tostring)]|join(" ")' <<<"$R")" "true kagent/assistant kourier:demo-assistant false"
+eq "rules hold no secret value"                        "$(jq -r 'tostring|test("vk-|sk-|ak-|Bearer|password")' <<<"$R")" false
+eq "audit raw switch is passed on"                     "$(q "$(docs "${GON[@]}" --set governance.a2a.audit.userId=raw)" "$GD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_GATE_AUDIT_USER_ID\")|.value")" raw
+eq "source hash lands on the pod template"             "$(q "$(docs "${GON[@]}" --set-string governance.a2a.sourceHash=abc123)" "$GD|.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" abc123
+
+echo "# governance: network policies"
+CP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-kagent-controller")'
+P83="$CP|[.spec.ingress[]|select(any(.ports[]?;.port==8083))|.from[]]"
+eq "port 8083 has exactly three sources"               "$(q "$DG" "$P83|length")" 3
+eq "port 8083 sources: the gate, atenet-egress, kagent" "$(q "$DG" "$P83|map(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]+\"/\"+((.podSelector.matchLabels.app // \"*\")))|sort|join(\",\")")" "ate-system/atenet-egress,kagent/*,openagentix-gateway/a2a-gate"
+eq "the Kourier and schedule namespaces are no longer peers of 8083" "$(q "$DG" "$P83|map(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"])|map(select(.==\"agent-kourier\" or .==\"openagentix-schedules\"))|length")" 0
+eq "the bridge pod is not a peer of 8083"              "$(q "$DG" "$P83|map(select(.podSelector.matchLabels.app==\"telegram-bridge\"))|length")" 0
+eq "the port ranges around 8083 stay as they were"     "$(q "$DG" "$CP|[.spec.ingress[]|select(has(\"from\")|not)|.ports[]|(.port|tostring)+\"-\"+(.endPort|tostring)]|sort|join(\",\")")" 1-8082,8084-65535
+GI='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="a2a-gate-ingress")'
+eq "gate ingress policy exists in the gate namespace"  "$(q "$DG" "$GI|.metadata.namespace+\" \"+.spec.podSelector.matchLabels.app")" "openagentix-gateway a2a-gate"
+eq "gate ingress: port 8080 only"                      "$(q "$DG" "$GI|[.spec.ingress[].ports[].port]|map(tostring)|join(\",\")")" 8080
+eq "gate ingress peers: bridge, Kourier broker, schedules" "$(q "$DG" "$GI|[.spec.ingress[].from[]|.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]]|sort|join(\",\")")" agent-kourier,openagentix-gateway,openagentix-schedules
+eq "gate ingress: the bridge peer is scoped by pod label" "$(q "$DG" "$GI|.spec.ingress[].from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"openagentix-gateway\")|.podSelector.matchLabels.app")" telegram-bridge
+eq "gate ingress: the schedule peer is scoped by the schedule label" "$(q "$DG" "$GI|.spec.ingress[].from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"openagentix-schedules\")|.podSelector.matchLabels[\"openagentix.io/component\"]")" schedule
+eq "schedule egress goes to the gate, not the controller" "$(q "$DG" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-schedules-egress")|.spec.egress[1]|[.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],.to[0].podSelector.matchLabels.app,(.ports[0].port|tostring)]|join(" ")')" "openagentix-gateway a2a-gate 8080"
+BE=$(q "$DG" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-channels")|.data.brokerEgress')
+eq "Kourier egress goes to the gate"                   "$(jq -r '.[0]|[.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],.to[0].podSelector.matchLabels.app,(.ports[0].port|tostring)]|join(" ")' <<<"$BE")" "openagentix-gateway a2a-gate 8080"
+eq "networkPolicy.enabled=false: no policy at all, the gate still renders" "$(q "$(docs "${GON[@]}" --set networkPolicy.enabled=false)" '[(.[]|select(.kind=="NetworkPolicy")),(.[]|select(.kind=="Deployment" and .metadata.name=="a2a-gate"))]|map(.kind)|join(",")')" Deployment
+
+echo "# governance: callers authenticate"
+BD='.[]|select(.kind=="Deployment" and .metadata.name=="telegram-bridge")'
+eq "bridge A2A_URL is the gate"                        "$(q "$DG" "$BD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_URL\")|.value")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/assistant
+eq "bridge reads its token from a file"                "$(q "$DG" "$BD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_TOKEN_FILE\")|.value")" /var/run/a2a/token
+eq "bridge has a projected token with the audience"    "$(q "$DG" "$BD|.spec.template.spec.volumes[]|select(.name==\"a2a-token\")|.projected.sources[0].serviceAccountToken|[.audience,(.expirationSeconds|tostring),.path]|join(\" \")")" "openagentix-a2a 3600 token"
+eq "bridge mounts it read-only"                        "$(q "$DG" "$BD|.spec.template.spec.containers[0].volumeMounts[]|select(.name==\"a2a-token\")|[.mountPath,(.readOnly|tostring)]|join(\" \")")" "/var/run/a2a true"
+eq "bridge has its own ServiceAccount and keeps automount off" "$(q "$DG" "$BD|[.spec.template.spec.serviceAccountName,(.spec.template.spec.automountServiceAccountToken|tostring)]|join(\" \")")" "telegram-bridge false"
+eq "ServiceAccount telegram-bridge exists"             "$(count "$DG" '.kind=="ServiceAccount" and .metadata.name=="telegram-bridge" and .metadata.namespace=="openagentix-gateway" and .automountServiceAccountToken==false')" 1
+eq "an explicit bridge.a2aUrl still wins"              "$(q "$(docs "${GON[@]}" --set bridge.a2aUrl=http://x/y)" "$BD|.spec.template.spec.containers[0].env[]|select(.name==\"A2A_URL\")|.value")" http://x/y
+CJ='.[]|select(.kind=="CronJob" and .metadata.name=="demo-brief")'
+CJP="$CJ|.spec.jobTemplate.spec.template.spec"
+eq "each schedule has its own ServiceAccount"          "$(count "$DG" '.kind=="ServiceAccount" and .metadata.name=="schedule-demo-brief" and .metadata.namespace=="openagentix-schedules" and .automountServiceAccountToken==false')" 1
+eq "the schedule pod uses it and keeps automount off"  "$(q "$DG" "$CJP|[.serviceAccountName,(.automountServiceAccountToken|tostring)]|join(\" \")")" "schedule-demo-brief false"
+eq "the schedule pod has a projected token with the audience" "$(q "$DG" "$CJP|.volumes[]|select(.name==\"a2a-token\")|.projected.sources[0].serviceAccountToken|[.audience,(.expirationSeconds|tostring)]|join(\" \")")" "openagentix-a2a 3600"
+eq "the schedule reads it from a file"                 "$(q "$DG" "$CJP|.containers[0].env[]|select(.name==\"A2A_TOKEN_FILE\")|.value")" /var/run/a2a/token
+eq "the schedule A2A_URL is the gate"                  "$(q "$DG" "$CJP|.containers[0].env[]|select(.name==\"A2A_URL\")|.value")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/assistant
+eq "the schedule keeps its prompt volume"              "$(q "$DG" "$CJP|[.volumes[].name]|sort|join(\",\")")" a2a-token,prompt
+BN='.[]|select(.kind=="Binding" and .metadata.name=="demo-assistant")'
+eq "Binding sends a key Secret as its token"           "$(q "$DG" "$BN|.spec.identity.tokenSecretRef|[.name,.key]|join(\" \")")" "a2a-key-demo-assistant token"
+eq "Binding keeps its userId (the gate fixes it)"      "$(q "$DG" "$BN|.spec.identity.userId")" kourier:demo-assistant
+eq "Binding names its gate caller"                     "$(q "$DG" "$BN|.metadata.annotations[\"openagentix.io/a2a-caller\"]")" kourier-demo-assistant
+eq "every Binding has a distinct key Secret"           "$(q "$DG" '[.[]|select(.kind=="Binding")|.spec.identity.tokenSecretRef.name]|unique|length')" 2
+eq "AgentBackend points at the gate"                   "$(q "$DG" '.[]|select(.kind=="AgentBackend")|.spec.url')" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080
+eq "the broker may read the key Secrets (Role resourceNames)" "$(q "$DG" '.[]|select(.kind=="Role" and .metadata.name=="agent-kourier-secrets")|.rules[0].resourceNames|join(",")')" a2a-key-demo-assistant,a2a-key-demo-assistant-notify,demo-webhook
+eq "an explicit channels.kourier.backend.url still wins" "$(q "$(docs "${GON[@]}" --set channels.kourier.backend.url=http://z:1)" '.[]|select(.kind=="AgentBackend")|.spec.url')" http://z:1
+eq "no Secret object is rendered"                      "$(count "$DG" '.kind=="Secret"')" 0
+eq "bridge disabled: its rule and ServiceAccount are gone" "$(q "$(docs "${GON[@]}" --set bridge.enabled=false)" '[(.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="bridge")),(.[]|select(.kind=="ServiceAccount" and .metadata.name=="telegram-bridge"))]|length')" 0
+
+echo "# governance: extra callers and validation"
+GX="$(dirname "$0")/.gate-extra.yaml"
+cat > "$GX" <<'YAML'
+networkPolicy:
+  extraA2ACallers:
+    - namespace: ci
+      podLabels: {app: smoke}
+governance:
+  a2a:
+    callers:
+      - name: ci-smoke
+        serviceAccount: {namespace: ci, name: smoke}
+        agents: [assistant]
+        userId: {exact: "ci:smoke"}
+YAML
+DX=$(docs "${GON[@]}" -f "$GX")
+eq "an extra caller with a rule renders"               "$([ -z "$(render_err "${GON[@]}" -f "$GX")" ] && echo rendered || echo failed)" rendered
+eq "its rule is in the file"                           "$(q "$DX" '.[]|select(.kind=="ConfigMap" and .metadata.name=="a2a-gate-rules")|.data["rules.json"]|fromjson|.callers[]|select(.name=="ci-smoke")|[.serviceAccount.namespace,.serviceAccount.name,(.agents|join(",")),.userId.exact]|join(" ")')" "ci smoke kagent/assistant ci:smoke"
+eq "its peer moves to the gate policy"                 "$(q "$DX" "$GI|[.spec.ingress[].from[]|select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"ci\")|.podSelector.matchLabels.app]|join(\",\")")" smoke
+eq "and is not a peer of 8083"                         "$(q "$DX" "$P83|map(select(.namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"]==\"ci\"))|length")" 0
+printf 'networkPolicy:\n  extraA2ACallers:\n    - namespace: ci\n' > "$GX"
+E=$(render_err "${GON[@]}" -f "$GX")
+eq "extraA2ACallers without a caller rule fails the render" "$(printf '%s' "$E" | command grep -c 'extraA2ACallers.*ci.*governance.a2a.callers')" 1
+eq "the same extraA2ACallers renders with the gate off" "$([ -z "$(render_err "${GOFF[@]}" -f "$GX")" ] && echo rendered || echo failed)" rendered
+printf 'governance:\n  a2a:\n    callers:\n      - {name: bridge, serviceAccount: {namespace: a, name: b}, agents: [assistant], userId: {exact: x}}\n' > "$GX"
+eq "a caller named like a derived one fails the render" "$([ -n "$(render_err "${GON[@]}" -f "$GX")" ] && echo failed || echo rendered)" failed
+printf 'governance:\n  a2a:\n    callers:\n      - {name: ci, serviceAccount: {namespace: a, name: b}, agents: [ghost], userId: {exact: x}}\n' > "$GX"
+eq "a caller for an unknown agent fails the render"    "$([ -n "$(render_err "${GON[@]}" -f "$GX")" ] && echo failed || echo rendered)" failed
+printf 'governance:\n  a2a:\n    callers:\n      - {name: ci, serviceAccount: {namespace: a, name: b}, agents: [assistant], userId: {exact: x, prefix: y}}\n' > "$GX"
+eq "a caller with two user id rules fails the render"  "$([ -n "$(render_err "${GON[@]}" -f "$GX")" ] && echo failed || echo rendered)" failed
+printf 'governance:\n  a2a:\n    callers:\n      - {name: ci, serviceAccount: {namespace: a, name: b}, agents: [assistant]}\n' > "$GX"
+eq "a caller without a user id rule fails the render"  "$([ -n "$(render_err "${GON[@]}" -f "$GX")" ] && echo failed || echo rendered)" failed
+rm -f "$GX"
+eq "audit.userId must be hash or raw"                  "$([ -n "$(render_err "${GON[@]}" --set governance.a2a.audit.userId=plain)" ] && echo failed || echo rendered)" failed
+eq "the gate needs kagent.enabled"                     "$([ -n "$(render_err "${GON[@]}" --set kagent.enabled=false)" ] && echo failed || echo rendered)" failed
+eq "an invalid gate block is not checked while it is off" "$([ -z "$(render_err --set governance.a2a.audit.userId=plain)" ] && echo rendered || echo failed)" rendered
+eq "the gate alone (no channels, no schedules) renders" "$(q "$(docs --set governance.a2a.enabled=true)" '[.[]|select(.metadata.name|tostring|test("a2a"))|.kind]|sort|join(",")')" ClusterRoleBinding,ConfigMap,Deployment,NetworkPolicy,Service,ServiceAccount
+eq "stray secret-looking values are never rendered with the gate on" "$(q "$(docs "${GON[@]}" --set bridge.token=SENTINEL-GATE-123 --set governance.a2a.apiKey=SENTINEL-GATE-123)" 'tostring|contains("SENTINEL-GATE-123")')" false
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

@@ -1,0 +1,13 @@
+# Demo for the local kind cluster: the A2A gate ON (ADR 0006, round 1). Combine it with the other demo files:
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/governance/demo-values.yaml" ./install.sh
+# With the gate on, port 8083 of the kagent controller admits only the gate, the Substrate egress proxy and the kagent namespace.
+# The bridge, the schedules and the Kourier bindings call the gate instead, each with its own credential:
+#   - the bridge and every schedule: a projected ServiceAccount token (audience openagentix-a2a), mounted by the chart;
+#   - every Kourier binding: a static key. install.sh creates the key Secret `a2a-key-<binding>` in the channels namespace and the
+#     SHA-256 hashes in the Secret `a2a-gate-keys` of the gate namespace, only when absent, and never prints a value.
+# Turning it off again (leave this file out of VALUES_FILE) restores the direct paths; nothing else changes.
+governance:
+  a2a:
+    enabled: true
+    audit:
+      userId: hash       # hash | raw: the gate's audit line shows a salted hash of the user id, or the id itself with raw

@@ -50,6 +50,7 @@ http://{{ .Values.memory.gatewayAlias }}.{{ .Values.gateway.namespace }}.svc.clu
 {{/* JSON list: the distinct Secrets named by channels.connections[], sorted. */}}
 {{- define "oa.channelSecrets" -}}
 {{- $s := list -}}{{- range .Values.channels.connections }}{{ $s = append $s .existingSecret }}{{ end -}}
+{{- if include "oa.a2aGateOn" . }}{{ range .Values.channels.bindings }}{{ $s = append $s (printf "a2a-key-%s" .name) }}{{ end }}{{ end -}}
 {{- $s | uniq | sortAlpha | toJson -}}
 {{- end -}}
 
@@ -200,4 +201,64 @@ processors:
   {{- end }}
 exporters:
   jaeger_storage_exporter: {trace_storage: memstore}
+{{- end -}}
+
+{{- define "oa.a2aGateOn" -}}
+{{- $g := .Values.governance | default dict -}}
+{{- $a := $g.a2a | default dict -}}
+{{- if $a.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{- define "oa.a2aGateUrl" -}}
+http://a2a-gate.{{ .Values.governance.a2a.namespace }}.svc.cluster.local:8080
+{{- end -}}
+
+{{- /* The caller rules of the A2A gate, as JSON. Derived from the bridge, the schedules and the Kourier bindings, plus
+       governance.a2a.callers. It holds no secret. Used for the rules ConfigMap and its checksum. */ -}}
+{{- define "oa.a2aRules" -}}
+{{- $a := .Values.governance.a2a -}}
+{{- $kns := .Values.kagent.namespace -}}
+{{- $agents := list -}}{{- range .Values.agents }}{{ $agents = append $agents .name }}{{ end -}}
+{{- $callers := list -}}
+{{- if .Values.bridge.enabled -}}
+{{- $b := .Values.bridge -}}
+{{- $callers = append $callers (dict "name" "bridge" "serviceAccount" (dict "namespace" $b.namespace "name" "telegram-bridge") "agents" (list (printf "%s/%s" $b.agentNamespace $b.agent)) "userId" (dict "prefix" (default "telegram:" $b.userIdPrefix))) -}}
+{{- end -}}
+{{- range .Values.schedules -}}
+{{- $callers = append $callers (dict "name" (printf "schedule-%s" .name) "serviceAccount" (dict "namespace" $.Values.scheduling.namespace "name" (printf "schedule-%s" .name)) "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "exact" (default (printf "schedule:%s" .name) .userId))) -}}
+{{- end -}}
+{{- if .Values.channels.kourier.enabled -}}
+{{- range .Values.channels.bindings -}}
+{{- $callers = append $callers (dict "name" (printf "kourier-%s" .name) "key" true "agents" (list (printf "%s/%s" $kns .agent)) "userId" (dict "fixed" (default (printf "kourier:%s" .name) .userId))) -}}
+{{- end -}}
+{{- end -}}
+{{- $seen := list -}}
+{{- range $i, $c := $a.callers -}}
+{{- if not $c.name }}{{ fail (printf "governance.a2a.callers[%d]: name is required" $i) }}{{ end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$" (toString $c.name)) }}{{ fail (printf "governance.a2a.callers[%d]: name %q must be letters, digits, '.', '_' or '-' (at most 63)" $i (toString $c.name)) }}{{ end -}}
+{{- if or (eq $c.name "bridge") (hasPrefix "schedule-" $c.name) (hasPrefix "kourier-" $c.name) }}{{ fail (printf "governance.a2a.callers[%d]: name %q is reserved for the callers the chart derives (bridge, schedule-*, kourier-*)" $i $c.name) }}{{ end -}}
+{{- if has $c.name $seen }}{{ fail (printf "governance.a2a.callers: name %q is used twice" $c.name) }}{{ end -}}
+{{- $seen = append $seen $c.name -}}
+{{- if not (and $c.serviceAccount $c.serviceAccount.namespace $c.serviceAccount.name) }}{{ fail (printf "governance.a2a.callers[%s]: serviceAccount needs namespace and name" $c.name) }}{{ end -}}
+{{- if not $c.agents }}{{ fail (printf "governance.a2a.callers[%s]: agents must list at least one agent" $c.name) }}{{ end -}}
+{{- $full := list -}}
+{{- range $c.agents -}}
+{{- if contains "/" (toString .) -}}{{- $full = append $full (toString .) -}}
+{{- else -}}
+{{- if not (has . $agents) }}{{ fail (printf "governance.a2a.callers[%s]: agent %q is not in agents[] (have: %s)" $c.name (toString .) (join ", " $agents)) }}{{ end -}}
+{{- $full = append $full (printf "%s/%s" $kns .) -}}
+{{- end -}}
+{{- end -}}
+{{- $u := $c.userId | default dict -}}
+{{- $set := 0 -}}{{- range $k := list "exact" "prefix" "fixed" }}{{ if get $u $k }}{{ $set = add $set 1 }}{{ end }}{{ end -}}
+{{- if ne (int $set) 1 }}{{ fail (printf "governance.a2a.callers[%s]: userId needs exactly one of exact, prefix and fixed" $c.name) }}{{ end -}}
+{{- $callers = append $callers (dict "name" $c.name "serviceAccount" (dict "namespace" $c.serviceAccount.namespace "name" $c.serviceAccount.name) "agents" $full "userId" (pick $u "exact" "prefix" "fixed")) -}}
+{{- end -}}
+{{- /* a caller of the controller's port that was admitted by networkPolicy.extraA2ACallers must have a rule, or it would be cut off silently */ -}}
+{{- range $x := .Values.networkPolicy.extraA2ACallers -}}
+{{- $has := false -}}
+{{- range $a.callers }}{{ if eq .serviceAccount.namespace $x.namespace }}{{ $has = true }}{{ end }}{{ end -}}
+{{- if not $has }}{{ fail (printf "networkPolicy.extraA2ACallers: namespace %q has no matching entry in governance.a2a.callers (serviceAccount.namespace). With the A2A gate on every caller needs a rule." $x.namespace) }}{{ end -}}
+{{- end -}}
+{{- toJson (dict "callers" $callers) -}}
 {{- end -}}

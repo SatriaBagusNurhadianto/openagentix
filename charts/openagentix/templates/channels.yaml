@@ -19,6 +19,7 @@ Channels and triggers: Agent Kourier resources, rendered only when channels.kour
 {{- if not (has .agent $agents) }}{{ fail (printf "binding %q: agent %q is not in agents[] (have: %s)" .name (toString .agent) (join ", " $agents)) }}{{ end }}
 {{- end }}
 {{- $backendUrl := default (printf "http://kagent-controller.%s.svc.cluster.local:%v" .Values.kagent.namespace .Values.networkPolicy.controllerPort) $k.backend.url }}
+{{- if and (include "oa.a2aGateOn" .) (not $k.backend.url) }}{{ $backendUrl = include "oa.a2aGateUrl" . }}{{ end }}
 {{- $ns := $k.namespace }}
 ---
 # Marker and hand-off for install.sh: which namespaces to create, where Kourier lives, and the egress rule the broker's
@@ -32,7 +33,11 @@ metadata:
 data:
   namespace: {{ $ns | quote }}
   brokerNamespace: {{ $k.broker.namespace | quote }}
+  {{- if include "oa.a2aGateOn" . }}
+  brokerEgress: {{ list (dict "to" (list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Values.governance.a2a.namespace)) "podSelector" (dict "matchLabels" (dict "app" "a2a-gate")))) "ports" (list (dict "port" 8080 "protocol" "TCP"))) | toJson | quote }}
+  {{- else }}
   brokerEgress: {{ list (dict "to" (list (dict "namespaceSelector" (dict "matchLabels" (dict "kubernetes.io/metadata.name" .Values.kagent.namespace)) "podSelector" (dict "matchLabels" .Values.networkPolicy.controllerPodLabels))) "ports" (list (dict "port" (int .Values.networkPolicy.controllerPort) "protocol" "TCP"))) | toJson | quote }}
+  {{- end }}
 {{- if $c.connections }}
 ---
 # The broker reads each connection's Secret with its own ServiceAccount: list+watch on exactly those Secrets.
@@ -106,9 +111,19 @@ metadata:
   name: {{ .name }}
   namespace: {{ $ns }}
   labels: {{- include "oa.labels" $ | nindent 4 }}
+  {{- if include "oa.a2aGateOn" $ }}
+  annotations:
+    # the A2A gate's caller rule for this binding, and the key hash file name (install.sh reads it)
+    openagentix.io/a2a-caller: {{ printf "kourier-%s" .name | quote }}
+  {{- end }}
 spec:
   agent: {name: {{ .agent | quote }}, namespace: {{ $.Values.kagent.namespace | quote }}, backendRef: {name: {{ $k.backend.name | quote }}}}
+  {{- if include "oa.a2aGateOn" $ }}
+  # Kourier sends this key as the bearer token and then NO X-User-Id; the gate sets the user id from the caller's rule.
+  identity: {userId: {{ default (printf "kourier:%s" .name) .userId | quote }}, tokenSecretRef: {name: {{ printf "a2a-key-%s" .name | quote }}, key: token}}
+  {{- else }}
   identity: {userId: {{ default (printf "kourier:%s" .name) .userId | quote }}}
+  {{- end }}
   chat: {{- toYaml $chat | nindent 4 }}
   {{- with .interactions }}
   interactions: {{- toYaml . | nindent 4 }}

@@ -25,6 +25,9 @@ spec:
         openagentix.io/source-hash: {{ $b.sourceHash | quote }}
       {{- end }}
     spec:
+      {{- if include "oa.a2aGateOn" . }}
+      serviceAccountName: telegram-bridge
+      {{- end }}
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -37,7 +40,11 @@ spec:
           imagePullPolicy: {{ $b.image.pullPolicy }}
           env:
             - name: A2A_URL
+              {{- if include "oa.a2aGateOn" . }}
+              value: {{ default (printf "%s/agents/%s/%s" (include "oa.a2aGateUrl" .) $b.agentNamespace $b.agent) $b.a2aUrl | quote }}
+              {{- else }}
               value: {{ default (printf "http://kagent-controller.%s.svc.cluster.local:8083/agents/%s/%s" $b.agentNamespace $b.agentNamespace $b.agent) $b.a2aUrl | quote }}
+              {{- end }}
             - name: TELEGRAM_BOT_TOKEN
               valueFrom:
                 secretKeyRef: {name: {{ $b.existingSecret | quote }}, key: {{ $b.tokenKey | quote }}}
@@ -60,6 +67,10 @@ spec:
             - name: AGENT_TIMEOUT
               value: {{ $b.agentTimeout | quote }}
             {{- end }}
+            {{- if include "oa.a2aGateOn" . }}
+            # a projected ServiceAccount token (audience of the A2A gate), re-read by the bridge on every request
+            - {name: A2A_TOKEN_FILE, value: /var/run/a2a/token}
+            {{- end }}
           ports:
             - {name: health, containerPort: 8080}
           # /healthz turns 503 when no Telegram poll has succeeded recently, so a
@@ -73,6 +84,30 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
+          {{- if include "oa.a2aGateOn" . }}
+          volumeMounts:
+            - {name: a2a-token, mountPath: /var/run/a2a, readOnly: true}
+          {{- end }}
           resources:
             {{- toYaml $b.resources | nindent 12 }}
+      {{- if include "oa.a2aGateOn" . }}
+      volumes:
+        - name: a2a-token
+          projected:
+            sources:
+              - serviceAccountToken: {audience: {{ .Values.governance.a2a.audience | quote }}, expirationSeconds: 3600, path: token}
+      {{- end }}
+{{- if include "oa.a2aGateOn" . }}
+---
+# The gate knows the bridge by this ServiceAccount (rule "bridge"). The token is projected into the pod; the default token mount stays off.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: telegram-bridge
+  namespace: {{ $b.namespace }}
+  labels:
+    app: telegram-bridge
+    {{- include "oa.labels" . | nindent 4 }}
+automountServiceAccountToken: false
+{{- end }}
 {{- end }}

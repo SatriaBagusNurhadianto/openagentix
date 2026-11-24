@@ -15,6 +15,8 @@ type Config struct {
 	A2AToken           string
 	A2ATokenFile       string // A2A_TOKEN_FILE: a bearer token read again on every request (a projected ServiceAccount token)
 	UserIDPrefix       string // A2A_USER_ID_PREFIX; the agent-side user id is this prefix + the Telegram chat id
+	MemoryURL          string // MEMORY_GATE_URL: the A2A gate; with MEMORY_AGENT it turns on /memories and /forget (ADR 0006, round 3)
+	MemoryAgent        string // MEMORY_AGENT: "namespace/name" of the agent whose memories those commands show and delete
 	APIBase            string
 	AgentTimeout       time.Duration
 	AllowedChatIDs     map[int64]bool
@@ -50,6 +52,21 @@ func Load(getenv func(string) string) (Config, error) {
 	}
 	if c.A2AURL == "" {
 		return c, errors.New("A2A_URL is required")
+	}
+	c.MemoryURL, c.MemoryAgent = getenv("MEMORY_GATE_URL"), getenv("MEMORY_AGENT")
+	if (c.MemoryURL == "") != (c.MemoryAgent == "") {
+		return c, errors.New("MEMORY_GATE_URL and MEMORY_AGENT must be set together (or both left out)")
+	}
+	if c.MemoryURL != "" {
+		if !strings.HasPrefix(c.MemoryURL, "http://") && !strings.HasPrefix(c.MemoryURL, "https://") {
+			return c, errors.New("MEMORY_GATE_URL: must be an http or https URL")
+		}
+		if ns, name, ok := strings.Cut(c.MemoryAgent, "/"); !ok || ns == "" || name == "" || strings.Contains(name, "/") {
+			return c, errors.New("MEMORY_AGENT: must be namespace/name")
+		}
+		if c.A2ATokenFile == "" && c.A2AToken == "" {
+			return c, errors.New("MEMORY_GATE_URL needs A2A_TOKEN_FILE (or A2A_TOKEN): the gate refuses a caller without a token")
+		}
 	}
 	if c.HealthAddr == "" {
 		c.HealthAddr = ":8080"

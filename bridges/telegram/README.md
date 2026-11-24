@@ -19,6 +19,13 @@ connection from the internet. Go, standard library only.
 - `/new` (or `/new@<this bot's username>`) starts a fresh conversation. The bot
   resolves its own username once at startup with `getMe`; commands addressed to
   other bots are not treated as `/new`.
+- **`/memories` and `/forget`** (opt-in: `MEMORY_GATE_URL` and `MEMORY_AGENT`, set by the chart with `bridge.memoryCommands: true`; without
+  them both are ordinary text for the agent). `/memories` lists what kagent's long-term memory holds for this chat's user id (at most 10
+  items, each cut to 200 characters, at most 3500 characters in all, and a count of the rest). `/forget` only explains; `/forget confirm`
+  deletes everything stored for this chat's user id and the bridge's agent. Both go through the A2A gate (gRPC-Web, `MemoryService` `List` and
+  `Delete`); the user id is the chat's own (prefix + chat id), never anything typed after the command, and the gate checks it against the bridge's
+  rule. A failure gives a generic reply; neither error text nor memory content nor the chat id is logged (the log has the outcome and a count).
+  The command works only in a chat the allowlist admits. Conversation history is separate: `/new` starts a fresh one.
 - Chats are served concurrently (up to `MAX_CONCURRENT_TURNS`); messages within one
   chat are handled strictly in order.
 - Only text messages are handled. Replies longer than Telegram's 4096 UTF-16 code
@@ -43,6 +50,8 @@ connection from the internet. Go, standard library only.
 | `A2A_TOKEN_FILE` | empty | Path of a bearer token file (wins over `A2A_TOKEN`). It is read again on every request, because a projected ServiceAccount token is rotated by the kubelet. A missing or empty file fails the request with a clear error. The chart sets it when the A2A gate is on. |
 | `TELEGRAM_ALLOWED_CHAT_IDS` | empty | Comma-separated chat ids allowed to talk to the agent. |
 | `TELEGRAM_ALLOW_ALL` | `false` | Set `true` to accept every chat. Startup fails unless this or the allowlist is set (fail closed). |
+| `MEMORY_GATE_URL` | empty | URL of the A2A gate; with `MEMORY_AGENT` it turns on `/memories` and `/forget`. Needs `A2A_TOKEN_FILE` (or `A2A_TOKEN`). Both must be set, or neither. |
+| `MEMORY_AGENT` | empty | `namespace/name` of the agent whose memories those commands show and delete. |
 | `A2A_USER_ID_PREFIX` | `telegram:` | Prefix of the per-chat user id. Give each bot or bridge its own prefix when several share one agent. Printable ASCII, no spaces, at most 64 characters. |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Override for tests. |
 | `AGENT_TIMEOUT` | `120s` | Per-turn deadline for the agent call. |
@@ -53,7 +62,7 @@ connection from the internet. Go, standard library only.
 ## Logging and tracing
 
 One structured line per handled message (`msg":"turn"`): `trace_id`, `chat_hash`, `context_id`, `outcome` (`ok`, `agent_error`,
-`send_error`, `new_conversation`), `agent_ms`, `total_ms`, `reply_chars`. Never the message or the reply, and the chat id appears
+`send_error`, `new_conversation`, and for the memory commands `memories`, `forget`, `forget_ask`, `memory_error`; they add `memories`, a count), `agent_ms`, `total_ms`, `reply_chars`. Never the message or the reply, and the chat id appears
 only as `chat_hash`: 8 hex digits of SHA-256 over a random per-process salt and the id (stable inside one process, not matchable
 against a list of ids, different after a restart). Every turn starts a W3C trace: the bridge sends `traceparent` to the agent (no
 `baggage`) and logs the same trace id, so a log line leads to the trace. It exports no spans of its own (standard library only).

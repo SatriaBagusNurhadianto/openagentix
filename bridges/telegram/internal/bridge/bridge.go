@@ -49,6 +49,7 @@ type Bridge struct {
 	username           string           // the bot's own username, lowercased; set once by Run
 	lastPoll           atomic.Int64     // unix nanos of the last successful getUpdates
 	AllowAll           bool             // explicit opt-in: accept every chat; otherwise empty Allowed rejects all
+	Memory             Memories         // nil: /memories and /forget are ordinary text for the agent (ADR 0006, round 3)
 	UserIDPrefix       string           // prepended to the chat id to form the agent-side user id (X-User-Id); empty sends no user id
 	saltOnce           sync.Once
 	salt               []byte // per process: chat ids appear in logs only as a short hash salted with this
@@ -205,6 +206,9 @@ func (b *Bridge) handle(ctx context.Context, u telegram.Update) {
 			b.Log.Error("telegram sendMessage failed", "chat_hash", ch, "trace_id", tc.TraceID, "err", err)
 		}
 		b.Log.Info("turn", "trace_id", tc.TraceID, "chat_hash", ch, "outcome", "new_conversation", "total_ms", time.Since(started).Milliseconds())
+		return
+	}
+	if b.handleMemoryCommand(ctx, chat, ch, tc.TraceID, text, started) {
 		return
 	}
 	// Best effort: turns take seconds, so show "typing..." first. A failure

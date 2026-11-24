@@ -180,3 +180,41 @@ func TestLoad_TokenFile(t *testing.T) {
 		t.Fatalf("set: %+v %v", c, err)
 	}
 }
+
+func TestLoad_MemoryCommands(t *testing.T) {
+	base := map[string]string{"TELEGRAM_BOT_TOKEN": "tok", "A2A_URL": "http://agent", "TELEGRAM_ALLOW_ALL": "true"}
+	with := func(kv ...string) func(string) string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for i := 0; i < len(kv); i += 2 {
+			m[kv[i]] = kv[i+1]
+		}
+		return env(m)
+	}
+	c, err := Load(with())
+	if err != nil || c.MemoryURL != "" || c.MemoryAgent != "" {
+		t.Fatalf("off by default: %+v %v", c, err)
+	}
+	c, err = Load(with("MEMORY_GATE_URL", "http://gate:8080", "MEMORY_AGENT", "kagent/assistant", "A2A_TOKEN_FILE", "/t"))
+	if err != nil || c.MemoryURL != "http://gate:8080" || c.MemoryAgent != "kagent/assistant" {
+		t.Fatalf("on: %+v %v", c, err)
+	}
+	for name, kv := range map[string][]string{
+		"url without agent":      {"MEMORY_GATE_URL", "http://gate:8080", "A2A_TOKEN_FILE", "/t"},
+		"agent without url":      {"MEMORY_AGENT", "kagent/assistant", "A2A_TOKEN_FILE", "/t"},
+		"agent without ns":       {"MEMORY_GATE_URL", "http://gate:8080", "MEMORY_AGENT", "assistant", "A2A_TOKEN_FILE", "/t"},
+		"agent with two slashes": {"MEMORY_GATE_URL", "http://gate:8080", "MEMORY_AGENT", "a/b/c", "A2A_TOKEN_FILE", "/t"},
+		"not http":               {"MEMORY_GATE_URL", "ftp://gate", "MEMORY_AGENT", "kagent/assistant", "A2A_TOKEN_FILE", "/t"},
+		"no token source":        {"MEMORY_GATE_URL", "http://gate:8080", "MEMORY_AGENT", "kagent/assistant"},
+	} {
+		if _, err := Load(with(kv...)); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	// the user id prefix must exist: without it the calls would act for kagent's default user (the default is "telegram:")
+	if c, _ = Load(with("MEMORY_GATE_URL", "http://gate:8080", "MEMORY_AGENT", "kagent/assistant", "A2A_TOKEN", "x")); c.UserIDPrefix == "" {
+		t.Error("the user id prefix is empty")
+	}
+}

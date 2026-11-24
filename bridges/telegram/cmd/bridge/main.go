@@ -16,6 +16,7 @@ import (
 	"github.com/openagentix/openagentix/bridges/telegram/internal/a2a"
 	"github.com/openagentix/openagentix/bridges/telegram/internal/bridge"
 	"github.com/openagentix/openagentix/bridges/telegram/internal/config"
+	"github.com/openagentix/openagentix/bridges/telegram/internal/memory"
 	"github.com/openagentix/openagentix/bridges/telegram/internal/telegram"
 )
 
@@ -43,7 +44,16 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 	if cfg.A2ATokenFile != "" {
 		agent = agent.WithTokenFile(cfg.A2ATokenFile)
 	}
+	var mem bridge.Memories
+	if cfg.MemoryURL != "" {
+		mc := memory.NewClient(cfg.MemoryURL, cfg.MemoryAgent, &http.Client{}).WithToken(cfg.A2AToken)
+		if cfg.A2ATokenFile != "" {
+			mc = mc.WithTokenFile(cfg.A2ATokenFile)
+		}
+		mem = mc
+	}
 	b := &bridge.Bridge{
+		Memory:             mem,
 		Telegram:           tg,
 		Agent:              agent,
 		Store:              bridge.NewMemoryStore(),
@@ -57,7 +67,7 @@ func run(ctx context.Context, cfg config.Config, log *slog.Logger) error {
 		MaxConcurrentTurns: cfg.MaxConcurrentTurns,
 		ShutdownGrace:      cfg.ShutdownGrace,
 	}
-	log.Info("bridge starting", "allowlist_size", len(cfg.AllowedChatIDs), "allow_all", cfg.AllowAll)
+	log.Info("bridge starting", "allowlist_size", len(cfg.AllowedChatIDs), "allow_all", cfg.AllowAll, "memory_commands", mem != nil)
 	if cfg.HealthAddr != "" {
 		ln, err := net.Listen("tcp", cfg.HealthAddr)
 		if err != nil {

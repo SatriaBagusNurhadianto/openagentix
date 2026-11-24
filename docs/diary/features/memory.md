@@ -79,3 +79,9 @@ Clear one user: `delete from kagent.memory where agent_name='kagent/assistant' a
 - Anything that can reach controller port 8083 can claim any user id.
 - A Kourier binding has one fixed user id, so all its conversations share one scope.
 - Turning memory off for an agent stops saving and recall but does not delete rows.
+
+## Saving costs a model call (2026-11-24)
+
+kagent 1.0.1 saves a memory only when the model calls `save_memory`, and a tool result always goes back to the model. So every save is a second model call in the same turn: in the benchmark's first turn 1.5 s for the call that chose to save (184 output tokens), 0.1 s for the tool, 0.7 s for the call after it, 16,190 prompt tokens in all. Recall is cheap (embedding 30 to 130 ms, search 20 ms) and was left alone. There is no setting for an automatic or background save in the Go runtime; the periodic save of the Python runtime is not built in.
+
+The prompt (`memory.agentPrompt`) now says to save only when the user asks to remember something and not to save what is merely mentioned. A fact told in passing is answered in one call (turn 1 runtime median 3.96 s with 2 calls before, 2.7 s with 1 call after) and is no longer kept. A fact the user asks to be remembered is: "Please remember that my project codename is BLUEHERON-42" was recalled in a new conversation of the same user and answered `Unknown` for another user. Say "remember" when it matters.

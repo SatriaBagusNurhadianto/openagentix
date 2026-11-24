@@ -114,3 +114,11 @@ Weak points found:
 - Four conversations at once overload the single demo node. kagent answered 7 of 8 with a median of 56 s. AX answered 8 of 8 with a median of 19 s.
 
 The tooling is in `components/bench/`. The reading and the answer to "should we build on AX" are in ADR 0005 (`docs/decisions/0005-runtime-speed-kagent-vs-ax.md`).
+
+## Tuning the slow start (2026-11-24)
+
+The wait of 5 to 14 s before the agent starts, seen on some new conversations, was traced again on a calm node (30, 24 and 14 sequential new conversations, one every 8 or 6 s). It is real and it is not the agent, the snapshot restore or Substrate: the controller's `POST /agents/` span runs for about 10 s before it sends the message to the router, ateapi logs nothing for those 10 s, and the restore itself takes 0.7 s. It was not DNS, node load, a worker limit or a slow database statement. Of the new conversations started 8 s after the previous one, 16 of 54 waited 2 to 14 s (8 of them 9 to 10 s); started 6 s after, 0 of 14; back to back, 0 of 19. The same kind of wait shows in later turns. The 10 s matches a timer in the controller that waits for a session to be settled (`reserveDispatch`), which is only a hypothesis for a new session. The cause is not established and no kagent or Substrate setting changes it. See ADR 0005, "Tuning results", for what upstream would need to show (spans or debug logs inside the controller, lock logging in kagent's database).
+
+Substrate 1.0.1 has no warm pool: an actor is created from the template snapshot and resumed on demand. Capacity is the number of worker pods times 1000 actors; nothing bounds concurrent starts.
+
+Found on the way: the demo node was already in a restart loop when the session began (load 46 to 58, `ate-idp-server` 123 restarts, `kagent-controller` 134, Substrate PostgreSQL 74). The probes have a 1 s timeout and the node is oversubscribed, so a busy minute restarts the identity server, the controller follows, and the restarts keep the node busy. The one probe we own (Substrate PostgreSQL, `spikes/kagent/manifests/substrate-postgres/postgres.yaml`) now has `timeoutSeconds: 5`; it is not rolled out on this cluster and not measured.

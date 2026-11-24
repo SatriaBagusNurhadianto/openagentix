@@ -128,3 +128,12 @@ What was learned:
 - AX sandboxes cannot authenticate to our tool layer yet: AX refuses to send a token to a plain-HTTP service.
 - Decision record: ADR 0005. Recommendation: stay on kagent and tune it, keep AX as an optional second runtime.
 
+
+## 2026-11-24: tuning kagent after the speed test
+
+The owner decided to stay on kagent 1.0.1, so the three weak points of ADR 0005 were looked at one by one, with traces and the sources of kagent, Substrate and agentgateway.
+
+- Memory saving: it is the model calling a tool, so it always costs a second model call. The memory prompt now saves only on request. A mentioned fact takes 1 model call instead of 2 (turn 1 runtime median 3.96 s to 2.7 s); an explicit "remember" is recalled in a new conversation of the same user and not for another user.
+- Prompt caching: the gateway adds Anthropic cache marks only when asked. `spec.backend.ai.promptCaching` is now in the chart policy and on by default. Cache reads of 6,635 tokens on every new conversation, 8,036 inside one, cost per call down 74%. Model time is unchanged. kagent itself still shows 0 cached tokens.
+- Slow start: the 10 s wait is inside the kagent controller, before it sends to the router. Substrate, the restore, DNS and the node load are not the cause. Not solved; there is no setting for it. The demo node was also found in a restart loop (1 s probe timeouts on a full node), which explains part of the earlier concurrency result.
+- The assistant key reached its 1,000,000 tokens per hour after about 125 test calls and the next call got a 429.

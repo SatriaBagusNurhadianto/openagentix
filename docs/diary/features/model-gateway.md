@@ -83,3 +83,11 @@ A request to `/v1/embeddings` without a key, or with a wrong key, gets 401.
 - Cost is only computed for models in the gateway's built-in catalog. A model missing from it has no cost.
 - Multiple proxy replicas, HTTPS, streaming failover and the built-in cost dashboard were not tried.
 - "Intelligent routing" and cost-based routing are not built. No comparison with LiteLLM or other routers is recorded in the repository.
+
+## Prompt caching (2026-11-24)
+
+Calls from `assistant` carry about 8,000 prompt tokens and no call reported a cache read. The cause was simple: agentgateway adds Anthropic cache marks only when the policy says so, and kagent's OpenAI-compatible request has none. The switch is `AgentgatewayPolicy.spec.backend.ai.promptCaching` (checked in the installed CRD; the model object has no such field). The chart now renders it in the one policy: `gateway.policy.promptCaching`, on by default, with the tool list, the system prompt and the conversation marked.
+
+Measured on a calm node, new conversation per run, 8,000-token prompts: cache read 6,635 tokens on every call (7 of 7, seven different users), a second call in the same turn reads 8,036 of 8,070, cost per call from the gateway's price catalog 0.000803 USD before and 0.000209 USD after (74% less). The model call time did not change (median 0.715 s before, 0.753 s after), so the gain is cost, not speed. The gateway keeps `cache_creation` and `cache_read` in its spans and metrics; kagent's own usage shows 0 because its chat adapter does not read the cached count. Read cache numbers from the gateway.
+
+Limits: an entry lives 5 minutes, and the call that writes it costs 25% more. kagent puts the recalled memories into the system prompt after the static text, so when a memory is recalled only the tools and the static head of the prompt are cached. The per-key token budget counts the full prompt: about 125 calls of 8,000 tokens used the 1,000,000 tokens per hour of one key, and the next answer was `429 Too Many Requests`.

@@ -108,3 +108,68 @@ Next work on kagent, in order of expected gain:
 - The AX cold-start numbers are not usable. One run followed the concurrency phase on a loaded node, and in the repeat the harness failed for the minimal loop.
 - The concurrency result says as much about the node as about the runtimes.
 - AX was removed from the cluster after the run. The steps to install it again are in the bench README.
+
+## Tuning results
+
+Owner decision 2026-11-24: stay on kagent 1.0.1, tune it through our layer only (chart, installer, upstream Helm values, prompts). Done on 2026-11-24 against the three weak points above, with the existing harness (`components/bench/run.sh` tooling, one `assistant` agent, no AX), traces from the bundled Jaeger and the sources of kagent 1.0.1, Agent Substrate 1.0.1, agentgateway v1.7.0 and google/adk-go v2.6.0 (read only).
+
+### A. Memory saving
+
+Root cause. kagent has no automatic save in the Go runtime. The only way a memory is written is the model calling the `save_memory` tool (`go/adk/pkg/runner/adapter.go:45`, `go/adk/pkg/memory/save_memory_tool.go:16`); the session summariser `AddSessionToMemory` exists but nothing calls it and no model is passed to it (`go/adk/cmd/main.go:164`). Harness `spec.kagent.memory` has only `modelConfigRef` and `ttlDays`. So a save is a tool call, and after a tool call the ADK always sends the result back to the model: a second model round trip in the same turn. In the trace of the benchmark's first turn (`baa0fcd619e5469fa19c1cc89b6955be`): model call 1 took 1.5 s (184 output tokens, finish reason tool call), the tool `save_memory` 84 ms, call 2 took 0.67 s, 16,190 prompt tokens in total. The second call cannot be avoided by wording, and the save cannot be moved after the answer. Our own instruction made the model save any preference it was told.
+
+Change. `memory.agentPrompt` in `charts/openagentix/values.yaml`: save only when the user asks to remember something ("remember", "keep in mind", "note that", "from now on", "always"); do not save facts that are merely mentioned. A fact told without a request is answered in one model call and is not kept. This is a deliberate trade: predictable latency and cost over automatic capture.
+
+Measured (runtime part of turn 1, wall time minus the wait before dispatch, `assistant`, calm node):
+
+| | n | median | min | max | model calls |
+|---|---|---|---|---|---|
+| before, "My favourite colour is teal ... Just say OK." | 3 | 3.96 s | 3.87 | 4.69 | 2 (16,190 tokens) |
+| after, same prompt | 6 | 2.7 s | 2.19 | 3.98 | 1 (8,037 tokens) |
+
+Feature proof (user `bench:tune:alice`, then `bob`; each request a new conversation with no contextId): "Please remember that my project codename is BLUEHERON-42" saved it; a new conversation of the same user answered `BLUEHERON-42`; a new conversation of another user answered `Unknown`. A fact only mentioned ("My favourite colour is teal") was not saved and was not recalled later (`Unknown`), as designed. The test rows of these two users stay in `kagent.memory` for 30 days.
+
+Not fixable here: a save will always cost one more model call when it happens. Upstream would need either a save that ends the turn without a second model call (the ADK has `SkipSummarization` on tool results, the kagent tool does not set it) or the periodic session save that the Python runtime has (EP-1256, "every 5 user turns", in the background).
+
+### B. Prompt caching
+
+Root cause of "no cache read". Nothing was marking the request. agentgateway only adds Anthropic cache marks when the policy asks for it: `AgentgatewayPolicy.spec.backend.ai.promptCaching` (CRD field verified on the cluster; `AgentgatewayModel.spec.policies` has no such field, and the controller maps only this policy field, `controller/pkg/agentgateway/plugins/backend_policies.go:950`; marks are added in `crates/llm/src/conversion/messages.rs:26` and `:547` unless the client sent its own). kagent's OpenAI-compatible path sends none. The usage translation does not drop anything: the gateway span carried `cache_read.input_tokens=0` and `cache_creation.input_tokens=0` before, so the fields are there (`crates/llm/src/conversion/messages.rs:993`, `crates/agentgateway/src/telemetry/log.rs:1898`). The prompt is far above any provider minimum (about 8,000 tokens, of which the tool list is the larger part).
+
+Prefix stability. kagent puts the memory preload into the system instruction, after the static prompt, on every model request (`google.golang.org/adk/v2/tool/preloadmemorytool/tool.go`, `AppendInstructions`), so the system prompt differs per user message when memories are found. The tool list is first in Anthropic's order and is stable. Evidence: across 7 new conversations of 7 different users the gateway reported `cache_read` 6,635 tokens each time (the stable prefix); inside a conversation the second call read 8,036. A system mark alone would have missed whenever a memory is recalled, so the chart also marks the end of the tool list.
+
+Change. `gateway.policy.promptCaching` (`enabled: true`, `cacheTools`, `cacheSystem`, `cacheMessages`, `minTokens`), rendered into the one existing policy as `spec.backend.ai.promptCaching` (`charts/openagentix/templates/gateway.yaml`). **On by default** (the default render changes; tests updated deliberately). A cache entry lives 5 minutes; the call that writes it costs 25% more than a plain input token.
+
+Measured (group a, a new conversation per run, `assistant`, calm node; model time is the gateway's `POST /v1/chat/completions` span; cost is the gateway's `agw.ai.usage.cost.total` from its price catalog):
+
+| | n | model call median | prompt tokens | cache read | cost per call |
+|---|---|---|---|---|---|
+| before | 8 | 0.715 s (0.662 to 0.781) | 7,998 | 0 | 0.000803 USD |
+| after | 7 | 0.753 s (0.707 to 0.970) | 8,029 | 6,635 | 0.000209 USD (74% less) |
+
+Latency: no gain on the model call itself (the small model's time does not depend on the prompt size; the difference is inside the noise). The wall time of the 8 turns went from median 2.67 s to 2.04 s, but the baseline had one 4.1 s outlier and I do not claim that. The gain is cost. A tool-loop call inside a turn read 8,036 of 8,070 prompt tokens.
+
+Not fixable here: kagent drops the cached count. Its own span and the A2A usage show `cache_read 0` while the gateway shows thousands, because the chat-completions adapter reads only `PromptTokens` and `CompletionTokens` (`go/adk/pkg/models/openai_adk.go:535`, `:477`), whereas its Responses adapter maps `cached_tokens` (`openai_responses.go:445`). Use the gateway span or the gateway metrics for cache numbers. Also: the memory preload in the system prompt limits the cached part to the tools and the static head of the prompt when a memory is recalled; moving the preload into the user message would be an upstream change.
+
+Side effect: the per-key token budget counts the full prompt tokens. A benchmark with 8,000-token calls reached the 1,000,000 tokens per hour budget of the `assistant` key after about 125 calls and the next call got `429 Too Many Requests`.
+
+### C. Slow start of some new conversations
+
+What the traces show (series of 30, 24 and 14 sequential first turns on `assistant`, node load 1.5 to 2.8, one request every 8 or 6 s, plus 19 back-to-back runs). Of the new conversations started 8 s after the previous one ended, 16 of 54 waited 2 to 14 s before the controller sent the message to the agent; with a 6 s pause 0 of 14, back to back 0 of 19. (Which pause matters is an observation, not an explanation.) The wait is not in the agent and not at Substrate:
+
+- The controller span `POST /agents/` starts at 0. The controller's `SendMessage` span (the call to the Substrate router) starts at 10.09 s in the slow trace `78b63d35284d46f3b8fd55fd90830e02`, at 0.1 to 0.4 s in fast ones. After it, the resume (router to the agent) takes 0.6 to 1.0 s in both cases, so restoring the golden snapshot is not slow (atelet log: all `filecache: hit`, restore 0.69 s).
+- ateapi (both replicas) logs `CreateActor` at 07:25:35.862 and `CreateActorEgressPolicy` at .875 and then nothing for 10.1 s; the next ateapi event is the router's `ResumeActor` at 07:25:45.99 (restore 0.7 s). So Substrate is idle during the wait. Scheduling is not the cause either: one worker, 1000 actor slots, `Picked worker` immediately after the resume starts.
+- Not DNS (400 lookups of the router name from a pod in 60 s, none above 0.5 s), not node load (load 1.5 to 2.8 during the slow ones), not the database log (kagent-pg logs show no slow statement), not a worker or pool limit.
+- The 16 waits cluster at 9.2 to 10.2 s (8), 14.1 to 14.2 s (2), 5.1 to 6.2 s (2) and 2.2 to 4.2 s (4). A 10 s timer exists in exactly one place on this path, `reserveDispatch` (`go/core/internal/service/session/interactions.go:218`), which polls every 100 ms while `ReserveSessionDispatch` reports busy (`go/core/internal/database/session_tasks.go:32`, `requireSettledRuntime` at `:823`). Turn 2 and 3 of a conversation show the same waits (for example turn 2 of `d8f93680bb6e43238243d678dbcbe990`, 7.6 s), where the previous task's idle suspend (`go/core/internal/service/session/quiescence.go:35`, synchronous suspend through `go/core/internal/substrate/client.go:215`) is the documented reason for the busy state. For a brand new session no busy state should exist, so this is a hypothesis, not a proof.
+
+Root cause: not established. The wait is inside the kagent controller between creating the actor's egress policy and sending to the router, and I could not see inside it without a debug build of the controller or database lock logging (not allowed here). What would settle it: spans or debug logs around `FinishSessionOperation`, `reserveDispatch` and the pool in the controller; `log_lock_waits` and `log_min_duration_statement` in kagent's PostgreSQL. This needs an upstream change or a debug build; there is no kagent or Substrate setting for it (the only related settings are `config.sessions.quiescenceRecoveryInterval`, which paces a recovery scan, and the router's `--parked-request-budget` of 5 s, which governs capacity errors that did not occur).
+
+Warm pools and workers. Substrate 1.0.1 has no warm pool of pre-resumed actors: an actor is created from the template snapshot and resumed on demand (`cmd/ateapi/internal/controlapi/workflow_resume.go`). Pool size is the number of worker pods (`WorkerPool.spec.replicas`, one here) times `--max-actors` (1000 per worker); the scheduler only books against worker capacity (`cmd/ateapi/internal/scheduling/scheduling.go`). Nothing bounds concurrent actor starts; the atelet's only concurrency knobs are for background snapshot upload and detach (`--snapshot-upload-workers`, `--snapshot-detach-workers`; delay 5 and 30 minutes by default). A second worker would not help a CPU-bound node and costs memory the node does not have, so I did not test it. The concurrency result of the benchmark (7 of 8, median 56 s, load 89) shares no cause with the wait above that I can show; it is node CPU.
+
+What I did find, and it matters for the concurrency result: the platform falls into a restart loop under load, and it was already in it when I started (load 46 to 58 for 20 minutes with 46 pods on 6 CPUs, and a database container of another project on the same Docker host using 120% CPU). Evidence: `ate-idp-server` restarted 123 times, `kagent-controller` 134, `agentgateway` 110, Substrate `postgres-0` 74 times in 26 to 40 hours; the events say `Liveness probe failed ... timed out after 1s` (postgres is probed with `pg_isready`, a Perl script started through the container runtime) and the controller exits with `fetch Actor JWT discovery ... connection refused` while the IdP is down. The probe timeouts are Kubernetes defaults (1 s) and the Substrate chart hard-codes the probes of the IdP, atelet and router (`charts/substrate/templates/ate-idp-server.yaml:57`), `ateIdpServer.resources` is empty (BestEffort, first to be starved). From our layer I changed the one probe we own: the liveness probe of Substrate's PostgreSQL manifest (`spikes/kagent/manifests/substrate-postgres/postgres.yaml`, `timeoutSeconds: 5`, `failureThreshold: 6`). **Not rolled out and not measured**: `install.sh` does not re-apply that manifest on an existing cluster and I was only allowed to run the installer. Giving `ateIdpServer` and the worker pool CPU requests through `spikes/kagent/values/substrate.yaml` is the next candidate (installer does not upgrade Substrate on an existing cluster either; it needs `FORCE_PREREQS=1`).
+
+Summary of what is fixed and what is not:
+
+| Weak point | Result | Fixed from our layer |
+|---|---|---|
+| A. save costs a second model call | 1 call instead of 2 for a mentioned fact; saving on request still costs one more call | yes, with a behaviour trade-off |
+| B. no cache reads | cache reads on every call, 74% lower cost per call, no latency change | yes (kagent still reports 0) |
+| C. slow start | located in the controller before dispatch, cause not established | no |

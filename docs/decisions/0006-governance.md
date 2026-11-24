@@ -605,3 +605,15 @@ The test ServiceAccounts and jobs were removed. The throw-away client image `ope
 - That nothing else in the cluster needs kagent's PostgreSQL than the controller and the job.
 - The cause of the controller restart.
 
+
+## Round 3 review and fixes
+
+An independent security review of the round 3 change found no critical or important issue. The gate opening for the two memory calls held: a differential fuzz test of the frame parser against a protobuf decoder found no difference, and cross-user access, other calls and leaks into logs were all refused on the gate side. It also confirmed from the kagent source that the controller is the only client of kagent's PostgreSQL, so the new database policy cuts off nothing.
+
+Three minor findings, all fixed test-first:
+
+- **Database password in the process arguments.** The expiry script passed the whole connection string to `psql`, so the password was readable in the process list of the node while the job ran. The script now splits the string: the password goes into the `PGPASSWORD` environment variable (percent-decoded) and `psql` gets the string without it. The integration test checks both the script text and a percent-encoded password.
+- **Group chats.** A group shares one memory scope, so any member could delete it for all. `/forget` is now refused outside a private chat, `/memories` in a group says "from the members in this chat", and a forwarded message is never taken as a memory command.
+- **Reply length.** Telegram counts its message limit in UTF-16 code units. The `/memories` reply is now bounded in those units, so a list of emoji-heavy memories cannot make the reply fail.
+
+Not verified after these fixes: the commands in a real Telegram group, and the forward markers of Telegram clients older than Bot API 7.0 other than `forward_date`.

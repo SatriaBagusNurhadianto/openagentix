@@ -69,6 +69,47 @@ Use the A2A command on the [runtime page](./runtime.md). The agent should call `
 - Skill mounted at `/skills/openagentix-canary/SKILL.md`; the canary prompt returned the skill phrase 5/5 in the runtime comparison.
 - Idle footprint of the tool layer: about 112 MiB over 6 pods.
 
+## Tool profiles (opt-in)
+
+By default every agent can call every tool of the one vMCP: the list in `agents[].tools` is a convenience that the agent's own process applies, and `bash` or code mode can still reach the rest. A tool profile moves the real limit into the vMCP.
+
+A profile is one more vMCP on the same tool group. It advertises only the tools you list, it has its own OIDC audience, and agents on it reach it through its own RemoteMCPServer. A hidden tool cannot be called, not even through code mode.
+
+```yaml
+mcp:
+  profiles:
+    - name: lookup
+      codeMode: true            # execute_tool_script, limited to this profile's tools
+      tools:                    # backend name: that backend's own tool names
+        osv: [query_vulnerability, get_vulnerability]
+        knowledge: [kb_search]
+agents:
+  - name: profile-demo
+    toolProfile: lookup         # its tools come only from the vMCP tools-lookup
+    tools:
+      - tools: [execute_tool_script, osv_query_vulnerability, osv_get_vulnerability, knowledge_kb_search]
+```
+
+```mermaid
+flowchart LR
+  A["assistant (no profile)"] -->|"actor JWT, audience openagentix-vmcp"| S["vMCP tools: every tool"]
+  P["profile-demo (toolProfile lookup)"] -->|"actor JWT, audience openagentix-vmcp-lookup"| L["vMCP tools-lookup: 4 tools"]
+  P -.->|"egress proxy: 403 or no DNS"| S
+  S --> B["fetch, osv, knowledge, delivery"]
+  L --> B
+```
+
+What the render checks: an unknown profile, a tool that is not in the profile, `execute_tool_script` on a profile without `codeMode`, duplicate or invalid profile names, an unknown backend, an empty tool list. The tool names in the profile are the backend's own names (`kb_search`); the agent sees them with the vMCP prefix (`knowledge_kb_search`). Backends that a profile does not name contribute nothing (`defaultToolVisibility: deny`).
+
+Costs and limits:
+
+- One more vMCP pod per profile: about 30 MB of memory and a few millicores idle, and 100m CPU and 128 MiB of requests (measured on kind). The demo ships exactly one profile.
+- Every vMCP of the group connects to every backend, so the kb and notify policies admit every profile vMCP. A profile hides tools; it does not cut the network path to a backend.
+- Cedar `toolAccess` applies to the shared vMCP only. A profile allows every authenticated call; its filter is the limit.
+- `bash` stays on. In a profile agent it can still reach the other origins that the agent's own egress list holds.
+
+Try it: `VALUES_FILE="... components/governance/profiles-demo-values.yaml" ./install.sh` (the file must be last). Evidence is in ADR 0006, "Round 2 results".
+
 ## Known limits
 
 - Identity is per session (`actor/kagent/session-<uuid>`, atespace `kagent` for every agent), not per agent. Cedar cannot tell agents apart.

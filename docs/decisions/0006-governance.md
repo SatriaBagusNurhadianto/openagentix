@@ -1,6 +1,6 @@
 # ADR 0006: Governance (who may call an agent, which tools it may use, where it may connect, what it remembers, what is recorded)
 
-- **Status:** Round 1 (the A2A gate) is implemented, opt-in and proven on kind: see "Round 1 results" at the end. Rounds 2 and 3 are proposed and not started. The ADR records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
+- **Status:** Round 1 (the A2A gate) and round 2 (tool profiles and egress values) are implemented, opt-in and proven on kind: see "Round 1 results" and "Round 2 results" at the end. Round 3 is proposed and not started. The ADR records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
 - **Date:** 2026-11-24
 - **Evidence:** source of the pinned releases, read in local clones: kagent v1.0.1 (commit `558e3d7`), Agent Substrate v1.0.1 (`7ce6f439`), agentgateway v1.7.0 (`26f5aeb`), ToolHive v0.67.1 (tag clone). Paths below are relative to each repository root and prefixed with the project name. Read-only `kubectl` on the kind cluster `kind-openagentix` for three facts (marked "live"). No model call, no Telegram message, no database connection was made for this record.
 
@@ -441,3 +441,89 @@ A security review of round 1 found one critical hole, three important problems a
 - The narrowed 8083 policy with a feature that calls the controller from a `kagent` pod other than the UI. None was found in the source or in the cluster.
 - Whether the UI works for a user who reaches it by a route other than port-forward (an ingress needs `allowFrom`).
 - A ValidatingAdmissionPolicy for pod ServiceAccounts: not built.
+
+## Round 2 results (2026-11-24)
+
+Round 2 is built, tested and run on the kind cluster: tool profiles (`mcp.profiles`, `agents[].toolProfile`) and per-agent egress (`agents[].egress.allow`). Round 3 is not started. Everything is **off by default**: with no profile, no `toolProfile` and no `egress`, 28 renders (the default, each demo values file, all together, the gate on, the bench values, the `networkPolicy` and `mcp` and `kagent` switches, each with and without the Kourier API version) were saved before the change and compared with `cmp` afterwards: 28 of 28 byte-identical.
+
+### The open points, answered by evidence
+
+Source reading first (ToolHive v0.67.1), then a live run on the kind cluster with the demo profile.
+
+**(a) Do tool filters apply to `MCPServerEntry` backends? Yes.**
+
+- Source: the filter is keyed on the backend id, and the id of an `MCPServerEntry` is the entry name (toolhive `pkg/vmcp/workloads/k8s.go:546`, `pkg/vmcp/aggregator/default_aggregator.go:720-740`). The same code path serves `MCPServer` and `MCPServerEntry`.
+- Live: the profile `lookup` lists `knowledge: [kb_search]` and `osv: [query_vulnerability, get_vulnerability]`. Its `tools/list` returned exactly `knowledge_kb_search`, `osv_get_vulnerability`, `osv_query_vulnerability` and `execute_tool_script`. The knowledge entry offers six tools with the graph on and the other five were absent. `delivery` (also an entry) and `fetch` were absent.
+- A detail that matters: `aggregation.tools[].filter` names the backend's own tool name (`kb_search`), not the prefixed name the agent sees (`knowledge_kb_search`). The chart takes the backend names in the profile and builds the agent-side names itself.
+- Another detail: a filter alone only hides a backend's own tools from the list. A backend with no entry would stay fully visible. The chart therefore also sets `defaultToolVisibility: deny` on every profile vMCP, so a backend that the profile does not name contributes nothing, and a backend added to the group later is not exposed by accident.
+
+**(b) Is a hidden tool unreachable through code mode? Yes.**
+
+- Source: ToolHive keeps hidden tools in the routing table for composite workflows, but `CallTool` refuses a name that is not advertised (`pkg/vmcp/core/core_calls.go:62-100`), and the code-mode script is bound only to the advertised tools of the caller.
+- Live, from the sandbox of the profile agent, with the real actor JWT: a direct `tools/call` for `fetch_fetch`, `knowledge_kb_get_document`, `delivery_notify_list_destinations` and the alias form `fetch.fetch` all answered JSON-RPC error `-32602 tool ... not found`. `execute_tool_script` with a script calling `fetch_fetch`, `knowledge_kb_get_document` or `delivery_notify_list_destinations` failed with `script execution failed: undefined: <name>`: the hidden tool is not even bound in the script. The allowed tools worked directly and from a script (`osv_get_vulnerability`, `knowledge_kb_search`). The profile vMCP audit log recorded each refusal as `application_error` with the session actor as the subject.
+
+**(c) Does a profile agent have any path to the shared vMCP? No, and not through its own egress policy.**
+
+- The sandbox of `profile-demo` was driven by the stub model (no paid call) through `bash`. Its egress allowlist holds only the origins its own tools imply (its profile vMCP), the model gateway, the controller and the `egress.allow` origin.
+- By name, the shared vMCP does not resolve (`wget: bad address`). By Service IP with the correct `Host` header, the answer was `403 Forbidden` from the egress proxy, with a placeholder `Authorization` header present. The same 403 came for the `fetch` tool server's proxy and for the kb (both are unauthenticated and protected only by NetworkPolicy), and for the profile vMCP's own IP with a wrong `Host`.
+- Its own profile vMCP answered 200 for the same kind of request. So the 403 comes from the allowlist, not from a broken request.
+- **A correction to F5.** F5 says the egress proxy puts the actor JWT on any request to the vMCP origin. Live, it does not add one: a request without an `Authorization` header reached the profile vMCP anonymous and got 401. The proxy **replaces** an `Authorization` header that the request already carries (the kagent type says so: "Requests must send the header"). So `bash` needs one placeholder header to be authenticated as the session, which is no real obstacle, but it is not "no token at all". The conclusion of F5 stands: a prompt-injected agent on the shared vMCP can call every tool on it. With a profile, it can call only the profile's tools.
+
+**(d) Cost of one extra vMCP pod.** Measured from the node (`crictl stats`, the metrics API is not installed): working set 30.0 MB and resident 29.2 MB for `tools-lookup`, against 30.8 MB working set and 27.9 MB resident for the shared `tools`, over three samples taken a few seconds apart; CPU 2 to 6 millicores while idle or answering a handful of calls. The operator gives each vMCP requests of 100 millicores and 128 MiB and limits of 500 millicores and 512 MiB, so the scheduler counts 100m and 128 MiB per profile. After the install: node requests 2720m CPU (45%) and 4322 MiB (54%) of the 6 CPU / 8 GB node, 46 running pods (one more than before), load average 0.7 to 2.1 over the run. One profile is cheap; several would add up in requests rather than in use.
+
+### What was built
+
+- Chart `mcp.profiles`. Each profile renders:
+  - a VirtualMCPServer `<virtual.name>-<profile>` on the same MCPGroup, with `defaultToolVisibility: deny` and one `aggregation.tools` entry per backend;
+  - the `codeMode` block when the profile sets `codeMode: true` (the limits are the shared ones);
+  - the audit and telemetry settings of the shared vMCP;
+  - an `incomingAuth` that reuses the one MCPOIDCConfig (issuer, keys and CA are the same) with its **own audience** `<oidc.audience>-<profile>`;
+  - a RemoteMCPServer `<remoteMCPServer.name>-<profile>` whose `actorJwt.audiences` is that audience;
+  - an ingress NetworkPolicy equal to the shared one, and a metrics policy when observability is on.
+- Chart `agents[].toolProfile`: the agent's tools come only from the profile's RemoteMCPServer. The render fails for an unknown profile, for a tool the profile does not offer (and says what it offers), for `execute_tool_script` on a profile without `codeMode`, for an extra tool that `knowledge: true` or `notify` adds and the profile lacks, and for a tool entry that names another server.
+- Chart `agents[].egress.allow`: an `EgressPolicy` `<agent>-egress` in the agent's namespace and `egressPolicyRefs` on the Agent. Entries follow the kagent CRD pattern (`https` or `http`, a lower case DNS name, an optional port, a wildcard only for one leftmost label, no path, no address) and the render fails for any other entry, a duplicate, more than 64, and an origin inside the tools namespace (that would reach a vMCP or an unauthenticated tool proxy around the profile).
+- Render failures also cover: duplicate profile names, an invalid profile name, an unknown backend, an empty tool list, a profile with `incomingAuth.type` other than `oidc`, `toolProfile` with `mcp.enabled` or `kagent.remoteMCPServer.enabled` off.
+- The kb and notify ingress policies admit every profile vMCP (see the finding below).
+- `install.sh` waits for each profile vMCP to be Ready; `uninstall.sh` needs nothing (the objects go with the release).
+- `components/governance/profiles-demo-values.yaml`: one profile `lookup`, the `assistant` agent restated unchanged (the agents list is replaced by a later file, so the file must come last), a small agent `profile-demo` on the profile with `egress.allow: ["https://api.osv.dev"]`, and a caller `profile-canary` for the gate (inert with the gate off).
+- 103 new chart assertions (827 in all, 0 failing).
+
+### Live canary (kind, `kind-openagentix`)
+
+Install with the six current demo files plus the profiles file, without rebuilding the unchanged images (`SKIP_*_IMAGE=1`). Two model calls were made in all (the budget was four); the refusals were proven without a paid call.
+
+1. **A profile agent answers with an allowed tool.** `profile-demo`, called through the gate as the caller `profile-canary` (a projected token and `X-User-Id: canary:profiles`), completed (`TASK_STATE_COMPLETED`, 21.9 s) and said it used `osv_get_vulnerability` for the Log4Shell advisory. One model call.
+2. **A tool outside the profile cannot be used.** Stub model, no paid call, same real objects: the ModelConfig of `profile-demo` was patched to a stub for the test and patched back. Through `bash` in the real sandbox: the direct and code-mode refusals listed under (b).
+3. **Egress.** From the same sandbox: `https://api.osv.dev` answered 200 (inside `egress.allow`); `https://example.com` and `https://api.github.com` did not resolve; example.com by IP was refused (403 over http, a reset over https); the shared vMCP, the `fetch` proxy and the kb by IP with their real `Host` header got 403. No paid call.
+4. **`assistant` is unchanged.** It completed (10.4 s) through the gate and used `osv_get_vulnerability` on the shared vMCP; the shared vMCP audit shows that call and the profile vMCP shows none for it. One model call.
+
+After the run: both agents Ready, both vMCPs Ready with four backends, the stub, the test ServiceAccount and the test Jobs removed, every pod Running.
+
+### Findings
+
+- **Every vMCP of a group connects to every backend.** The first profile install showed `Degraded`: the profile did not list a notify tool, the notify ingress policy had admitted only the shared vMCP pod, and the profile's health check of `delivery` timed out for about eight minutes before it recovered once the policy was fixed. A profile hides tools; it does not remove a backend from the vMCP's view. The kb and notify policies now admit every profile vMCP. The hidden tools are still not callable (b).
+- The agent-side tool filter is client side (F5), so a hidden tool cannot be tried through the model: the stub only calls a tool the ADK advertises. The proofs above therefore go through `bash`, which is the realistic path for an injected agent.
+- The sandbox has `wget` and `sh`, no `curl`, no `python3`.
+- Outside hosts that are not on the allowlist usually fail at DNS inside the sandbox (`bad address`). The 403 appears when the address is used directly.
+- An `egress.allow` entry takes effect without a restart: `EgressPoliciesApplied` was `True` and the allowed host answered in the first test.
+
+### Deviations from this ADR, and why
+
+- **One OIDC config, not one per profile.** The ADR said an MCPOIDCConfig audience per profile. In ToolHive the audience is a field of the reference (`oidcConfigRef.audience`, "must be unique per server"), not of the MCPOIDCConfig. The issuer, keys and CA are the same for every vMCP, so one MCPOIDCConfig is reused and each profile gets its own audience. The chart fails if two vMCPs would share an audience.
+- **`defaultToolVisibility: deny`** was added (not in the ADR): see (a).
+- **Cedar is permit-all on a profile.** `toolAccess` names tools of the shared vMCP and would silently remove tools from a profile; the filter is the limit.
+- **No `fetch` host allowlist and no `MCPToolConfig`.** Not part of this round.
+- The profile agents' tool names for a backend are written with the shared `prefixFormat`; the chart builds them from the profile.
+- The stub test changed a ModelConfig by hand for a few minutes and restored it; a Helm upgrade would also have restored it.
+
+### Not verified
+
+- More than one profile on the node, and what a pod budget of several profiles does to the node under load. Only one profile ran.
+- A Cedar `toolAccess` on the shared vMCP together with profiles (profiles ignore it by design; no test with it set).
+- The demo run with a fresh install from an empty cluster.
+- Whether a future ToolHive version keeps hidden tools out of `CallTool` and code mode: this is source and live behaviour of v0.67.1.
+- A hidden tool through a composite tool (the chart defines none).
+- `egress.allow` with a wildcard or with `http` live (only the exact `https` origin was run); `EgressPolicy` credentials are not rendered by the chart at all.
+- The model gateway origin and the other always-allowed origins are still reachable from a profile agent's sandbox by design (its own key); `bash` stays on (owner decision).
+- Token revocation: an actor JWT of a profile works until it expires.
+- That a model, not a stub, can be talked into a refused call: the refusals were proven at the vMCP and the proxy, which are the same whoever asks.

@@ -464,6 +464,29 @@ kubectl logs -n openagentix-gateway deploy/a2a-gate     # the audit lines
 
 `install.sh` builds the image, creates the Kourier keys and their hashes (kept on re-runs, never printed) and applies the gate and the callers in one `helm upgrade`. `networkPolicy.extraA2ACallers` needs a matching `governance.a2a.callers` entry with the gate on, or the render fails. What it does not cover (one replica, no revocation, no protection from someone who can create pods in the callers' namespaces): `docs/diary/features/security.md` and ADR 0006 (`docs/decisions/0006-governance.md`).
 
+## Tool profiles and egress per agent (opt-in)
+
+Off by default. By default every agent can call every tool of the one vMCP, and `bash` or code mode can reach the ones the agent's list leaves out. A tool profile (`mcp.profiles`) renders one more vMCP on the same tool group that advertises only the tools you list, with its own OIDC audience and its own RemoteMCPServer. An agent with `toolProfile: <name>` takes its tools only from that server; a tool outside the profile is not found, in a direct call and in code mode, and the sandbox has no egress rule for the shared vMCP. `agents[].egress.allow` lists extra origins (`https://host[:port]`) for the agent's sandbox and renders a kagent `EgressPolicy`. The render fails for an unknown profile, a tool that is not in the profile, duplicate profile names and malformed origins.
+
+```yaml
+mcp:
+  profiles:
+    - name: lookup
+      codeMode: true
+      tools: {osv: [query_vulnerability, get_vulnerability], knowledge: [kb_search]}
+agents:
+  - name: profile-demo
+    toolProfile: lookup
+    tools: [{tools: [execute_tool_script, osv_query_vulnerability, osv_get_vulnerability, knowledge_kb_search]}]
+    egress: {allow: ["https://api.osv.dev"]}
+```
+
+```sh
+VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml components/knowledge/graph-demo-values.yaml components/governance/demo-values.yaml components/governance/profiles-demo-values.yaml" ./install.sh
+```
+
+The demo file ships exactly one profile (the 6 CPU / 8 GB node carries one) and must come last, because it restates the `agents` list. Each profile costs one more vMCP pod: about 30 MB and a few millicores idle, 100m CPU and 128 MiB of requests. Cedar `toolAccess` applies to the shared vMCP only. `bash` stays on. Evidence and findings: ADR 0006, "Round 2 results".
+
 ## Security
 
 What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy) with kagent 1.0.1, Substrate 1.0.1 and ToolHive 0.67.1.

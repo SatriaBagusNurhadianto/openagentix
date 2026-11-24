@@ -168,3 +168,14 @@ A security review of governance round 1 found a critical hole and several smalle
 - A wrong claim in the docs was corrected: a ServiceAccount per schedule does not stop someone who can create pods in the schedules namespace from acting as any schedule.
 - One bug on the way: after a read timeout the server waited for the rest of the body, so the 408 never arrived. Fixed with `Connection: close`.
 - Two model calls: a schedule turn through the gate and a follow-up in the same conversation. Not verified: a Kourier turn after the change.
+
+## 2026-11-24: tool profiles and per-agent egress (governance round 2)
+
+ADR 0006 round 2 is built and run on the kind cluster. `mcp.profiles` renders one more vMCP per profile with its own tool list, audience and RemoteMCPServer; `agents[].toolProfile` puts an agent on it; `agents[].egress.allow` renders an `EgressPolicy` for the agent. All three are off by default, and 28 renders (default, each demo file, all together, gate on and more) stayed byte-identical to before.
+
+- Open points answered by evidence: tool filters do apply to `MCPServerEntry` backends; a hidden tool is not found directly and is not even bound in code mode; the sandbox of a profile agent gets 403 (or no DNS) for the shared vMCP, the `fetch` proxy and the kb; one extra vMCP pod costs about 30 MB and a few millicores idle (100m CPU and 128 MiB of requests).
+- A correction to the earlier reading of the egress proxy: it does not add a token to a request that has none. It replaces an `Authorization` header that is already there. Without one, a vMCP answers 401 anonymous.
+- One bug on the way: the first profile install reported `Degraded`. Every vMCP of a group connects to every backend, and the notify policy admitted only the shared vMCP. The kb and notify policies now admit every profile vMCP.
+- Proven live with two model calls (a profile agent answered with an allowed tool through the gate; `assistant` still completed on the shared vMCP). The refusals ran through the real sandbox with a stub model and no paid call.
+- Not verified: more than one profile on the node, a fresh install from an empty cluster, Cedar `toolAccess` together with profiles.
+

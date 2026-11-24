@@ -119,6 +119,38 @@ networkPolicy:
 
 This changes the default render on purpose, because it closes a hole. Set `networkPolicy.enabled: false` only if you accept that.
 
+## Tool profiles and egress per agent (opt-in)
+
+Two switches make an agent's limits real instead of advisory (ADR 0006, round 2). Both are off by default and change nothing until you set them.
+
+**Tool profile.** `agents[].toolProfile` takes the agent's tools from a profile vMCP (see the [tools page](./tools.md)). The shared vMCP answers a session with an actor token of the audience `openagentix-vmcp`; a profile has its own audience, and the sandbox of a profile agent has no egress rule for the shared vMCP, so it cannot reach it. A tool outside the profile is not found, in a direct call and in code mode.
+
+**Egress.** A sandbox reaches only what its agent's models and tools imply, the controller, and the origins in `agents[].egress.allow`, which render a kagent `EgressPolicy` and `egressPolicyRefs`. Rules match host and port only, not methods or paths. An entry inside the tools namespace is refused at render time, because it would be a way around the profile.
+
+```mermaid
+flowchart LR
+  subgraph sb["sandbox of profile-demo"]
+    AG["agent process and bash"]
+  end
+  AG -->|"placeholder Authorization header replaced by the actor JWT"| PX["egress proxy"]
+  PX -->|"allowed"| L["vMCP tools-lookup"]
+  PX -->|"allowed"| O["api.osv.dev (egress.allow)"]
+  PX -.->|"403"| S["shared vMCP, fetch proxy, kb"]
+  PX -.->|"refused"| X["any other host"]
+```
+
+Proven on kind with the real sandbox (a stub model drove `bash`, so no paid call): the allowed host answered 200; other hosts did not resolve, or got 403 by address; the shared vMCP, the `fetch` proxy and the kb got 403; hidden tools were refused directly and in code mode. A correction to the earlier reading: the egress proxy does not add a token to a request that has none, it replaces an `Authorization` header that is already there. A request without one reaches a vMCP as anonymous and gets 401. With one placeholder header, `bash` is authenticated as the session, so on the shared vMCP a prompt-injected agent can still call any tool; on a profile it can call only the profile's tools.
+
+Limits: `bash` stays on, and the model gateway, the controller and the profile vMCP stay reachable by design. An actor token cannot be revoked before it expires. A profile does not remove its backends from the vMCP's view; it hides their tools.
+
+```yaml
+agents:
+  - name: profile-demo
+    toolProfile: lookup
+    egress:
+      allow: ["https://api.osv.dev"]
+```
+
 ## What was proven
 
 - `mcp-tools`: a pod in `default` or another namespace timed out; backends and proxies accept only their own namespace and the ToolHive operator; the vMCP also accepts `atenet-egress` and the controller pod.
@@ -132,7 +164,7 @@ This changes the default render on purpose, because it closes a hole. Set `netwo
 ## What is NOT protected
 
 - **The kagent controller does not authenticate callers** (`server.auth.mode: insecure`). The opt-in A2A gate (section above) authenticates the bridge, the schedules and Kourier in front of it; the controller can still be called directly by anything the NetworkPolicy admits (the UI pods, the egress proxy). Setting `serviceAccount.authority: kubernetes` was tried: requests with no token or a garbage token still got 200. It was reverted. Any pod the NetworkPolicy lets through can call any agent, and can claim any `X-User-Id`.
-- **No per-agent tool authorization.** Cedar tells sessions and atespaces apart, not agents. Default policy is permit-all for any authenticated caller. Whether code in a sandbox (for example through `bash`) could call the vMCP directly was not tested; assume it can.
+- **No per-agent tool authorization by default.** Cedar tells sessions and atespaces apart, not agents. Default policy is permit-all for any authenticated caller, and code in a sandbox (for example through `bash`) can call the shared vMCP directly: it only needs to send any `Authorization` header, which the egress proxy replaces with the session's token (checked live in round 2). Tool profiles (above) give an agent its own vMCP with a fixed tool list and close the shared one to it.
 - A valid actor JWT works until it expires (up to 3600 seconds). No revocation.
 - **Global tool discovery is off** with `actorJwt` (`DiscoveryDisabled`).
 - The `fetch` tool can reach any URL the pod network allows. The bridge pod, `kagent` and `ate-system` are not restricted.

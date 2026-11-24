@@ -18,7 +18,7 @@
 #   CLUSTER=openagentix  CREATE_CLUSTER=1  KUBE_CONTEXT=kind-$CLUSTER
 #   SKIP_PREREQS=1       never touch kagent/Substrate/agentgateway/ToolHive
 #   FORCE_PREREQS=1      re-run the upstream installers even if their Helm releases exist (this re-applies
-#                        spikes/kagent/values/substrate.yaml and DROPS any Substrate additions made by spikes/ax)
+#                        components/runtime/values/substrate.yaml and DROPS any Substrate additions made by spikes/ax)
 #   SKIP_SKILL=1         do not build/push the example skill; use the digest in values.yaml
 #   SKIP_BRIDGE_IMAGE=1  do not build/load the bridge image
 #   SKIP_KB_IMAGE=1      do not build/load the knowledge base image (services/kb)
@@ -34,7 +34,7 @@
 #                        /24 of the API server's node address, elsewhere the exact endpoint addresses (components/channels/apiserver-cidrs.sh)
 # Observability is opt-in too: the ONE switch is the chart value observability.enabled (components/observability/demo-values.yaml). When the chart
 # renders its marker ConfigMap (openagentix-observability) this script applies the same settings to what the chart does not own: the kagent
-# controller and agent runtimes (spikes/kagent/kagent-helm.sh, only when they differ from the release) and the Agent Kourier release.
+# controller and agent runtimes (components/runtime/kagent-helm.sh, only when they differ from the release) and the Agent Kourier release.
 # Channels and triggers (Agent Kourier) are opt-in. The ONE switch is the chart value channels.kourier.enabled (default false), set
 # in a VALUES_FILE, e.g. VALUES_FILE=components/channels/demo-values.yaml ./install.sh . When it is true this script installs the
 # pinned Kourier release (components/channels/kourier.sh, cosign-verified when cosign exists) BEFORE the chart, generates the
@@ -95,7 +95,7 @@ if [ "$CLUSTER_UP" = 0 ]; then
   kind create cluster --config hack/kind-config.yaml
 fi
 $K config use-context "$CTX" >/dev/null || die "kube context $CTX not found"
-docker exec "$NODE" sysctl -w net.ipv4.conf.all.proxy_arp=1 >/dev/null   # gVisor pod networking (see spikes/kagent/NOTES.md)
+docker exec "$NODE" sysctl -w net.ipv4.conf.all.proxy_arp=1 >/dev/null   # gVisor pod networking (see components/runtime/NOTES.md)
 docker exec "$NODE" sysctl -e -w net.ipv6.conf.all.proxy_ndp=1 >/dev/null
 
 # --- 2. prerequisites: reuse the component scripts, pinned versions live in those scripts ---------------------
@@ -103,8 +103,8 @@ helm_has(){ helm status "$1" -n "$2" >/dev/null 2>&1; }
 want(){ [ "${SKIP_PREREQS:-0}" != 1 ] && { [ "${FORCE_PREREQS:-0}" = 1 ] || ! "$@"; }; }
 log "prerequisites"
 if want bash -c "$(declare -f helm_has); helm_has kagent $KAGENT_NS && helm_has substrate ate-system"; then
-  echo "-> kagent 1.0.1 + Agent Substrate 1.0.1 (spikes/kagent/up.sh)"
-  SKIP_FIRST_AGENT=1 bash spikes/kagent/up.sh
+  echo "-> kagent 1.0.1 + Agent Substrate 1.0.1 (components/runtime/up.sh)"
+  SKIP_FIRST_AGENT=1 bash components/runtime/up.sh
 else echo "kagent + Substrate: present or skipped"; fi
 if want bash -c "$(declare -f helm_has); helm_has agentgateway $GW_NS"; then
   echo "-> Gateway API CRDs + agentgateway v1.7.0 (components/model-gateway/install.sh)"
@@ -135,17 +135,17 @@ KB_KEY=$(jq -r 'select(.kind=="Deployment")|.metadata as $m|($m.annotations//{})
 [ -z "$KB_KEY" ] || AGENT_KEYS=$(printf '%s\n%s' "$AGENT_KEYS" "$KB_KEY")
 
 # --- 3b. long-term memory needs pgvector in kagent's PostgreSQL and config.database.vectorEnabled=true ------------------
-# Only when some agent opts in (Harness spec.kagent.memory). Fresh installs get both from spikes/kagent/up.sh; this step
+# Only when some agent opts in (Harness spec.kagent.memory). Fresh installs get both from components/runtime/up.sh; this step
 # brings an existing cluster up to date with the SAME scripts (pgvector.sh is idempotent, kagent-helm.sh is the one
 # helm command that always carries values/kagent.yaml). It never touches kagent data. SKIP_PREREQS=1 skips it.
 if [ "${SKIP_PREREQS:-0}" != 1 ] && jq -e -s 'any(.[]; .kind=="Harness" and (.spec.kagent.memory!=null))' <<<"$RENDERED" >/dev/null; then
   log "kagent long-term memory prerequisites (pgvector)"
-  bash spikes/kagent/pgvector.sh
+  bash components/runtime/pgvector.sh
   if [ "$(helm get values kagent -n $KAGENT_NS -a -o json | jq -r '.config.database.vectorEnabled // false')" = true ]; then
     echo "kagent release: config.database.vectorEnabled already true"
   else
-    echo "-> enabling config.database.vectorEnabled (spikes/kagent/kagent-helm.sh)"
-    bash spikes/kagent/kagent-helm.sh
+    echo "-> enabling config.database.vectorEnabled (components/runtime/kagent-helm.sh)"
+    bash components/runtime/kagent-helm.sh
   fi
 fi
 
@@ -175,10 +175,10 @@ if [ "${SKIP_PREREQS:-0}" != 1 ] && helm_has kagent $KAGENT_NS; then
   if [ "$OBS_HAVE" = "$OBS_WANT_N" ]; then
     echo "kagent release: telemetry settings already as wanted"
   else
-    log "kagent telemetry settings (spikes/kagent/kagent-helm.sh)"
+    log "kagent telemetry settings (components/runtime/kagent-helm.sh)"
     OBS_T=$(mktemp -d)
     jq -c . <<<"$OBS_WANT" > "$OBS_T/telemetry.json"
-    if [ "$OBS_WANT" = '{}' ]; then bash spikes/kagent/kagent-helm.sh; else KAGENT_EXTRA_VALUES="$OBS_T/telemetry.json" bash spikes/kagent/kagent-helm.sh; fi
+    if [ "$OBS_WANT" = '{}' ]; then bash components/runtime/kagent-helm.sh; else KAGENT_EXTRA_VALUES="$OBS_T/telemetry.json" bash components/runtime/kagent-helm.sh; fi
     rm -rf "$OBS_T"
   fi
 fi

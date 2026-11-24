@@ -150,7 +150,7 @@ agents:
       ttlDays: 30      # optional; kagent's default is 15
 ```
 
-`install.sh` then (1) installs pgvector into kagent's PostgreSQL (`spikes/kagent/pgvector.sh`, idempotent, no data touched), (2) sets `config.database.vectorEnabled=true` on the kagent release with the one script that always applies `spikes/kagent/values/kagent.yaml` (`spikes/kagent/kagent-helm.sh`; fresh installs get both from `spikes/kagent/up.sh`), (3) creates the gateway key `memory-virtual-key` for the embedding ModelConfig, and (4) renders the shared pieces once: ModelConfig `gateway-embed-memory`, gateway model `embed-memory`, and the embedding server in namespace `openagentix-memory`. An agent without the `memory` block renders exactly as before, and if no agent opts in none of the shared pieces exist. `ttlDays` only sets `expires_at` on each row. In kagent 1.0.1 nothing calls the prune function (`PruneExpiredMemories`) and search ignores `expires_at`, so **memories do not actually expire**; delete them yourself (see "Clear it").
+`install.sh` then (1) installs pgvector into kagent's PostgreSQL (`components/runtime/pgvector.sh`, idempotent, no data touched), (2) sets `config.database.vectorEnabled=true` on the kagent release with the one script that always applies `components/runtime/values/kagent.yaml` (`components/runtime/kagent-helm.sh`; fresh installs get both from `components/runtime/up.sh`), (3) creates the gateway key `memory-virtual-key` for the embedding ModelConfig, and (4) renders the shared pieces once: ModelConfig `gateway-embed-memory`, gateway model `embed-memory`, and the embedding server in namespace `openagentix-memory`. An agent without the `memory` block renders exactly as before, and if no agent opts in none of the shared pieces exist. `ttlDays` only sets `expires_at` on each row. In kagent 1.0.1 nothing calls the prune function (`PruneExpiredMemories`) and search ignores `expires_at`, so **memories do not actually expire**; delete them yourself (see "Clear it").
 
 **Why a second embedding model.** kagent stores memory as `vector(768)` and refuses any other size (a 384-dimension model fails with "embedding dimension 384 is less than required 768"; a larger vector is cut to 768 and re-normalised). The knowledge base's `bge-small-en-v1.5` has 384, so memory runs its own llama.cpp server with `bge-base-en-v1.5` (768, same publisher and pooling, 118 MB Q8_0). The chart fails the render if `memory.embeddings.model.dim` is not 768. The knowledge base is untouched, so nothing needs re-ingesting.
 
@@ -365,7 +365,7 @@ Cost per agent, one trace per turn, tool-call counts and an audit log, from one 
 VALUES_FILE="components/observability/demo-values.yaml" ./install.sh      # add the other values files you use: Helm replaces release values on every run
 ```
 
-`install.sh` configures what the chart does not own from the same switch (the kagent controller and agent runtimes through `spikes/kagent/kagent-helm.sh`, Agent Kourier's OTLP env and scrape policy) and only when they differ from the wanted state, in either direction; a re-run changes nothing. **The first time it rolls the kagent controller and recompiles the agents, and on the 7.7 GiB demo node that roll caused a stall of about 20 minutes (see ADR 0003): do it when nobody is using the demo and expect to delete a crash-looping controller pod.** With your own stack instead:
+`install.sh` configures what the chart does not own from the same switch (the kagent controller and agent runtimes through `components/runtime/kagent-helm.sh`, Agent Kourier's OTLP env and scrape policy) and only when they differ from the wanted state, in either direction; a re-run changes nothing. **The first time it rolls the kagent controller and recompiles the agents, and on the 7.7 GiB demo node that roll caused a stall of about 20 minutes (see ADR 0003): do it when nobody is using the demo and expect to delete a crash-looping controller pod.** With your own stack instead:
 
 ```yaml
 observability:
@@ -489,7 +489,7 @@ These are the gaps found while building the components. Most are acceptable for 
 - **Agent changes roll slowly.** Editing a ModelConfig re-snapshots the agent (15 to 20 seconds); calls in that window still use the old configuration. Agents share one Substrate worker pool, so a busy agent can starve another.
 - **Gemini** has not produced a real completion in this project (the test key had no credits). The Gemini and failover model entries are examples only.
 - **A kagent-controller start-up race** (two restarts while Substrate's API came up) was seen once and not root-caused.
-- **AX is not part of the install.** `spikes/ax` added Substrate values for Google AX. `install.sh` skips prerequisites that already exist, but `FORCE_PREREQS=1` (or a first install followed by an AX install) re-applies `spikes/kagent/values/substrate.yaml` and drops those additions. AX also does not provide a way to message a running task, so it is not used here.
+- **AX is not part of the install.** `spikes/ax` added Substrate values for Google AX. `install.sh` skips prerequisites that already exist, but `FORCE_PREREQS=1` (or a first install followed by an AX install) re-applies `components/runtime/values/substrate.yaml` and drops those additions. AX also does not provide a way to message a running task, so it is not used here.
 - The cold install was run twice from a deleted kind cluster on one machine (Docker image cache warm). A machine with nothing cached has not been tried.
 
 ## Repository layout
@@ -513,10 +513,11 @@ components/notify/              a demo values file: notify on, `assistant` opted
 components/observability/       a demo values file: observability on with the bundled VictoriaMetrics + Jaeger
 tools/a2a-call/                 Go A2A caller run by the schedule CronJobs (tests, Dockerfile)
 docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented, 0003 observability: accepted for the MVP slice)
-spikes/kourier/                 Agent Kourier spike (evidence; superseded by the integration)
-spikes/kagent/                  kagent + Substrate bring-up (up.sh, values) and NOTES
-spikes/ax/                      Google AX spike; not installed
+components/runtime/             kagent + Substrate bring-up (up.sh, pgvector.sh, kagent-helm.sh, values, manifests) and NOTES
+components/bench/               kagent versus AX speed benchmark (harness in compare/, results)
 ```
+
+Paths that start with `spikes/` in the changelog, the decision records and the diary point to exploratory spike code and notes (Agent Kourier, Google AX, early kagent samples). They are kept outside this public repository; what the installer needs from them now lives in `components/runtime/` and `components/bench/compare/`.
 
 The `NOTES.md` files record versions, deviations from upstream docs, failures and evidence.
 

@@ -62,6 +62,8 @@ Not the same, and it matters when reading the numbers:
 
 ## Install (done once; the AX part is temporary)
 
+Note: the AX bring-up scripts named below (`spikes/ax/...`) are spike code kept outside the public repository. The kagent side of the benchmark needs none of them.
+
 Prerequisites: kind cluster `openagentix` running, `kubectl`, `helm`, `docker`, Go (the toolchain downloads 1.27.1), `yq` (the python one: `yq -y`), `jq`.
 The ax-registry volume `ax-registry-data` must still hold the images (`ax-server`, `ax-runner`, `ax-assistant`, `ax-assistant-api`); if not, run
 `spikes/ax/up.sh` without `SKIP_BUILD=1` and rebuild the agent images (`spikes/ax/agent/Dockerfile`, `spikes/ax/agent/api/Dockerfile`, push to `localhost:5001`).
@@ -134,8 +136,8 @@ Cold start, defined per runtime:
 - AX: *cold* is the first Task of a brand-new Workspace (a nonce file in the Workspace setup changes its snapshot tag, so Substrate builds the snapshot in a setup actor); *warm* is the second.
   `cold-ax` creates the Workspace and a throw-away adapter per cycle (2 cycles per variant) and deletes both afterwards. It needs `AX_BIN=$S/ax-src/bin/ax`.
 
-Harness alone, for a one-off: `kubectl -n openagentix-gateway exec -i cmp -- python3 - --backends 'a=URL,b=URL' --groups a,e --runs 3 --warmup --concurrency 4 ... < spikes/ax/compare/a2a_compare.py`
-(`--header 'kagent:X-User-Id:bench:{backend}:{rid}'`, `--turn-gap`, `--load`, `--load-cmd`, `--no-header`, `--run-id`; see its docstring). Tests: `cd spikes/ax/compare && python3 -m unittest test_a2a_compare test_summarize test_bench`
+Harness alone, for a one-off: `kubectl -n openagentix-gateway exec -i cmp -- python3 - --backends 'a=URL,b=URL' --groups a,e --runs 3 --warmup --concurrency 4 ... < components/bench/compare/a2a_compare.py`
+(`--header 'kagent:X-User-Id:bench:{backend}:{rid}'`, `--turn-gap`, `--load`, `--load-cmd`, `--no-header`, `--run-id`; see its docstring). Tests: `cd components/bench/compare && python3 -m unittest test_a2a_compare test_summarize test_bench`
 and `cd components/bench && python3 -m unittest test_trace_breakdown`.
 
 ## Reading the breakdown

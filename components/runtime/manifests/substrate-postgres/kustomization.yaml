@@ -1,0 +1,17 @@
+# Vendored from kagent-dev/substrate v1.0.1 manifests/ate-install/postgres/postgres.yaml,
+# shrunk for an 8 GB laptop (upstream kind overlay only trims CPU).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - postgres.yaml
+patches:
+  - target: {kind: StatefulSet, name: postgres}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {cpu: "2", memory: 768Mi}
+      - op: replace
+        path: /spec/volumeClaimTemplates/0/spec/resources/requests/storage
+        value: 5Gi

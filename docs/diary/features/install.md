@@ -8,7 +8,7 @@ description: How install.sh and the Helm chart fit together, the values files, u
 
 ## What it is for
 
-The goal in `WHAT.txt` is a single-command deploy with Helm. Upstream constraints make one chart impossible today: kagent and Substrate need fixed release names, a strict install order, and key material minted by `kubectl ate` before the charts start, and the Gateway API CRDs ship in neither agentgateway chart. So there are two layers.
+The goal in the original product brief is a single-command deploy with Helm. Upstream constraints make one chart impossible today: kagent and Substrate need fixed release names, a strict install order, and key material minted by `kubectl ate` before the charts start, and the Gateway API CRDs ship in neither agentgateway chart. So there are two layers.
 
 | Layer | What | Where |
 |---|---|---|
@@ -79,6 +79,6 @@ Uninstall: `./uninstall.sh` removes only the `openagentix` release and then the 
 - Docker needs about 7.5 GB or more. The full stack idles at about 2.3 GiB in the node, and each agent sandbox adds more. Node memory requests grew from 3410 Mi to 4146 Mi as the knowledge base, memory, notify and observability were added.
 - A machine with nothing cached has not been tried. Allow longer when every image must be pulled.
 - The skill registry container `openagentix-registry` survives cluster deletion but its IP can change: re-run `./install.sh` after recreating the cluster.
-- `FORCE_PREREQS=1` re-applies `spikes/kagent/values/substrate.yaml` and drops Substrate additions made by `spikes/ax`.
+- `FORCE_PREREQS=1` re-applies `components/runtime/values/substrate.yaml` and drops Substrate additions made by `spikes/ax`.
 - The first observability enable rolls the kagent controller; see [observability](./observability.md).
 - Single node, dev databases. Not a production install.

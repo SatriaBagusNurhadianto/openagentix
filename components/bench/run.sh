@@ -24,7 +24,7 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$HERE/../.." && pwd)
-HARNESS=$ROOT/spikes/ax/compare/a2a_compare.py
+HARNESS=$ROOT/components/bench/compare/a2a_compare.py
 CTX=${CTX:-kind-openagentix}
 NODE=${NODE:-openagentix-control-plane}
 NS=${NS:-openagentix-gateway}
@@ -225,7 +225,7 @@ seq_phase() { # phase
     done
   done
   k exec -n "$NS" "$POD" -- cat "$ans" > "$OUT/answers-$ph.jsonl"
-  python3 "$ROOT/spikes/ax/compare/summarize.py" "$csv"
+  python3 "$ROOT/components/bench/compare/summarize.py" "$csv"
   log "done: $csv"
 }
 
@@ -244,7 +244,7 @@ concurrency_phase() {
   harness --backends "$(backends_arg "$@")" --concurrency 4 --rounds 2 --run-id "$(date +%Y%m%d%H%M%S)" --load "$(node_load)" --answers "$ans" \
     ${warm[@]+"${warm[@]}"} ${hdr[@]+"${hdr[@]}"} > "$csv" 2>> "$OUT/harness-concurrency.log"
   k exec -n "$NS" "$POD" -- cat "$ans" > "$OUT/answers-concurrency.jsonl"
-  python3 "$ROOT/spikes/ax/compare/summarize.py" "$csv"
+  python3 "$ROOT/components/bench/compare/summarize.py" "$csv"
 }
 
 cold_kagent_phase() {
@@ -347,7 +347,7 @@ report_phase() {
   local csvs=()
   while IFS= read -r f; do csvs+=("$f"); done < <(find "$OUT" -maxdepth 1 -name 'results-*.csv' | sort)
   [ "${#csvs[@]}" -gt 0 ] || die "no results-*.csv in $OUT"
-  python3 "$ROOT/spikes/ax/compare/summarize.py" "${csvs[@]}" | tee "$OUT/summary.md"
+  python3 "$ROOT/components/bench/compare/summarize.py" "${csvs[@]}" | tee "$OUT/summary.md"
   log "per-turn breakdown (reads Jaeger, the egress proxy log and the ax-server log; no model calls)"
   python3 "$HERE/trace-breakdown.py" --context "$CTX" --rows-out "$OUT/breakdown-rows.csv" "${csvs[@]}" | tee "$OUT/breakdown.md"
   log "wrote $OUT/summary.md and $OUT/breakdown.md"

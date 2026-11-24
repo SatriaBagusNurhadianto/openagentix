@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Idempotent installer for the OpenAgentix tool layer (ToolHive + vMCP code mode + kagent wiring).
-# Prereqs: kind cluster with kagent+substrate (spikes/kagent/up.sh), kubectl, helm. Context defaults to kind-openagentix.
+# Prereqs: kind cluster with kagent+substrate (components/runtime/up.sh), kubectl, helm. Context defaults to kind-openagentix.
 # Optional: WITH_SKILL=1 builds/pushes the example OCI skill (needs docker + the ax-registry container).
 set -euo pipefail
 cd "$(dirname "$0")"

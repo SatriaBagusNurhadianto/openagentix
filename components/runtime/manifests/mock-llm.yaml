@@ -1,0 +1,82 @@
+# Spike-only: OpenAI-compatible stub, used because the supplied Gemini key's project has no credits (HTTP 402).
+apiVersion: v1
+kind: ConfigMap
+metadata: {name: mock-llm, namespace: kagent}
+data:
+  server.py: |
+    import json, time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers.get("content-length", 0))) or b"{}")
+            n = len(body.get("messages", []))
+            text = "MOCK-LLM reply (%d messages seen). 2+2 is 4." % n
+            created = int(time.time())
+            if body.get("stream"):
+                self.send_response(200); self.send_header("content-type", "text/event-stream"); self.end_headers()
+                for d, fin in (({"role": "assistant", "content": text}, None), ({}, "stop")):
+                    c = {"id": "mock", "object": "chat.completion.chunk", "created": created, "model": "mock", "choices": [{"index": 0, "delta": d, "finish_reason": fin}]}
+                    self.wfile.write(("data: " + json.dumps(c) + "\n\n").encode())
+                self.wfile.write(b"data: [DONE]\n\n"); return
+            out = {"id": "mock", "object": "chat.completion", "created": created, "model": "mock",
+                   "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+                   "usage": {"prompt_tokens": 5, "completion_tokens": 10, "total_tokens": 15}}
+            b = json.dumps(out).encode()
+            self.send_response(200); self.send_header("content-type", "application/json"); self.send_header("content-length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        def log_message(self, *a): print(*a, flush=True)
+    ThreadingHTTPServer(("", 8000), H).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: mock-llm, namespace: kagent}
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: mock-llm}}
+  template:
+    metadata: {labels: {app: mock-llm}}
+    spec:
+      containers:
+      - name: py
+        image: python:3.12-alpine
+        command: [python, /app/server.py]
+        volumeMounts: [{name: code, mountPath: /app}]
+        resources: {requests: {cpu: 10m, memory: 32Mi}, limits: {memory: 128Mi}}
+      volumes: [{name: code, configMap: {name: mock-llm}}]
+---
+apiVersion: v1
+kind: Service
+metadata: {name: mock-llm, namespace: kagent}
+spec:
+  selector: {app: mock-llm}
+  ports: [{port: 8000}]
+---
+apiVersion: v1
+kind: Secret
+metadata: {name: mock-llm-key, namespace: kagent}
+stringData: {OPENAI_API_KEY: not-a-real-key}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: ModelConfig
+metadata: {name: mock-model, namespace: kagent}
+spec:
+  provider: OpenAI
+  model: mock
+  apiKeySecret: mock-llm-key
+  apiKeySecretKey: OPENAI_API_KEY
+  stream: false
+  openAI: {baseUrl: "http://mock-llm.kagent.svc.cluster.local:8000/v1"}
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: AgentTemplate
+metadata: {name: mock-template, namespace: kagent}
+spec:
+  description: Agent backed by the stub LLM
+  modelConfig: {name: mock-model}
+  systemPrompt: You are a concise, helpful assistant.
+---
+apiVersion: api.kagent.dev/v1alpha3
+kind: Agent
+metadata: {name: mock-agent, namespace: kagent}
+spec:
+  template: {ref: {name: mock-template}}
+  harnessRef: {name: my-first-harness}

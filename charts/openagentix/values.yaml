@@ -417,7 +417,7 @@ notify:
 
 # ---- Long-term memory (kagent memory + pgvector + local embedding model) ---------------------------------
 # Shared pieces for agents that opt in with `agents[].memory.enabled: true`. Rendered only when at least one agent
-# does. kagent stores every memory as a vector(768) row in its own PostgreSQL (install.sh / spikes/kagent turn pgvector
+# does. kagent stores every memory as a vector(768) row in its own PostgreSQL (install.sh / components/runtime turn pgvector
 # on), so the embedding model MUST produce 768 dimensions: bge-small (384, used by the knowledge base) cannot be used,
 # kagent rejects it ("embedding dimension 384 is less than required 768"). A second llama.cpp server runs a
 # 768-dimension model; it is reached through the model gateway like every other model, with its own virtual key.

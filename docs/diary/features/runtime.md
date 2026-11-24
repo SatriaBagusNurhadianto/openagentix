@@ -81,7 +81,7 @@ Expect `TASK_STATE_COMPLETED` and an answer that says 4.
 
 ## What was proven
 
-- gVisor works on arm64 under a VM without KVM; golden snapshots and resume worked (spikes/kagent/NOTES.md).
+- gVisor works on arm64 under a VM without KVM; golden snapshots and resume worked (components/runtime/NOTES.md).
 - A2A: agent card, `SendMessage`, `SendStreamingMessage`, and a follow-up turn on the same `contextId`.
 - The full stack idles at about 2.3 GiB in the node on the first spike. A cold install took 604 s with images cached.
 - AX comparison as above (spikes/ax/compare/RESULTS.md).
@@ -121,4 +121,4 @@ The wait of 5 to 14 s before the agent starts, seen on some new conversations, w
 
 Substrate 1.0.1 has no warm pool: an actor is created from the template snapshot and resumed on demand. Capacity is the number of worker pods times 1000 actors; nothing bounds concurrent starts.
 
-Found on the way: the demo node was already in a restart loop when the session began (load 46 to 58, `ate-idp-server` 123 restarts, `kagent-controller` 134, Substrate PostgreSQL 74). The probes have a 1 s timeout and the node is oversubscribed, so a busy minute restarts the identity server, the controller follows, and the restarts keep the node busy. The one probe we own (Substrate PostgreSQL, `spikes/kagent/manifests/substrate-postgres/postgres.yaml`) now has `timeoutSeconds: 5`; it is not rolled out on this cluster and not measured.
+Found on the way: the demo node was already in a restart loop when the session began (load 46 to 58, `ate-idp-server` 123 restarts, `kagent-controller` 134, Substrate PostgreSQL 74). The probes have a 1 s timeout and the node is oversubscribed, so a busy minute restarts the identity server, the controller follows, and the restarts keep the node busy. The one probe we own (Substrate PostgreSQL, `components/runtime/manifests/substrate-postgres/postgres.yaml`) now has `timeoutSeconds: 5`; it is not rolled out on this cluster and not measured.

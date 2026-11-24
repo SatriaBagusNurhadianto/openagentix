@@ -6,7 +6,7 @@ description: What OpenAgentix is, how its parts fit together, and where to read 
 
 # OpenAgentix feature diary
 
-OpenAgentix is a Kubernetes-native platform for running AI agents. It puts existing open-source projects behind one installer and one Helm chart. The aim in `WHAT.txt` is a replacement for the managed agent services of the large clouds, running on your own cluster.
+OpenAgentix is a Kubernetes-native platform for running AI agents. It puts existing open-source projects behind one installer and one Helm chart. The aim in the original product brief is a replacement for the managed agent services of the large clouds, running on your own cluster.
 
 This diary records what was built, how each part was proven, and what is still missing. The current state is an MVP (tag `v0.1.0`) plus work done on 2026-11-22 and 2026-11-23 that is not yet released. It runs on one kind node. Read [what works](./what-works.md) before you rely on anything.
 

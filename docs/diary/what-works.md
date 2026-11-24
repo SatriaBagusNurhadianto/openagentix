@@ -15,11 +15,11 @@ States used here:
 
 Evidence comes from the README, the CHANGELOG, `docs/decisions/` and the component notes. "Live" means the single-node kind cluster `kind-openagentix`. Nothing here was tested at scale, under load, or on a cluster other than kind.
 
-## Items from WHAT.txt
+## Items from the original brief
 
 | Capability | State | How it was proven | Where | Main known gap |
 |---|---|---|---|---|
-| Agent runtime | working and proven live | kagent 1.0.1 on Substrate 1.0.1: A2A `SendMessage`, multi-turn on one `contextId`, real model, cold install twice (ADR 0001, spikes/kagent/NOTES.md) | `spikes/kagent/`, `charts/openagentix/templates/kagent.yaml` | The controller does not authenticate callers; start-up race seen once |
+| Agent runtime | working and proven live | kagent 1.0.1 on Substrate 1.0.1: A2A `SendMessage`, multi-turn on one `contextId`, real model, cold install twice (ADR 0001, components/runtime/NOTES.md) | `spikes/kagent/`, `charts/openagentix/templates/kagent.yaml` | The controller does not authenticate callers; start-up race seen once |
 | Runtime choice (kagent vs Google AX vs Dapr Agents) | working and proven live (kagent vs AX only) | Same agent on both, measured twice. Second run with traces, 5 runs per test: kagent 2.5 to 2.9 s for a plain question, AX 3.4 to 7.6 s (ADR 0005) | `docs/decisions/0001-*.md`, `docs/decisions/0005-*.md`, `components/bench/` | Small node, 5 runs; kagent has a slow start on some new conversations and does badly with 4 at once; no Dapr Agents or LiteLLM comparison |
 | Google AX as second backend | experimental | Adapter ran 40 AX runs, all correct; not installed | `bridges/ax-adapter/`, `spikes/ax/` | No auth, no streaming, history lost on restart; AX's own Claude Code runner never started |
 | MCP tools (ToolHive vMCP, fetch, OSV) | working and proven live | A real model called `osv_query_vulnerability` and answered 4 for lodash 4.17.20 | `components/tools/`, chart `mcp` block | Cedar policy is permit-all by default; no per-agent tool authorization |
@@ -27,7 +27,7 @@ Evidence comes from the README, the CHANGELOG, `docs/decisions/` and the compone
 | Model gateway | working and proven live | Real Anthropic completions through agentgateway; 401 without a key; 429 when the budget ran out | `components/model-gateway/`, chart `gateway` block | Static virtual keys, plain HTTP in cluster, one shared provider key |
 | Model routing and cost optimization | experimental | Priority-group failover with a retry policy ran with a stub and a 402 from Gemini | `components/model-gateway/manifests/10-models.yaml` | No intelligent routing; no USD caps; Gemini never gave a completion |
 | Skills | working and proven live | OCI skill mounted, loaded by a real model; canary prompt 5/5 (ADR 0001) | `components/tools/skills/`, chart `skills` | Needs a plain-HTTP registry on kind; model-driven selection lightly exercised |
-| Memory | working and proven live | A fact saved in one conversation was recalled in a new one, not for another user id | chart `memory` block, `spikes/kagent/pgvector.sh` | `ttlDays` is not enforced; nothing prunes |
+| Memory | working and proven live | A fact saved in one conversation was recalled in a new one, not for another user id | chart `memory` block, `components/runtime/pgvector.sh` | `ttlDays` is not enforced; nothing prunes |
 | Messaging: Telegram | working and proven live | ADR 0001 lists kagent wired to Telegram on the cluster; per-chat user id verified against kagent | `bridges/telegram/` | Single replica; in-memory offsets; the bridge's new trace line was unit-tested only |
 | Messaging: Slack | built and tested only | Chart renders it; marked UNTESTED in the README | chart `channels` block | No Slack tokens were available |
 | Messaging: Teams and other platforms | not built | No code or notes | none | Kourier docs list platforms; none wired |
@@ -43,7 +43,7 @@ Evidence comes from the README, the CHANGELOG, `docs/decisions/` and the compone
 | Single-command install | working and proven live | Cold install from a deleted cluster, twice, warm image cache, 604 s | `install.sh`, `uninstall.sh` | Two layers (installer plus chart), not one Helm chart; no cold install with an empty image cache |
 | Open core and licensing | built and tested only | Apache-2.0 `LICENSE` at the repository root for the open core | `LICENSE` | No enterprise edition or repository split yet |
 
-## What was built beyond WHAT.txt
+## What was built beyond the original brief
 
 | Capability | State | How it was proven | Where | Main known gap |
 |---|---|---|---|---|

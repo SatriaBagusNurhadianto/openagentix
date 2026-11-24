@@ -15,7 +15,7 @@ An agent with `memory.enabled: true` remembers facts across conversations. This 
 - **Saving.** Only what the model decides to save. kagent adds a `save_memory` tool. The chart appends a short paragraph to the system prompt of memory-enabled agents (`memory.agentPrompt`) that tells the model when to call it and never to store secrets.
 - **Recall.** On every turn kagent embeds the user's message, takes up to 5 stored memories of the same agent and user with cosine similarity of at least 0.3, and puts them in the context. The model also has a `load_memory` tool.
 - **Scope.** One memory space per agent and per user: rows are keyed by the agent (`kagent/assistant`) and the session's user id. In `insecure` auth mode the user id comes from `?user_id=` or the `X-User-Id` header, otherwise kagent's default admin user.
-- **Storage.** Table `kagent.memory` in kagent's PostgreSQL, column `extensions.vector(768)`, HNSW cosine index. Needs pgvector there: `spikes/kagent/pgvector.sh`.
+- **Storage.** Table `kagent.memory` in kagent's PostgreSQL, column `extensions.vector(768)`, HNSW cosine index. Needs pgvector there: `components/runtime/pgvector.sh`.
 
 ```mermaid
 sequenceDiagram
@@ -49,7 +49,7 @@ memory:
     model: {hf: "CompendiumLabs/bge-base-en-v1.5-gguf:Q8_0", name: bge-base-en-v1.5, dim: 768, pooling: cls}
 ```
 
-The render fails if `memory.embeddings.model.dim` is not 768 or the gateway is disabled. `install.sh` step 3b installs pgvector into kagent's PostgreSQL, sets `config.database.vectorEnabled=true` through `spikes/kagent/kagent-helm.sh`, and creates `memory-virtual-key`. Enabling it restarts the kagent controller and recompiles the agent revision. An agent without the block renders exactly as before.
+The render fails if `memory.embeddings.model.dim` is not 768 or the gateway is disabled. `install.sh` step 3b installs pgvector into kagent's PostgreSQL, sets `config.database.vectorEnabled=true` through `components/runtime/kagent-helm.sh`, and creates `memory-virtual-key`. Enabling it restarts the kagent controller and recompiles the agent revision. An agent without the block renders exactly as before.
 
 ## How to try it
 

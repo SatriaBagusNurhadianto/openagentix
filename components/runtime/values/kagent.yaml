@@ -1,0 +1,28 @@
+database:
+  postgres:
+    # Spike uses password auth to a plain in-cluster PG; chart default secret names are used.
+    clientCertificate:
+      enabled: false
+controller:
+  substrateClientCertificate:
+    enabled: true
+substrateWorkerPool:
+  create: true
+  workerImage: ghcr.io/kagent-dev/substrate/ateworker-gvisor:v1.0.1
+harnesses:
+  enabled: true
+config:
+  server:
+    grpcReflection: false
+  database:
+    # Long-term agent memory (Harness spec.kagent.memory) stores vectors in kagent's PostgreSQL. pgvector must be
+    # installed in vectorSchema first: pgvector.sh does that (up.sh runs it; install.sh runs it for existing clusters).
+    vectorEnabled: true
+    vectorSchema: extensions
+providers:
+  default: gemini
+  gemini:
+    provider: Gemini
+    model: gemini-3.5-flash-lite
+    apiKeySecretRef: kagent-gemini
+    apiKeySecretKey: GOOGLE_API_KEY

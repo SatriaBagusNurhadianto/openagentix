@@ -14,10 +14,10 @@ Dates are commit dates from `git log --date=short`. The whole history is 23 comm
 
 Added the first Helm chart `charts/openagentix`, `install.sh`, `uninstall.sh`, the Telegram bridge, the demo `assistant` agent, and the spike results for kagent, agentgateway, ToolHive and Google AX. Added ADR 0001 and `bridges/ax-adapter` (experimental).
 
-Why: the goal in `WHAT.txt` was a demo of an agent on Kubernetes with tools, skills and a model, reachable from a chat app.
+Why: the goal in the original product brief was a demo of an agent on Kubernetes with tools, skills and a model, reachable from a chat app.
 
 What was learned:
-- kagent 1.0.1 and Substrate 1.0.1 run on a laptop, with gVisor sandboxes on arm64 (spikes/kagent/NOTES.md). A Gemini test key had no credits (HTTP 402), so a stub model proved the path first.
+- kagent 1.0.1 and Substrate 1.0.1 run on a laptop, with gVisor sandboxes on arm64 (components/runtime/NOTES.md). A Gemini test key had no credits (HTTP 402), so a stub model proved the path first.
 - The same agent was built on Google AX. It worked and was not slower, but needed an adapter, an agent loop and images that kagent supplies. Decision: kagent (ADR 0001).
 - The first token budget of 100000 per hour was used up by the comparison runs and caused 429 answers. The default was raised to 1000000.
 - Fixes before the tag: the installer runs component scripts through `bash`; the skill registry became its own container on the `kind` network because a registry sharing the node network broke after cluster recreation; the `kubectl-ate` download is checked by SHA-256.

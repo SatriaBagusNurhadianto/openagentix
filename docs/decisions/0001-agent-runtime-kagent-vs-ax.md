@@ -4,7 +4,7 @@
 
 - **Status:** Accepted for the MVP, confirmed after running the same agent on both runtimes. Revisit under the conditions in "When to revisit".
 - **Date:** 2026-11-22 (revised the same day; see "Revision history")
-- **Evidence:** `spikes/kagent/NOTES.md`, `spikes/ax/NOTES.md`, a source check of AX at commit `0b44e971`, and the same-flow measurements in `spikes/ax/compare/RESULTS.md`
+- **Evidence:** `components/runtime/NOTES.md`, `spikes/ax/NOTES.md`, a source check of AX at commit `0b44e971`, and the same-flow measurements in `spikes/ax/compare/RESULTS.md`
 
 ## Decision
 

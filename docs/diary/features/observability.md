@@ -33,7 +33,7 @@ flowchart LR
 - **Correlation key.** The A2A `contextId` equals the kagent session id and the Substrate actor `session-<contextId>`.
 - **Audit.** The vMCP writes `AUDIT` lines (tool, outcome, `actor/kagent/session-<contextId>`, duration), never arguments or results.
 - **Privacy.** Content capture is off. One value, `observability.capture.content`, is the only way to turn it on. Baggage is off. The Go ADK and the vMCP write tool arguments and results into spans whatever the setting; the bundled Jaeger deletes those attributes and `user.id` before storage. With your own endpoint the chart exports only gateway spans until you set `observability.otlp.contentFiltered: true`.
-- `install.sh` configures what the chart does not own (kagent controller and runtimes through `spikes/kagent/kagent-helm.sh`, Agent Kourier OTLP env and scrape policy) from a marker ConfigMap `openagentix-observability`, only when they differ.
+- `install.sh` configures what the chart does not own (kagent controller and runtimes through `components/runtime/kagent-helm.sh`, Agent Kourier OTLP env and scrape policy) from a marker ConfigMap `openagentix-observability`, only when they differ.
 
 ## How to enable and configure
 

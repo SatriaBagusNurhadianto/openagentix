@@ -25,6 +25,7 @@
 #   SKIP_A2A_CALL_IMAGE=1  do not build/load the schedule caller image (tools/a2a-call); it is only built when `schedules` is not empty
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
 #   SKIP_NOTIFY_IMAGE=1  do not build/load the notify image (services/notify); it is only built when notify.enabled is true
+#   SKIP_A2A_GATE_IMAGE=1  do not build/load the A2A gate image (services/a2a-gate); it is only built when governance.a2a.enabled is true
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart, space-separated, applied in order (maps are merged, lists
 #                        such as agents[] or schedules[] are REPLACED by the later file) (e.g. more agents, schedules, networkPolicy.extraA2ACallers for a
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
@@ -40,6 +41,10 @@
 # pinned Kourier release (components/channels/kourier.sh, cosign-verified when cosign exists) BEFORE the chart, generates the
 # Secret of each webhook connection when absent (random, never printed), and the chart admits Kourier's pod to the kagent controller.
 #   RELEASE_NS=openagentix-system  AGENT_WAIT=900s
+# The A2A gate (ADR 0006, round 1) is opt-in too: the ONE switch is the chart value governance.a2a.enabled (components/governance/demo-values.yaml).
+# When the chart renders the gate, this script builds and loads its image, creates one static key per Kourier binding (Secret a2a-key-<binding> in the
+# channels namespace, only when absent, random, never printed) and writes the SHA-256 of each key into the gate's hash Secret (a2a-gate-keys), all
+# BEFORE the single helm upgrade that also moves the callers to the gate, so no caller is ever cut off.
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
 # The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
@@ -127,6 +132,7 @@ BRIDGE_IMAGE=$(jq -r 'select(.kind=="Deployment" and .metadata.name=="telegram-b
 KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDERED")   # empty when knowledge.enabled=false
 # Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
 NOTIFY_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="notify")' <<<"$RENDERED")   # empty when notify.enabled=false
+A2A_GATE_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="a2a-gate")' <<<"$RENDERED")   # empty when governance.a2a.enabled=false
 # A Deployment asks for one key per annotation SET: openagentix.io/gateway-user<sfx> (the user id), gateway-key-secret<sfx> (the Secret) and,
 # optionally, gateway-key-name<sfx> (the Secret key, default OPENAI_API_KEY); <sfx> is empty for the first set, "-extract" for the kb's
 # extraction key. Annotation names are unique per object, so a second key on one Deployment needs a second suffix: the earlier one-pair lookup
@@ -342,6 +348,26 @@ fi
 
 [ -z "$OBS_KOURIER_FILE" ] || rm -rf "$(dirname "$OBS_KOURIER_FILE")"
 
+# --- 4d. A2A gate keys (only when the chart renders the gate) ---------------------------------------------------------
+# One static key per Kourier binding: Secret <ns>/<name> key <key> (the chart's tokenSecretRef) holds the key, created only when absent. The gate's hash
+# Secret holds SHA-256(key) per caller, applied with one field manager per key so a key never clobbers another and nothing else in the Secret is
+# touched. The hash is derived from the key Secret on every run, so the two always agree. Values never reach output, argv or disk.
+if [ -n "$A2A_GATE_DEP" ]; then
+  log "A2A gate keys"
+  GATE_NS=$(jq -r '.metadata.namespace' <<<"$A2A_GATE_DEP")
+  GATE_KEYS_S=$(jq -r '.spec.template.spec.volumes[]|select(.name=="keys")|.secret.secretName' <<<"$A2A_GATE_DEP")
+  GATE_KEYS_N=0
+  while IFS=$'\t' read -r gcaller gns gsec gkey; do
+    [ -n "$gcaller" ] || continue
+    mk_random_secret "$gns" "$gsec" "$gkey" 32
+    gh=$($K get secret -n "$gns" "$gsec" -o jsonpath="{.data.${gkey//./\\.}}" | base64 -d | shasum -a 256 | cut -d' ' -f1)
+    $K create secret generic "$GATE_KEYS_S" -n "$GATE_NS" --from-file="$gcaller"=<(printf '%s' "$gh") --dry-run=client -o yaml \
+      | $K apply --server-side --force-conflicts --field-manager="openagentix-a2a-key-$gcaller" -f - >/dev/null
+    unset gh; GATE_KEYS_N=$((GATE_KEYS_N+1))
+  done < <(jq -r 'select(.kind=="Binding" and .spec.identity.tokenSecretRef!=null)|[.metadata.annotations["openagentix.io/a2a-caller"],.metadata.namespace,.spec.identity.tokenSecretRef.name,(.spec.identity.tokenSecretRef.key//"token")]|@tsv' <<<"$RENDERED")
+  echo "Secret $GATE_NS/$GATE_KEYS_S: $GATE_KEYS_N key hash(es) (one per Kourier binding)"
+fi
+
 # --- 5. images ----------------------------------------------------------------------------------------------
 SET=()
 if [ "${SKIP_BRIDGE_IMAGE:-0}" != 1 ] && [[ "$BRIDGE_IMAGE" == openagentix/telegram-bridge:* ]]; then
@@ -369,6 +395,12 @@ if [ "${SKIP_NOTIFY_IMAGE:-0}" != 1 ] && [[ "$NOTIFY_IMAGE" == openagentix/notif
   docker build -q -t "$NOTIFY_IMAGE" services/notify >/dev/null
   kind load docker-image "$NOTIFY_IMAGE" --name "$CLUSTER"
 fi
+A2A_GATE_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${A2A_GATE_DEP:-null}" 2>/dev/null || true)
+if [ "${SKIP_A2A_GATE_IMAGE:-0}" != 1 ] && [[ "$A2A_GATE_IMAGE" == openagentix/a2a-gate:* ]]; then
+  log "a2a-gate image $A2A_GATE_IMAGE"
+  docker build -q -t "$A2A_GATE_IMAGE" services/a2a-gate >/dev/null
+  kind load docker-image "$A2A_GATE_IMAGE" --name "$CLUSTER"
+fi
 if [ -n "$BRIDGE_IMAGE" ]; then
   # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
   BRIDGE_HASH=$(cd bridges/telegram && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
@@ -390,6 +422,11 @@ if [ -n "$NOTIFY_DEP" ]; then
   SET+=(--set-string "notify.sourceHash=$NOTIFY_HASH")
   # No destination yet: the service is not Ready by design (it fails closed), and `helm --wait` must not wait for that.
   [ "$NOTIFY_NO_DEST" = 0 ] || SET+=(--set notify.requireReady=false)
+fi
+if [ -n "$A2A_GATE_DEP" ]; then
+  # Same for the gate: a hash of services/a2a-gate rolls the pod on a code change although the tag stays "dev".
+  A2A_GATE_HASH=$(cd services/a2a-gate && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name '*_test.go' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "governance.a2a.sourceHash=$A2A_GATE_HASH")
 fi
 if [ "${SKIP_SKILL:-0}" != 1 ] && jq -e 'select(.kind=="AgentTemplate")|.spec.skills[]?|select(.source.oci|test("/skills/openagentix-canary@"))' <<<"$RENDERED" >/dev/null; then
   log "example skill openagentix-canary"
@@ -461,6 +498,11 @@ if [ -n "$NOTIFY_DEP" ]; then
   log "notify"
   $K rollout status deployment/notify -n "$N_NS" --timeout=180s
   [ "$NOTIFY_NO_DEST" = 0 ] || echo "notify has no destination: calls are refused until you create Secret $N_NS/$N_DEST_S (README "Notifications") and run: $K rollout restart deployment/notify -n $N_NS"
+fi
+
+if [ -n "$A2A_GATE_DEP" ]; then
+  log "A2A gate"
+  $K rollout status deployment/a2a-gate -n "$GATE_NS" --timeout=180s
 fi
 
 log "waiting for agents (first start builds a golden snapshot, ~1-2 min each)"

@@ -27,6 +27,8 @@ if [ "${PURGE_SECRETS:-0}" = 1 ]; then   # read per-agent virtual key secret nam
 fi
 NOTIFYSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="Deployment" and .metadata.name=="notify")|.metadata.namespace as $ns|([.spec.template.spec.volumes[]?.secret.secretName]+[.spec.template.spec.containers[0].env[]?.valueFrom.secretKeyRef.name])|map(select(.!=null))|unique|.[]|$ns+"/"+.' 2>/dev/null || true)
 WHSECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r 'select(.kind=="ChatConnection" and .spec.platform=="webhook")|.metadata.namespace+"/"+.spec.credentialsSecretRef.name' 2>/dev/null || true)
+# A2A gate (governance.a2a): the key Secret of every Kourier binding and the gate's hash Secret, read before the release goes
+GATESECRETS=$(helm get manifest openagentix -n "$RELEASE_NS" 2>/dev/null | yq -r '(select(.kind=="Binding" and .spec.identity.tokenSecretRef!=null)|.metadata.namespace+"/"+.spec.identity.tokenSecretRef.name),(select(.kind=="Deployment" and .metadata.name=="a2a-gate")|.metadata.namespace as $ns|.spec.template.spec.volumes[]|select(.name=="keys")|$ns+"/"+.secret.secretName)' 2>/dev/null || true)
 if helm status openagentix -n "$RELEASE_NS" >/dev/null 2>&1; then
   helm uninstall openagentix -n "$RELEASE_NS" --wait
 else
@@ -35,6 +37,7 @@ fi
 KOURIER_NS=${KOURIER_NS:-agent-kourier} CLUSTER="$CLUSTER" KUBE_CONTEXT="$CTX" KUBECTL="$K" bash "$(dirname "$0")/components/channels/kourier.sh" uninstall
 if [ "${PURGE_SECRETS:-0}" = 1 ]; then
   for row in $WHSECRETS; do $K delete secret -n "${row%%/*}" "${row##*/}" --ignore-not-found; done
+  for row in $GATESECRETS; do $K delete secret -n "${row%%/*}" "${row##*/}" --ignore-not-found; done   # gate keys and their hashes
   for row in $VKEYS; do $K delete secret -n "${row%%/*}" "${row##*/}" --ignore-not-found; done
   $K delete configmap llm-api-keys -n agentgateway-system --ignore-not-found
   $K delete secret kb-admin kb-virtual-key -n openagentix-knowledge --ignore-not-found

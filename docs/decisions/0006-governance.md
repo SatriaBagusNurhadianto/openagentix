@@ -108,10 +108,10 @@ D gives the cleanest result: a verified caller and an allowed delegated user id 
    - `atenet-egress` (F4);
    - namespace `kagent`.
 
-   The bridge, Kourier, schedule and `extraA2ACallers` peers move to the gate's own ingress policy. The `kagent` namespace peer stays for now. Which of its pods really call 8083 (the UI, `kagent-tools`, the worker pool) is not verified, so narrowing it to pod labels is a follow-up after a log check. Until then, a pod in `kagent` can still impersonate a user. That is the same trust as today for that namespace, and it is stated in the docs.
+   The bridge, Kourier, schedule and `extraA2ACallers` peers move to the gate's own ingress policy. The `kagent` namespace peer stayed in round 1 and was narrowed to the UI pods after the review (see "Round 1 review and fixes").
 6. **How each caller authenticates:**
    - **Bridge:** a projected token volume (audience `openagentix-a2a`, `expirationSeconds: 3600`). The client reads the token file again on every request, because the kubelet rotates it. The bridge already sends a bearer token when one is set (`client.go:75-77`); it needs a file source instead of a fixed string. Rule: agent `bridge.agent`, user id prefix `bridge.userIdPrefix` (default `telegram:`).
-   - **Schedules:** one ServiceAccount per schedule (`schedule-<name>`) and a projected token volume. The pod keeps `automountServiceAccountToken: false` (`charts/openagentix/templates/schedules.yaml:76`); the projected volume is explicit. `tools/a2a-call` gets `A2A_TOKEN_FILE`. Rule: agent = the schedule's agent, user id exactly `schedule:<name>`. This also closes "anyone who can create a labelled pod there can call any agent" (`docs/diary/features/schedules.md:83`): such a pod has no token for another schedule's ServiceAccount.
+   - **Schedules:** one ServiceAccount per schedule (`schedule-<name>`) and a projected token volume. The pod keeps `automountServiceAccountToken: false` (`charts/openagentix/templates/schedules.yaml:76`); the projected volume is explicit. `tools/a2a-call` gets `A2A_TOKEN_FILE`. Rule: agent = the schedule's agent, user id exactly `schedule:<name>`. (Corrected after the round 1 review: this does **not** close "anyone who can create a labelled pod there can call any agent". Whoever may create pods in `openagentix-schedules` can mount a projected token of any ServiceAccount in that namespace and so act as any schedule. The boundary is the RBAC for creating pods in that namespace and in the bridge's. A per-schedule ServiceAccount only limits what one stolen token can do and makes the audit line name the schedule.)
    - **Kourier:** one static key per Binding, in a Secret in `openagentix-channels`, referenced by `identity.tokenSecretRef`. Rule: agent = the Binding's agent, user id fixed to the Binding's `userId`. The gate ignores whatever `X-User-Id` Kourier sends. Kourier refuses static `Authorization` and `X-User-Id` headers on the AgentBackend (live: `kubectl explain agentbackends.spec.headers`), so `tokenSecretRef` is the only way. Kourier's documentation calls it an "OIDC bearer token". Whether Kourier sends a non-JWT value unchanged is **not verified**. If it does not, the gate also accepts an HS256 JWT signed with a per-Binding key.
    - **Operator by hand:** `kubectl create token <sa> --audience openagentix-a2a` for a ServiceAccount listed in `a2aGate.callers`.
    - **Sandboxes:** unchanged (F4).
@@ -392,3 +392,52 @@ After the run the gate is on and healthy: `a2a-gate` 1/1 with no restart, the br
 - Behaviour with more than one gate replica, a gate restart during a long stream, and rotation of a Kourier key (a new key Secret value needs the hash Secret updated by `install.sh`, then the gate reads it within about a minute).
 - The `kagent` namespace peer on port 8083 is unchanged: a pod there can still impersonate a user.
 - A fresh install from an empty cluster with the gate on.
+
+## Round 1 review and fixes (2026-11-24)
+
+A security review of round 1 found one critical hole, three important problems and two smaller ones. All are fixed and were run on the kind cluster. Each fix started with a test that failed.
+
+### Findings and fixes
+
+**C1, critical: the kagent UI was an open relay around the gate.** No NetworkPolicy selected the `kagent-ui` pods. Its nginx proxies `/api/`, `/a2a/` and `/mcp` to the controller and passes `X-User-Id`, and the controller serves every API (memory, sessions, A2A) over gRPC-Web on that path. A pod in `default` got HTTP 200 from `POST /api/kagent.runtime.v1.MemoryService/List` on `kagent-ui:8080`. The hole existed with the gate off too, and the gate's own policy work did not touch it. The `kagent` namespace peer on port 8083 also admitted every pod of that namespace.
+
+- Fix: a new NetworkPolicy `openagentix-kagent-ui` selects the UI pods (`app.kubernetes.io/component=ui`, `app.kubernetes.io/name=kagent`) and admits nobody. `networkPolicy.kagentUI.allowFrom` lists peers (`namespace`, optional `podLabels`) for the UI port. It renders whenever `networkPolicy.enabled` is true, which is the default, so **the default render changed on purpose**. The 8083 policy now admits the UI pods by label instead of the whole `kagent` namespace.
+- Evidence for the narrowing: in the kagent source only the UI proxies to the controller from inside the namespace; `kagent-tools` has no controller URL (its settings are the tools port, metrics and Prometheus and Grafana URLs); the sandboxes get the controller URL as their control plane address and their traffic leaves through `atenet-egress`, which stays a peer. Live: after the change an agent turn through the gate completed, so the sandbox path works.
+- Proof on the cluster: the List probe with `X-User-Id: probe:none` and an empty body, from a pod in `default`, in `openagentix-gateway` and in `kagent`, timed out (curl exit 28, no HTTP status). `kubectl port-forward` to the UI still works with kindnet (root page and `/health` answered 200, `/api/version` through the UI answered 200, the UI pod stayed Ready with no new restart). Port-forward is the way to open the UI. A CNI that also filters the kubelet's connection would need `allowFrom`.
+- Not covered: the UI still proxies `/a2a/` and `/mcp` to the controller for anyone who may reach it, which is why the UI is closed rather than the gate being relied on. A pod of the controller calling its own Service was not seen in the source; if a future version does that, the narrowed policy would need the controller pods as a peer.
+
+**I1, important: cheap memory exhaustion of the gate.** Only `ReadHeaderTimeout` was set, headers could be 1 MiB, the body sniff took 64 KiB per request and waited with no deadline, and the pod limit is 64 MiB.
+
+- Fix: `MaxHeaderBytes` 16 KiB (431 above it); a read deadline of 10 s for the start of the body, set with `http.NewResponseController` and cleared before the request is proxied, so long uploads and streams are not cut (408, `reason: body_timeout`); at most `A2A_GATE_MAX_INFLIGHT` (default 128, chart `governance.a2a.maxInFlight`) requests at once, the next gets 503 with `Retry-After` and `reason: busy`; the sniff buffer follows `Content-Length`.
+- A bug found on the way: after a read timeout the server waited for the rest of the body before it answered, so the 408 never arrived. The gate now sets `Connection: close` on that answer.
+- Live: a 30000 byte header got 431.
+
+**I2, important: TokenReview amplification and cache flush.** Any three-part string cost an API call, there was no limit, and the cache emptied itself at 2048 entries.
+
+- Fix: bearer values over 8 KiB are refused; the unverified payload must name our audience, have `iss` and a future `exp` before a TokenReview is made; one review per token at a time (singleflight), at most 8 at once with a 2 s wait that then fails closed with 503; good and refused answers live in separate bounded maps, so a flood of bad tokens cannot evict a good entry.
+
+**I3, important, documentation: a wrong claim.** The ADR said a ServiceAccount per schedule closes "any labelled pod can call any agent". It does not. Whoever can create pods in `openagentix-schedules` (or in the bridge's namespace) can mount a projected token of any ServiceAccount there. The ADR, `security.md`, `schedules.md` and the README now say the boundary is the RBAC for creating pods in those namespaces. A per-schedule ServiceAccount limits what one token can do and puts the schedule's name in the audit line. A ValidatingAdmissionPolicy that ties a pod to its own ServiceAccount is a possible later step and is **not built**.
+
+**M1: the claimed user id was audited before authentication.** It is now recorded only after the caller is authenticated (an unauthenticated line carries none), and cut to 128 bytes.
+
+**M2: every JSON-RPC method passed.** Each caller now has a method list; the default is `SendMessage` and `SendStreamingMessage`. Evidence for what the chart's own callers use: the bridge and `a2a-call` send `SendMessage` only; Kourier 0.6.0 (read in its source: `internal/agent/agent.go`) sends `SendStreamingMessage`, and also uses `GetTask`, `SubscribeToTask` and `CancelTask`. The chart sets those lists, and `governance.a2a.callers[].methods` can set a list for an extra caller. A method outside the list gets 403 with `reason: method`; the audit line has the method in `rpc`.
+
+- The method is read from the body, so on the JSON-RPC route the whole body must fit in the sniff window (64 KiB by default, `A2A_GATE_SNIFF_BYTES` up to 1 MiB) and be one object with exactly one `method` string. Anything else fails closed (403, `reason: method`): a larger body, a batch, a body that is not JSON, no or two `method` members (names are compared without case, as Go's decoder does, so a second member cannot hide one), data after the object. This also closes a trick where a second `method` member after the window would be read by the agent. Messages above the window can use the REST routes (`message:send`, `message:stream`), which name their method in the path and are not limited by the window.
+- Live: `GetTask` as a schedule got 403 with `reason: method` and `rpc: GetTask`.
+
+**Extra: the audit `context_id` was always empty.** The extraction itself works for the real request shape. A test with the body the bridge builds (a map with `jsonrpc`, `id`, `method` and `params.message`, where `contextId` is left out for a first message) shows the id for a follow-up. It was empty in the live logs because every live request was a first message (schedules always start a new conversation; the bridge had no traffic). Live proof: a follow-up with the `contextId` of the first answer showed that id in the audit line. The extraction is now exact (it reads `params.message.contextId` from the parsed body), so an id in metadata or in the text is not taken.
+
+### What was proven live
+
+- The canary: the UI List probe from `default`, `openagentix-gateway` and `kagent` timed out; the UI answered through port-forward; the UI pod kept running.
+- Two model calls in all: a schedule's turn through the gate (`TASK_STATE_COMPLETED`, 18.9 s) and one follow-up in the same conversation (HTTP 200, the id in the audit line).
+- Through the gate: `GetTask` 403 (`method`), a 30000 byte header 431, no token 401, the agent card of both Kourier bindings 200 after the new pod started.
+- Tests: chart 722 assertions, gate 51 tests with `-race`, no failures.
+
+### Not verified
+
+- A Kourier turn after the change. The Kourier bindings call the agent card through the new gate (200), but no signed webhook was sent after the roll-out, so the exact methods Kourier sends during a turn are taken from its source, not from a live run. A binding that needs a method outside its list shows up as `reason: method` in the audit line.
+- Memory use of the gate under load (the cap was tested, not the 64 MiB limit).
+- The narrowed 8083 policy with a feature that calls the controller from a `kagent` pod other than the UI. None was found in the source or in the cluster.
+- Whether the UI works for a user who reaches it by a route other than port-forward (an ingress needs `allowFrom`).
+- A ValidatingAdmissionPolicy for pod ServiceAccounts: not built.

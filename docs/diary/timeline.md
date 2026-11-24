@@ -157,3 +157,14 @@ ADR 0006 round 1 is built and run on the kind cluster. A small proxy, `a2a-gate`
 - Not verified: a real Telegram turn through the gate (no message was sent), kubelet token rotation, streaming through the real controller. The `kagent` namespace can still call 8083 directly.
 - The node load went above 20 for a few minutes during the run, from the node's own probes and other work on the host; the gate pod never restarted.
 
+## 2026-11-24: review of the A2A gate, round 1 fixes
+
+A security review of governance round 1 found a critical hole and several smaller ones. All are fixed and were run on the kind cluster.
+
+- Critical: the kagent UI was an open relay around the gate. Nothing selected its pods, its nginx forwards `X-User-Id`, and the controller serves its whole API over gRPC-Web on `/api/`. A pod in `default` got 200 on the memory List call, with the gate on or off. The UI now has a deny-all NetworkPolicy (`networkPolicy.kagentUI.allowFrom` lists exceptions), and port 8083 admits the UI pods instead of the whole `kagent` namespace. Proven: the probe from `default`, `openagentix-gateway` and `kagent` timed out; `kubectl port-forward` to the UI still works under kindnet. The default render changed on purpose.
+- The gate got memory and API limits: 16 KiB headers, a read deadline for the start of a body, a cap on requests in flight, a size limit and a payload pre-check before TokenReview, singleflight and a concurrency limit on reviews, and separate caches for good and bad tokens.
+- Each caller has a method list (the chart sets what its callers really send; the default is `SendMessage` and `SendStreamingMessage`). A method outside the list, or a body whose method cannot be determined, gets 403 with `reason: method`.
+- The claimed user id is audited only after authentication. The audit `context_id` was empty only because every live request was a first message: a follow-up showed its id.
+- A wrong claim in the docs was corrected: a ServiceAccount per schedule does not stop someone who can create pods in the schedules namespace from acting as any schedule.
+- One bug on the way: after a read timeout the server waited for the rest of the body, so the 408 never arrived. Fixed with `Connection: close`.
+- Two model calls: a schedule turn through the gate and a follow-up in the same conversation. Not verified: a Kourier turn after the change.

@@ -80,6 +80,6 @@ The log is one line like `{"state":"TASK_STATE_COMPLETED","taskId":...,"duration
 - Every firing costs at least one model call. A `* * * * *` schedule spends tokens every minute. The demo schedule is suspended.
 - Do not put secrets in a prompt: it is stored in a ConfigMap and sent to the model provider.
 - kindnet enforces the egress policy for cluster destinations but not for the internet: a labelled pod still reached example.com. Calico or Cilium enforce it fully.
-- Anyone who can create pods with the schedule label in `openagentix-schedules` can call any agent.
+- With the A2A gate on, each schedule has its own ServiceAccount and token, but that does not keep a pod out: whoever can create pods in `openagentix-schedules` can mount the token of any schedule ServiceAccount there and act as that schedule (and without the gate, anyone who can create a pod with the schedule label can call any agent). The boundary is RBAC for creating pods in that namespace. A ValidatingAdmissionPolicy that ties each pod to its own ServiceAccount is a possible later step and is not built.
 - `X-User-Id` is an unauthenticated claim on port 8083.
 - ADR 0002 says to re-test kagent's own scheduler on versions newer than 1.0.1 and to open an upstream issue for the two problems it saw.

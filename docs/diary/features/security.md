@@ -16,7 +16,7 @@ Controls, from the outside in:
 
 1. **Telegram allowlist.** The bridge refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS`.
 2. **Virtual keys.** Agents hold a gateway key, never the provider key.
-3. **NetworkPolicies** (chart `networkPolicy.enabled`, default on) for `mcp-tools`, the kagent controller port 8083, the knowledge namespace, notify, schedules and Kourier.
+3. **NetworkPolicies** (chart `networkPolicy.enabled`, default on) for `mcp-tools`, the kagent controller port 8083, the kagent UI (closed to every pod), the knowledge namespace, notify, schedules and Kourier.
 4. **Actor JWT** on the tool layer (vMCP `incomingAuth.type: oidc`).
 5. **Cedar** tool allowlist (optional `toolAccess`).
 
@@ -57,9 +57,9 @@ Call the vMCP without a token from a pod: expect 401 from inside `mcp-tools`, a 
 
 By default anything the NetworkPolicy admits can call the kagent controller on port 8083 and name its own user with `X-User-Id`. The A2A gate closes that for the callers the chart knows. It is off by default (`governance.a2a.enabled: false`) and with it off nothing changes: every default and demo render is byte-identical to the one before.
 
-What it is: a small Go reverse proxy (`services/a2a-gate`, standard library only) in `openagentix-gateway`. With the gate on, port 8083 admits only the gate, the Substrate egress proxy and the `kagent` namespace. The bridge, every schedule and every Kourier binding call the gate, and each proves who it is:
+What it is: a small Go reverse proxy (`services/a2a-gate`, standard library only) in `openagentix-gateway`. With the gate on, port 8083 admits only the gate, the Substrate egress proxy and the kagent UI pods. The bridge, every schedule and every Kourier binding call the gate, and each proves who it is:
 
-- **Bridge and schedules:** a projected ServiceAccount token with the audience `openagentix-a2a` (one ServiceAccount per schedule). The gate checks it with a Kubernetes TokenReview and caches a positive answer for 30 seconds. The bridge and `a2a-call` read the token file again on every request, because the kubelet rotates it.
+- **Bridge and schedules:** a projected ServiceAccount token with the audience `openagentix-a2a` (one ServiceAccount per schedule, so a token is limited to one schedule's agent and user id and the audit line names it; this does not stop someone who can create pods in `openagentix-schedules` from mounting any of those ServiceAccounts, see Limits). The gate checks it with a Kubernetes TokenReview and caches a positive answer for 30 seconds. The bridge and `a2a-call` read the token file again on every request, because the kubelet rotates it.
 - **Kourier bindings:** a static key per binding. Kourier sends it as `Authorization: Bearer` (and then no `X-User-Id`). The gate compares its SHA-256 with the hashes in a Secret. `install.sh` creates both and never prints them.
 
 ```mermaid
@@ -85,7 +85,10 @@ What the gate does for each request:
 
 Limits, stated plainly:
 
-- The `kagent` namespace peer on port 8083 is not narrowed yet. A pod in that namespace can still call the controller directly and name any user. Which of its pods really call 8083 is not verified.
+- The `kagent` namespace peer on port 8083 was narrowed after the review of round 1: only the UI pods (by label), the egress proxy and the gate (or the callers, with the gate off) are peers. The UI itself is closed to every pod, so it is not a way around the gate (see the next section).
+- Whoever can create pods in `openagentix-schedules` or in the bridge's namespace can mount the token of any ServiceAccount there. A ServiceAccount per schedule limits one token and names the schedule in the audit line; it is not a boundary between pods. Keep the RBAC for creating pods in those namespaces tight. A ValidatingAdmissionPolicy that ties a pod to its own ServiceAccount is a possible later step and is not built.
+- A caller may use only the JSON-RPC methods in its rule. On the JSON-RPC route the whole body must fit in `A2A_GATE_SNIFF_BYTES` (64 KiB by default) and carry one `method`; otherwise the gate answers 403 (`reason: method`). Larger messages use the REST routes.
+- The gate caps itself: headers 16 KiB, 10 s for the start of a body, 128 requests at once, TokenReview limits and a pre-check of the token payload.
 - The gate trusts the Kubernetes API for tokens. A key in a Secret is as safe as read access to that Secret.
 - One replica, no rate limit, no revocation before a token expires (at most one hour for projected tokens).
 - `extraA2ACallers` with the gate on needs a matching rule in `governance.a2a.callers`, or the render fails.
@@ -100,10 +103,27 @@ governance:
 
 Try it with `VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/governance/demo-values.yaml" ./install.sh`. Evidence from the live run is in ADR 0006, "Round 1 results".
 
+## The kagent UI is closed
+
+The kagent UI proxies `/api/`, `/a2a/` and `/mcp` to the controller and forwards `X-User-Id`, and the controller serves memory, sessions and A2A over gRPC-Web on that path. A pod that reached the UI could therefore do what the gate refuses, with the gate on or off. Before the review of round 1 nothing selected the UI pods, and a pod in `default` got HTTP 200 on the memory List call.
+
+Now `openagentix-kagent-ui` selects the UI pods and admits nobody. Open the UI with `kubectl port-forward -n kagent svc/kagent-ui 8080:8080`: the kubelet connects inside the pod's network namespace, and this works under kindnet (the UI pod also stayed Ready). To let a pod or a proxy in, list it:
+
+```yaml
+networkPolicy:
+  kagentUI:
+    allowFrom:
+      - namespace: ops
+        podLabels: {app: proxy}   # optional; without it every pod of the namespace
+```
+
+This changes the default render on purpose, because it closes a hole. Set `networkPolicy.enabled: false` only if you accept that.
+
 ## What was proven
 
 - `mcp-tools`: a pod in `default` or another namespace timed out; backends and proxies accept only their own namespace and the ToolHive operator; the vMCP also accepts `atenet-egress` and the controller pod.
-- Port 8083 accepts the bridge pod (label `app=telegram-bridge`), the `kagent` namespace, `atenet-egress` and Kourier; other pods time out.
+- Port 8083 accepts the bridge pod (label `app=telegram-bridge`), the kagent UI pods, `atenet-egress` and Kourier; other pods time out.
+- The kagent UI accepts no pod: the memory List call from `default`, `openagentix-gateway` and `kagent` timed out; `kubectl port-forward` to the UI still answers (checked on kind, round 1 review).
 - vMCP: 401 without a valid token, also for a malformed token. No `insecure*` flag is set.
 - Cedar: with `osv_query_vulnerability` left out of `toolAccess`, deny was logged for it and allow for the others.
 - Knowledge namespace: three timeouts from `default`, three from another pod in the namespace, and one from a non-vMCP pod in `mcp-tools`.
@@ -111,7 +131,7 @@ Try it with `VALUES_FILE="components/channels/demo-values.yaml components/schedu
 
 ## What is NOT protected
 
-- **The kagent controller does not authenticate callers** (`server.auth.mode: insecure`). The opt-in A2A gate (section above) authenticates the bridge, the schedules and Kourier in front of it; a pod in the `kagent` namespace can still call the controller directly. Setting `serviceAccount.authority: kubernetes` was tried: requests with no token or a garbage token still got 200. It was reverted. Any pod the NetworkPolicy lets through can call any agent, and can claim any `X-User-Id`.
+- **The kagent controller does not authenticate callers** (`server.auth.mode: insecure`). The opt-in A2A gate (section above) authenticates the bridge, the schedules and Kourier in front of it; the controller can still be called directly by anything the NetworkPolicy admits (the UI pods, the egress proxy). Setting `serviceAccount.authority: kubernetes` was tried: requests with no token or a garbage token still got 200. It was reverted. Any pod the NetworkPolicy lets through can call any agent, and can claim any `X-User-Id`.
 - **No per-agent tool authorization.** Cedar tells sessions and atespaces apart, not agents. Default policy is permit-all for any authenticated caller. Whether code in a sandbox (for example through `bash`) could call the vMCP directly was not tested; assume it can.
 - A valid actor JWT works until it expires (up to 3600 seconds). No revocation.
 - **Global tool discovery is off** with `actorJwt` (`DiscoveryDisabled`).

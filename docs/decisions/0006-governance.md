@@ -1,6 +1,6 @@
 # ADR 0006: Governance (who may call an agent, which tools it may use, where it may connect, what it remembers, what is recorded)
 
-- **Status:** Proposed. Nothing here is implemented. It records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
+- **Status:** Round 1 (the A2A gate) is implemented, opt-in and proven on kind: see "Round 1 results" at the end. Rounds 2 and 3 are proposed and not started. The ADR records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
 - **Date:** 2026-11-24
 - **Evidence:** source of the pinned releases, read in local clones: kagent v1.0.1 (commit `558e3d7`), Agent Substrate v1.0.1 (`7ce6f439`), agentgateway v1.7.0 (`26f5aeb`), ToolHive v0.67.1 (tag clone). Paths below are relative to each repository root and prefixed with the project name. Read-only `kubectl` on the kind cluster `kind-openagentix` for three facts (marked "live"). No model call, no Telegram message, no database connection was made for this record.
 
@@ -323,3 +323,64 @@ memory:
 - That `aggregation.tools[].filter` applies to `MCPServerEntry` backends (`knowledge`, `delivery`) as it does to `MCPServer` workloads.
 - The memory and CPU of one extra vMCP pod.
 - Whether gofetch can be limited to a host allowlist.
+
+## Round 1 results (2026-11-24)
+
+Round 1 is built, tested and run on the kind cluster. Rounds 2 and 3 are not started. The gate is **off by default** and is **on** in the demo cluster after this run.
+
+### What was built
+
+- `services/a2a-gate`: a Go reverse proxy with no dependency outside the standard library (33 tests with `-race`; coverage 90% for the proxy, 80% for authentication). It follows Question 1, items 2 to 5 and 7:
+  - A projected ServiceAccount token is checked by a TokenReview for the audience `openagentix-a2a` (a good answer cached 30 s, a refusal 5 s). A static key is matched by its SHA-256 against the files of a mounted Secret.
+  - Each caller has a rule: the agents it may reach and a user id rule (`exact`, `prefix` or `fixed`). The rules file is strict JSON; an unknown field stops the gate at start.
+  - Only `POST /agents/<ns>/<name>` (also `message:send` and `message:stream`, with or without `/v1`) and the agent card `GET` pass. Everything else gets 403, `application/grpc*` included. The gate removes `Authorization`, the whole query string, `Cookie`, `Baggage`, the `X-Forwarded-*` headers and a few identity headers, and sets `X-User-Id` itself.
+  - SSE passes with `FlushInterval: -1`; a test proves that the first event arrives before the second is written.
+  - One audit line per request: time, caller, agent, user id (salted hash `h:` and 8 hex digits, or raw), `contextId`, trace id, status, duration, method and, for a refusal, a `reason` from a closed set. At most 64 KiB of the body is read to find `contextId` (`A2A_GATE_SNIFF_BYTES`); the body is never logged and is passed on whole.
+- Chart: `governance.a2a` and `templates/governance.yaml`, as in the values sketch, with one addition: `sourceHash` (the same rollout trick as the other services). Callers authenticate as designed: projected token volumes for the bridge and for each schedule (one ServiceAccount per schedule, `automountServiceAccountToken: false` kept), `tokenSecretRef` on every Kourier Binding, AgentBackend, bridge and schedule URLs at the gate, the changed port-8083 policy, the gate ingress policy, and the render failure for `extraA2ACallers` without a rule. 78 new chart assertions (703 in all, 0 failing).
+- `bridges/telegram` and `tools/a2a-call`: `A2A_TOKEN_FILE`, read again on every request; a missing or empty file is a clear error and nothing is sent.
+- `install.sh` and `uninstall.sh`: image build and load, one key Secret per Kourier binding (`a2a-key-<binding>`, created only when absent) and the hash Secret `a2a-gate-keys` (derived from the key Secrets on every run, one field manager per key), all before the one `helm upgrade`. `PURGE_SECRETS=1` removes them.
+- `components/governance/demo-values.yaml` turns the gate on.
+
+### Compatibility check
+
+The default render and nine demo or option renders (default, channels, schedules, notify, observability, graph, all five demo files together, bench, `extraA2ACallers`, and `networkPolicy.enabled=false` with channels and schedules), each with and without the Kourier API version, were rendered from `HEAD` (a `git archive` copy) and from the working tree and compared with `cmp`: 20 of 20 identical.
+
+### Live canary (kind, context `kind-openagentix`)
+
+Steps 1 to 4 of the canary. Two model calls were made in all (the agent turn of step 3 and the one of step 4; the gateway log shows two chat completions).
+
+1. **Direct call and no token.** A pod with the bridge's labels calling `kagent-controller:8083` timed out (curl exit 28 after 6 s). The gate answered 401 without a token and 401 with a garbage token. Passed.
+2. **A bridge token claiming another identity.** A token of the bridge's ServiceAccount (`kubectl create token`, audience `openagentix-a2a`) that sent `X-User-Id: schedule:demo-brief` got 403 (audit `reason: user_id`). The same token got 403 with no user id, 200 for the agent card of `assistant`, 403 for the card of another agent, 403 for gRPC to `MemoryService/List`, 403 for gRPC-Web on the agent path and 403 for `/api/sessions`. A token with the default audience got 401. Passed.
+3. **A schedule through the gate.** A Job built from the CronJob `demo-brief` (its ServiceAccount, projected token, A2A URL and user id `schedule:demo-brief`) reached `TASK_STATE_COMPLETED` in 21.7 s. Audit line: `caller: schedule-demo-brief`, `agent: kagent/assistant`, `user_id: h:713e157c`, status 200, 21555 ms, and the trace id the Job printed. Passed (see the deviation below).
+4. **A signed webhook through the gate.** A signed `question.asked` event to `demo-webhook` was accepted (HTTP 200), Kourier logged `session turn ended` with `outcome: completed`, and the gate logged `caller: kourier-demo-assistant`, user id `h:98845f7b` (the gate fixed it to the Binding's id), status 200, 10459 ms, the same trace id as Kourier's. Before that, both Bindings went `Ready=True` through the gate with their static keys (the agent card, status 200). Passed.
+
+After the run the gate is on and healthy: `a2a-gate` 1/1 with no restart, the bridge 1/1 with its projected token and the gate URL, both Bindings Ready, the agent Ready.
+
+### Findings
+
+- **Kourier 0.6.0 sends the static key unchanged.** In its source (`internal/identity/token.go`, `internal/dialect/kagentv1/kagentv1.go`) the value of `identity.tokenSecretRef` is read from the Secret on every call (any non-empty value without control characters) and sent as `Authorization: Bearer <value>`. It sends `X-User-Id` only when there is no token, never both. So no JWT is needed and the HS256 fallback was not built. The live run confirmed it.
+- **A Secret mounted for a non-root user needs `fsGroup`.** The first gate pod had no `fsGroup`, so the key hashes (mode 0440) were unreadable and every Kourier call got 401. Root cause found from the audit line (`reason: bad_token`), fixed with `fsGroup: 65532`, a chart test, and a warning in the gate for any key file it cannot use (`key hash file unusable`, once per file).
+- **Kourier checks a Binding only every 5 minutes.** After the fix the Bindings turned Ready about 5 minutes later, not at once.
+- The Kourier broker needs `list` and `watch` on the key Secrets: the chart adds `a2a-key-<binding>` to the `resourceNames` of the existing Role.
+- The Kourier egress policy (marker ConfigMap) and the schedule egress policy had to point at the gate, or the callers would have been cut off by their own policies.
+
+### Deviations from this ADR, and why
+
+- **No `client-go`.** The gate calls the TokenReview REST endpoint with the standard library. That keeps the image and the module free of dependencies, and the fake is a plain `httptest` server.
+- **JSON rules, no YAML.** The rules ConfigMap is JSON, so the gate needs no YAML library.
+- **The whole query string is dropped,** not only `user_id`. A2A uses no query, and an allow-nothing rule is easier to trust.
+- **Canary step 3 used a different prompt.** The demo schedule's own prompt ends by delivering a message to the owner's Telegram chat through notify. No Telegram message was to be sent, so the Job was made from the CronJob's pod template with the same ServiceAccount, token, URL and user id, but the prompt "Reply with exactly one word: pong. Do not use any tool." and no prompt volume. The path through the gate is the same. Canary step 4 used the same short question for the same reason.
+- **Metrics were not added** to the gate (the audit line is the record for round 1).
+- **The agent card `GET` carries no user id** upstream when the rule is `prefix`; with `exact` or `fixed` the gate sets it.
+- Added beyond the ADR, to close small holes: `Cookie`, `Baggage`, `X-Agent-Name`, `X-Share-Token`, `X-Kagent-Insecure-Runtime-Identity` and `X-Forwarded-*` are removed; request bodies over 8 MiB get 413; the gate answers 503 when TokenReview itself fails (it fails closed).
+
+### Not verified
+
+- The bridge calling the gate end to end. The bridge pod runs with the projected token and the gate URL and is Ready, and its ServiceAccount's token is accepted by the gate (step 2), but no Telegram message was sent, so a real chat turn through the gate was not run. It is covered by the client tests (token re-read, missing file).
+- Token rotation by the kubelet (the file is read again on every request; no one-hour wait was done).
+- SSE through the real controller. Flushing is tested against a fake upstream; no streaming request was sent live.
+- Which `message:send` and `message:stream` REST paths kagent really serves. They are allowed because A2A 1.0 defines them; only the JSON-RPC `POST` and the card `GET` were seen live.
+- That the Substrate egress proxy still reaches port 8083 (F4) with the new policy. The agents answered in steps 3 and 4, which suggests the sandboxes still reach the controller through `atenet-egress`, but the actor-JWT injection itself was not inspected.
+- Behaviour with more than one gate replica, a gate restart during a long stream, and rotation of a Kourier key (a new key Secret value needs the hash Secret updated by `install.sh`, then the gate reads it within about a minute).
+- The `kagent` namespace peer on port 8083 is unchanged: a pod there can still impersonate a user.
+- A fresh install from an empty cluster with the gate on.

@@ -144,3 +144,16 @@ The owner decided to stay on kagent 1.0.1, so the three weak points of ADR 0005 
 - Layout change before publishing: the kagent and Substrate bring-up moved to `components/runtime/`, the benchmark harness to `components/bench/compare/`. Exploratory spike code and the original product brief are not part of the public repository.
 - Memory saving stays automatic (owner decision). The save-on-request variant is documented in ADR 0005.
 - Not verified: a fresh install from an empty cluster after the layout change. Syntax checks, chart tests (625) and a re-run of the installer on the existing cluster passed.
+
+## 2026-11-24: the A2A gate (governance round 1)
+
+ADR 0006 round 1 is built and run on the kind cluster. A small proxy, `a2a-gate`, now stands in front of the kagent controller's port 8083 when `governance.a2a.enabled` is true. It is off by default and the default and demo renders are byte-identical to before (20 of 20 `cmp` checks).
+
+- What changes: the bridge and every schedule send a projected ServiceAccount token (one ServiceAccount per schedule); each Kourier binding sends its own static key. The gate checks the caller, allows only the agents and user ids in the caller's rule, answers 403 for gRPC and everything that is not A2A, sets `X-User-Id` itself and writes one audit line per request (user id hashed).
+- Proven live, with two model calls: no token gives 401; a pod with the bridge's labels cannot reach port 8083 any more; a bridge token that claims `schedule:demo-brief` gets 403; a schedule Job completed through the gate; a signed webhook ended with `outcome=completed` through the gate.
+- Kourier 0.6.0 sends the key from `identity.tokenSecretRef` unchanged as a bearer token, so no JWT was needed.
+- One bug on the way: the gate pod had no `fsGroup`, so it could not read its mounted key hashes and every Kourier call got 401. Found from the audit reason, fixed, and the gate now warns about a key file it cannot read.
+- Kourier re-checks a binding every 5 minutes, so the bindings turned Ready about 5 minutes after the fix.
+- Not verified: a real Telegram turn through the gate (no message was sent), kubelet token rotation, streaming through the real controller. The `kagent` namespace can still call 8083 directly.
+- The node load went above 20 for a few minutes during the run, from the node's own probes and other work on the host; the gate pod never restarted.
+

@@ -445,12 +445,24 @@ Skill references must be digest-pinned (`...@sha256:<64 hex>`); the render fails
 charts/openagentix/tests/run.sh      # shell assertions over `helm template`, needs helm, yq, jq
 helm lint charts/openagentix
 (cd tools/a2a-call && make test)     # the schedule caller: go vet, go test -race
+(cd services/a2a-gate && make test)  # the A2A gate: go test -race, standard library only
 (cd bridges/telegram && go test -race ./...)
 ```
 
 ## Adopting an existing hand-applied install
 
 If the cluster already holds hand-applied copies of the objects this chart renders, `install.sh` labels and annotates them for Helm (`app.kubernetes.io/managed-by=Helm`, `meta.helm.sh/release-*`), runs `helm upgrade --install`, then converges them with a server-side apply. Nothing is deleted or recreated. Helm alone would leave adopted custom resources unchanged. Objects the chart does not render (old stub models, test agents, a second policy) are left alone; remove them yourself.
+
+## A2A gate (opt-in)
+
+Off by default. With `governance.a2a.enabled: true` a small proxy (`services/a2a-gate`) stands in front of the kagent controller's A2A port, so a caller proves who it is and can no longer name any user it likes. The bridge and every schedule send a projected ServiceAccount token (one ServiceAccount per schedule); each Kourier binding sends its own static key. The chart derives a rule per caller: the agents it may call and the user ids it may assert (the bridge: the prefix `telegram:`; a schedule: exactly `schedule:<name>`; a Kourier binding: fixed). Everything except `POST /agents/<ns>/<name>` and the agent card gets 403, gRPC and the REST API included. The gate sets `X-User-Id` itself, removes `Authorization` and `?user_id=`, passes SSE through, and writes one JSON audit line per request (user id as a salted hash, never the message text). Port 8083 then admits only the gate, the Substrate egress proxy and the `kagent` namespace.
+
+```sh
+VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/governance/demo-values.yaml" ./install.sh
+kubectl logs -n openagentix-gateway deploy/a2a-gate     # the audit lines
+```
+
+`install.sh` builds the image, creates the Kourier keys and their hashes (kept on re-runs, never printed) and applies the gate and the callers in one `helm upgrade`. `networkPolicy.extraA2ACallers` needs a matching `governance.a2a.callers` entry with the gate on, or the render fails. What it does not cover (the `kagent` namespace peer, one replica, no revocation): `docs/diary/features/security.md` and ADR 0006 (`docs/decisions/0006-governance.md`).
 
 ## Security
 
@@ -466,7 +478,7 @@ What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy)
 
 **Not protected**
 
-- **The kagent controller does not authenticate callers.** `server.auth.mode` is `insecure`. Enabling `config.server.auth.serviceAccount.authority: kubernetes` was tried and does not help: requests with no token and with a garbage token were still answered (HTTP 200); only a valid Kubernetes token with the wrong audience was refused (401). Any pod the NetworkPolicy lets through can call any agent. The policy is the only control, and it allows all of the `kagent` namespace and all sandboxes (their traffic leaves through `atenet-egress`, which therefore cannot be told apart from one agent to the next).
+- **The kagent controller does not authenticate callers.** `server.auth.mode` is `insecure`. The opt-in A2A gate (above) puts authentication in front of it for the bridge, the schedules and Kourier; without it, or for a pod in the `kagent` namespace, this still holds. Enabling `config.server.auth.serviceAccount.authority: kubernetes` was tried and does not help: requests with no token and with a garbage token were still answered (HTTP 200); only a valid Kubernetes token with the wrong audience was refused (401). Any pod the NetworkPolicy lets through can call any agent. The policy is the only control, and it allows all of the `kagent` namespace and all sandboxes (their traffic leaves through `atenet-egress`, which therefore cannot be told apart from one agent to the next).
 - **No per-agent tool authorization.** kagent creates one Substrate actor per session (`actor/kagent/session-<uuid>`) in the atespace `kagent`, for every agent. Cedar can tell sessions and atespaces apart, not agents. The default Cedar policy is permit-all for any authenticated caller. Only the agent's tool allowlist in its AgentTemplate limits which tools an agent offers to its model. Whether code running in a sandbox (for example through the `bash` tool) could call the vMCP directly, with the token the egress proxy injects for that destination, was not tested; assume it can.
 - Anything with an actor JWT can present it to the vMCP until it expires (up to `tokenExpirationSeconds`, 3600). There is no revocation.
 - **Global tool discovery is off.** With `actorJwt` the RemoteMCPServer shows `Accepted` with reason `DiscoveryDisabled`; agents list the tools at run time inside their sandbox. Set `incomingAuth.type=anonymous` to get the controller-side discovery back.

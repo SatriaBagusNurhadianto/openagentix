@@ -53,6 +53,53 @@ Needs a CNI that enforces NetworkPolicy. kindnet on kind 1.37 does for ingress.
 
 Call the vMCP without a token from a pod: expect 401 from inside `mcp-tools`, a timeout from `default`. From a pod in `default`, calls to the knowledge base, its database and the embedding server time out. A request to `/v1/embeddings` on the gateway without a key gets 401. `components/tools/verify/run-mcp-check.sh` now gets 401 unless `incomingAuth.type=anonymous`.
 
+## The A2A gate (opt-in, ADR 0006 round 1)
+
+By default anything the NetworkPolicy admits can call the kagent controller on port 8083 and name its own user with `X-User-Id`. The A2A gate closes that for the callers the chart knows. It is off by default (`governance.a2a.enabled: false`) and with it off nothing changes: every default and demo render is byte-identical to the one before.
+
+What it is: a small Go reverse proxy (`services/a2a-gate`, standard library only) in `openagentix-gateway`. With the gate on, port 8083 admits only the gate, the Substrate egress proxy and the `kagent` namespace. The bridge, every schedule and every Kourier binding call the gate, and each proves who it is:
+
+- **Bridge and schedules:** a projected ServiceAccount token with the audience `openagentix-a2a` (one ServiceAccount per schedule). The gate checks it with a Kubernetes TokenReview and caches a positive answer for 30 seconds. The bridge and `a2a-call` read the token file again on every request, because the kubelet rotates it.
+- **Kourier bindings:** a static key per binding. Kourier sends it as `Authorization: Bearer` (and then no `X-User-Id`). The gate compares its SHA-256 with the hashes in a Secret. `install.sh` creates both and never prints them.
+
+```mermaid
+flowchart LR
+  B["Telegram bridge"] -->|"projected token"| G["a2a-gate"]
+  S["Schedule pod"] -->|"its own projected token"| G
+  K["Agent Kourier"] -->|"static key per binding"| G
+  G -->|"TokenReview, cached 30 s"| API["Kubernetes API"]
+  G -->|"only POST agents/ns/name and the agent card; X-User-Id set by the gate"| C["kagent controller :8083"]
+  G -.->|"stdout, one line per request"| A["Audit line"]
+  X["Any other pod"] -.->|"times out"| C
+  G -.->|"gRPC, gRPC-Web, REST API: 403"| C
+```
+
+What the gate does for each request:
+
+1. No token, a wrong audience or an expired token gets 401.
+2. The caller's rule lists the agents it may reach and the user ids it may assert: `exact`, `prefix` (the bridge: `telegram:`) or `fixed` (a Kourier binding: the gate sets it and ignores what was sent). A bridge token that claims `schedule:demo-brief` gets 403.
+3. Only `POST /agents/<namespace>/<name>` (and `message:send` and `message:stream` below it) and the agent card `GET` pass. gRPC, gRPC-Web and the REST API get 403, so the controller's memory and session APIs are not reachable through it.
+4. `Authorization`, the whole query string (kagent reads `?user_id=` before the header), `Cookie`, `Baggage` and a few identity headers are removed, and `X-User-Id` is set by the gate.
+5. SSE passes through with an immediate flush.
+6. One JSON audit line goes to stdout: time, caller, agent, user id, `contextId`, trace id, status, duration. The user id is a salted hash by default (`governance.a2a.audit.userId: raw` shows it). The message text is never read beyond a bounded look for `contextId`, and never logged.
+
+Limits, stated plainly:
+
+- The `kagent` namespace peer on port 8083 is not narrowed yet. A pod in that namespace can still call the controller directly and name any user. Which of its pods really call 8083 is not verified.
+- The gate trusts the Kubernetes API for tokens. A key in a Secret is as safe as read access to that Secret.
+- One replica, no rate limit, no revocation before a token expires (at most one hour for projected tokens).
+- `extraA2ACallers` with the gate on needs a matching rule in `governance.a2a.callers`, or the render fails.
+
+```yaml
+governance:
+  a2a:
+    enabled: true
+    audit: {userId: hash}      # hash | raw
+    callers: []                # extra callers: name, serviceAccount, agents, userId {exact | prefix | fixed}
+```
+
+Try it with `VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/governance/demo-values.yaml" ./install.sh`. Evidence from the live run is in ADR 0006, "Round 1 results".
+
 ## What was proven
 
 - `mcp-tools`: a pod in `default` or another namespace timed out; backends and proxies accept only their own namespace and the ToolHive operator; the vMCP also accepts `atenet-egress` and the controller pod.
@@ -64,7 +111,7 @@ Call the vMCP without a token from a pod: expect 401 from inside `mcp-tools`, a 
 
 ## What is NOT protected
 
-- **The kagent controller does not authenticate callers** (`server.auth.mode: insecure`). Setting `serviceAccount.authority: kubernetes` was tried: requests with no token or a garbage token still got 200. It was reverted. Any pod the NetworkPolicy lets through can call any agent, and can claim any `X-User-Id`.
+- **The kagent controller does not authenticate callers** (`server.auth.mode: insecure`). The opt-in A2A gate (section above) authenticates the bridge, the schedules and Kourier in front of it; a pod in the `kagent` namespace can still call the controller directly. Setting `serviceAccount.authority: kubernetes` was tried: requests with no token or a garbage token still got 200. It was reverted. Any pod the NetworkPolicy lets through can call any agent, and can claim any `X-User-Id`.
 - **No per-agent tool authorization.** Cedar tells sessions and atespaces apart, not agents. Default policy is permit-all for any authenticated caller. Whether code in a sandbox (for example through `bash`) could call the vMCP directly was not tested; assume it can.
 - A valid actor JWT works until it expires (up to 3600 seconds). No revocation.
 - **Global tool discovery is off** with `actorJwt` (`DiscoveryDisabled`).

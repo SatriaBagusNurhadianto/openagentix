@@ -1,6 +1,6 @@
 # ADR 0005: Runtime speed, kagent versus AX, and whether to build on AX
 
-- **Status:** Accepted for the measurement. The recommendation (stay on kagent, tune it, keep AX as an optional second runtime) is proposed and waits for the owner's decision.
+- **Status:** Accepted. Owner decision, 2026-11-24: continue with kagent for now (option 1). Options 2 and 3 (AX as a second runtime, AX as the base) are kept on record here for a later review.
 - **Date:** 2026-11-23
 - **Supersedes:** the speed figures in [ADR 0001](0001-agent-runtime-kagent-vs-ax.md). Its other findings stand.
 - **Evidence:** [`components/bench/RESULTS.md`](https://github.com/openagentix/openagentix/blob/main/components/bench/RESULTS.md), method in [`components/bench/README.md`](https://github.com/openagentix/openagentix/blob/main/components/bench/README.md).

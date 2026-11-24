@@ -63,6 +63,13 @@ eq "policy: token budget default 1000000 per hour"     "$(q "$D" '.[]|select(.ki
 eq "policy: retry attempts"                            "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.traffic.retry.attempts')" 2
 eq "policy: access log attributes user_id"             "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.frontend.accessLog.attributes.add[0].name')" user_id
 eq "policy: metrics attribute user_id"                 "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.frontend.metrics.attributes.add[0].name')" user_id
+eq "policy: prompt caching is on by default (backend.ai.promptCaching)" "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.backend.ai.promptCaching|"\(.cacheSystem) \(.cacheMessages) \(.cacheTools) \(.minTokens)"')" "true true true 1024"
+D=$(docs --set gateway.policy.promptCaching.enabled=false)
+eq "promptCaching.enabled=false renders no backend section" "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec|has("backend")')" false
+D=$(docs)
+eq "promptCaching keeps the one policy and its traffic part" "$(q "$D" '[.[]|select(.kind=="AgentgatewayPolicy")]|length')" 1
+D=$(docs --set gateway.policy.promptCaching.enabled=true --set gateway.policy.promptCaching.cacheTools=false --set gateway.policy.promptCaching.cacheMessages=false --set gateway.policy.promptCaching.minTokens=0)
+eq "promptCaching switches and minTokens are honoured (0 is kept)" "$(q "$D" '.[]|select(.kind=="AgentgatewayPolicy")|.spec.backend.ai.promptCaching|"\(.cacheSystem) \(.cacheMessages) \(.cacheTools) \(.minTokens)"')" "true false false 0"
 D=$(docs --set gateway.enabled=false)
 eq "gateway.enabled=false: no Gateway/Model/Policy"    "$(count "$D" '.kind=="Gateway" or .kind=="AgentgatewayModel" or .kind=="AgentgatewayPolicy"')" 0
 cat > "$(dirname "$0")/.extra-models.yaml" <<'YAML'
@@ -424,6 +431,8 @@ eq "networkPolicy.enabled=false: no memory policy"     "$(count "$D" '.kind=="Ne
 eq "embedding dimension other than 768 fails the render (kagent stores vector(768))" "$([ -n "$(render_err --set memory.embeddings.model.dim=384)" ] && echo failed || echo rendered)" failed
 eq "memory without the gateway fails the render"       "$([ -n "$(render_err --set gateway.enabled=false)" ] && echo failed || echo rendered)" failed
 eq "memory prompt hint is appended for opted-in agents" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("save_memory")')" true
+eq "memory prompt saves only on request (no model call for a casual fact)" "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("only when the user asks you to\\s+remember")')" true
+eq "memory prompt still forbids secrets"            "$(q "$(docs)" '.[]|select(.kind=="AgentTemplate")|.spec.systemPrompt|test("Never store passwords")')" true
 
 echo "# bridge user identity and rollout"
 D=$(docs)
@@ -949,7 +958,8 @@ eq "capture.content=true: marker says so"             "$(q "$DC" "$MK|.data.capt
 eq "capture.content=true: audit includes request and response data" "$(q "$DC" "$VM|.spec.config.audit|\"\(.includeRequestData) \(.includeResponseData)\"")" "true true"
 DC2=$(docs "${OE[@]}" --set observability.audit.includeRequestData=true --set observability.audit.includeResponseData=true --set observability.tracing.captureContent=true --set observability.capture.captureContent=true)
 eq "no other value path turns content on"              "$(q "$DC2" "$MK|.data.captureContent")+$(q "$DC2" "$VM|.spec.config.audit|\"\(.includeRequestData) \(.includeResponseData)\"")" "false+false false"
-eq "gateway span attributes never reference prompt, completion or body" "$(q "$DC" "$POL|.spec|tojson|test(\"prompt|completion|request.body|response.body|llm\\\\.\")")" false
+eq "gateway span attributes never reference prompt, completion or body (the backend.ai.promptCaching switches are cache marks, not content)" "$(q "$DC" "$POL|.spec|del(.backend)|tojson|test(\"prompt|completion|request.body|response.body|llm\\\\.\")")" false
+eq "backend section holds only the promptCaching switches (no content capture)" "$(q "$DC" "$POL|.spec.backend|tojson")" '{"ai":{"promptCaching":{"cacheSystem":true,"cacheMessages":true,"cacheTools":true,"minTokens":1024}}}'
 
 echo "# observability: bundled dev profile"
 OB=(--set observability.enabled=true --set observability.bundled.enabled=true)

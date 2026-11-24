@@ -185,6 +185,17 @@ gateway:
       attempts: 2
       codes: [402, 429, 500, 502, 503, 504]
     attributeUserId: true         # tag access log + metrics with the virtual key's user_id
+    # Anthropic prompt caching, added by the gateway (spec.backend.ai.promptCaching of the one policy). The gateway puts cache
+    # marks on the tool list, the system prompt and the conversation before the Anthropic call; a client that sends its own
+    # marks wins. On by default: measured 8,000-token calls read 6,600 to 8,000 tokens from the cache and cost about 74% less
+    # (docs/decisions/0005-runtime-speed-kagent-vs-ax.md, "Tuning results"). A cache entry lives 5 minutes; the first call after
+    # that writes it again (the write costs 25% more than a plain input token).
+    promptCaching:
+      enabled: true
+      cacheTools: true            # mark the end of the tool list (the largest stable block of an agent request)
+      cacheSystem: true           # mark the end of the system prompt
+      cacheMessages: true         # mark the second-to-last message
+      minTokens: 1024             # the gateway skips the system mark below this estimated size
 
 # ---- MCP tool layer (ToolHive) -----------------------------------------------------------------
 # Needs the ToolHive operator (installed by install.sh).
@@ -437,12 +448,16 @@ memory:
       requests: {cpu: 50m, memory: 192Mi}
       limits: {cpu: 2, memory: 512Mi}
   # Appended to the system prompt of every agent with memory enabled. Recall is automatic (kagent preloads the most
-  # similar memories into each turn); saving is NOT: kagent writes memory only when the model calls `save_memory`.
+  # similar memories into each turn); saving is NOT: kagent writes memory only when the model calls `save_memory`, and
+  # that call costs one more model round trip in the same turn (the tool result goes back to the model). So the prompt
+  # saves only on request: a fact the user merely mentions is answered in one model call and is not kept.
+  # Measured in docs/decisions/0005-runtime-speed-kagent-vs-ax.md ("Tuning results").
   agentPrompt: |
     You have long-term memory. Relevant facts from earlier conversations with this user may appear in your
-    context; use them. When the user tells you something worth keeping across conversations (a preference, a
-    project name, a codename, a standing instruction) or asks you to remember something, call the save_memory tool
-    with one short, self-contained sentence. Never store passwords, tokens or other secrets.
+    context; use them. Saving costs an extra step, so call the save_memory tool only when the user asks you to
+    remember something (for example "remember", "keep in mind", "note that", "from now on", "always") and then
+    with one short, self-contained sentence. Do not save anything the user merely mentions, even a personal
+    detail or a preference. Never store passwords, tokens or other secrets.
 
 # ---- Observability (traces, metrics, tool-call audit) -----------------------------------------------
 # OFF by default: with `enabled: false` the chart renders nothing below and the output is byte-identical to a chart without it.

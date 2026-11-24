@@ -84,6 +84,17 @@ spec:
     retry:
       attempts: {{ $g.policy.retry.attempts }}
       codes: {{ toJson $g.policy.retry.codes }}
+  {{- if $g.policy.promptCaching.enabled }}
+  {{- $pc := $g.policy.promptCaching }}
+  # Anthropic prompt caching: the gateway adds the cache marks (a client's own marks win).
+  backend:
+    ai:
+      promptCaching:
+        cacheSystem: {{ $pc.cacheSystem }}
+        cacheMessages: {{ $pc.cacheMessages }}
+        cacheTools: {{ $pc.cacheTools }}
+        minTokens: {{ int $pc.minTokens }}
+  {{- end }}
   {{- $trace := and (include "oa.obsOn" .) .Values.observability.tracing.enabled }}
   {{- if or $g.policy.attributeUserId $trace }}
   frontend:

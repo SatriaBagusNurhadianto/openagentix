@@ -1,0 +1,325 @@
+# ADR 0006: Governance (who may call an agent, which tools it may use, where it may connect, what it remembers, what is recorded)
+
+- **Status:** Proposed. Nothing here is implemented. It records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
+- **Date:** 2026-11-24
+- **Evidence:** source of the pinned releases, read in local clones: kagent v1.0.1 (commit `558e3d7`), Agent Substrate v1.0.1 (`7ce6f439`), agentgateway v1.7.0 (`26f5aeb`), ToolHive v0.67.1 (tag clone). Paths below are relative to each repository root and prefixed with the project name. Read-only `kubectl` on the kind cluster `kind-openagentix` for three facts (marked "live"). No model call, no Telegram message, no database connection was made for this record.
+
+## Context
+
+OpenAgentix now has agents, tools, memory, channels, schedules and notify, all wired by one chart. The security page (`docs/diary/features/security.md:65-83`) lists what is not protected. The biggest gaps:
+
+1. The kagent controller port 8083 accepts any caller the NetworkPolicy lets through, and the caller names its own user with `X-User-Id`.
+2. Every agent can call every tool of the vMCP.
+3. Memory never expires, and nobody but an operator with `psql` can remove it.
+4. There is no audit trail that says which person (or system) made an agent do what.
+
+This ADR answers five questions. For each it gives the options, the evidence, a recommendation and an effort (S: up to a day, M: 2 to 4 days, L: a week or more). The MVP slice, values, compatibility rules and tests follow at the end.
+
+## Findings that shape every answer
+
+These are the facts the options depend on. Several of them correct what we believed before.
+
+**F1. kagent's controller authentication is a chain, and the user part has only two modes.** The binary accepts `server.auth.mode` `insecure` or `trusted-proxy` and nothing else (kagent `go/core/cmd/controller/main.go:95-104`, `proto/kagent/config/v1/config.proto:154-163`). On top of that mode, two verifiers are stacked (kagent `go/core/pkg/app/app.go:338-346`):
+
+- a ServiceAccount verifier, only when `server.auth.serviceAccount.authority` is set;
+- the Substrate actor verifier, always.
+
+Each verifier looks at the unverified token only to decide whether it is "its" token. If not, it passes the request down to the next verifier, and in the end to the user mode.
+
+- The ServiceAccount verifier claims a token only when its `sub` starts with `system:serviceaccount:` or it has a `kubernetes.io` claim. Anything else falls through (kagent `go/core/internal/httpserver/auth/serviceaccount.go:32-44`). A token it claims is checked by a TokenReview for the fixed audience `kagent-invocation` (`serviceaccount.go:16`, `tokenreview.go:88-111`).
+- `insecure` takes the user from `?user_id=`, then from `X-User-Id`, and otherwise uses `admin@kagent.dev` (`authn.go:24-31`).
+- `trusted-proxy` needs exactly one `Authorization: Bearer` JWT. It reads `sub` (or a configured claim) **without checking the signature** (`proxy_authn.go:28-53`, `:72-79`).
+
+This is why the earlier try with `serviceAccount.authority: kubernetes` still answered 200 without a token or with a garbage token. Neither token looks like a ServiceAccount token, so both fell through to `insecure`.
+
+**F2. A verified ServiceAccount caller is one user.** The principal is `kubernetes:<authority>` plus the ServiceAccount UID (`tokenreview.go:69-75`). Memory and sessions are keyed by that principal. The bridge would lose its per-chat memory scope, and no header can override this.
+
+**F3. The rest of port 8083 is just as open.** Port 8083 also serves gRPC and gRPC-Web for every kagent API, told apart by content type (kagent `go/core/internal/grpcserver/grpcweb.go:50-69`, `server.go:157`). That includes `MemoryService.List` and `MemoryService.Delete`, which act for the authenticated user (`proto/kagent/runtime/v1/memory.proto:10-16`). The default authorizer permits everything (`go/core/pkg/app/app.go:95-97`, `:140-147`). So in `insecure` mode, any admitted pod can list or delete any user's memories, and read any user's sessions, by naming that user.
+
+**F4. Sandboxes reach the controller with a verified identity, not a header.** For the controller origin, kagent always injects an actor JWT (audience `kagent-runtime`, 300 s) into the sandbox's egress policy. A sandbox cannot supply that header itself: it is reserved (kagent `go/core/internal/substrate/policy.go:31-55`). The egress proxy overwrites or adds it (substrate `cmd/atenet/internal/router/egress/credentials.go:123`). The controller verifies actor tokens and never falls back to the user mode for them (kagent `go/core/internal/runtimeauth/provider.go:24-51`). So the `atenet-egress` peer on port 8083 is not a hole for user impersonation, as long as the egress injection works as read. Not tested live.
+
+**F5. The agent's tool list is enforced inside the sandbox, by the agent's own process.** The Go ADK filters `tools/list` on the client side (kagent `go/adk/pkg/mcp/discovery.go:116-160`, `registry.go:180-193`). The vMCP is not told about it. Every agent also has a `bash` tool by default (kagent `go/adk/pkg/tools/builtin.go:276-315`). The switch is controller-wide, `runtimeDefaults.builtinTools.disableBash`, default false (kagent `helm/kagent/values.yaml:214-217`).
+
+The egress proxy puts the actor JWT on any request to the vMCP origin (substrate `cmd/atenet/internal/router/egress/credentials.go:68-125`, kagent `go/core/internal/substrate/policy.go:18-30`). So a prompt-injected agent can use `bash` to call any vMCP tool directly. It needs no token of its own: the proxy adds the JWT. The `execute_tool_script` tool does the same from inside the vMCP. Its inner calls are checked only by Cedar (toolhive `pkg/vmcp/codemode/decorator.go:91-102`), and Cedar cannot tell agents apart (F6).
+
+**F6. The actor JWT names a session, not an agent.** Its claims are `sub` = `actor/<atespace>/<name>` and `actor.ate.dev` = atespace, actor name and actor UID, with no template, label or agent claim (substrate `cmd/ateapi/internal/controlapi/actor.go:563-615`, `internal/actoridjwt/actoridjwt.go:84-128`). kagent names the actor `session-<id>` (kagent `go/core/internal/substrate/client.go:284`). The atespace is the Agent's Kubernetes namespace and cannot be configured (kagent `go/core/internal/substrate/actor_template.go:110`).
+
+**F7. Substrate egress is deny-by-default per actor, and kagent already fills the allowlist.** With no policy, or a policy without rules, the egress proxy answers 403 (substrate `cmd/atenet/internal/router/egress/egress.go:259-270`, `api/ateapi/v1/ateapi.proto:604`). kagent compiles one rule per origin, from:
+
+- the agent's models and tools ("Integration access inferred from models and tools is always included", kagent `go/api/v1alpha3/agent_types.go:56-65`);
+- the controller origin;
+- any `EgressPolicy` objects that the Agent lists in `spec.egressPolicyRefs` (kagent `go/core/internal/substrate/policy.go:21-68`, `go/core/internal/controller/reconciler.go:112`).
+
+Rules match host (or SNI) and port only. They cannot match methods or paths (substrate `api/ateapi/v1/ateapi.proto:699`, `:733`, `:762`, kagent `go/api/v1alpha3/egresspolicy_types.go:25`). Live: the cluster has the `egresspolicies.api.kagent.dev` CRD and no `EgressPolicy` objects. Every agent therefore reaches only what its own models and tools imply.
+
+**F8. A ToolHive vMCP really blocks the tools it filters out.** `aggregation.tools[].filter` hides a tool from `tools/list` (toolhive `pkg/vmcp/config/config.go:607-614`). `CallTool` returns not-found for any name that is not advertised (toolhive `pkg/vmcp/core/core_calls.go:25`, `:62-63`, `:90`). Code-mode inner calls go through the same `CallTool` (toolhive `pkg/vmcp/codemode/decorator.go:91-95`). Each VirtualMCPServer has its own `groupRef` and its own aggregation config. Nothing prevents two of them from serving one MCPGroup (toolhive `cmd/thv-operator/controllers/virtualmcpserver_controller.go:1083-1130`). The OIDC audience must be unique per server (toolhive `cmd/thv-operator/api/v1beta1/mcpoidcconfig_types.go:221-231`).
+
+**F9. Memory expiry is not enforced, but upstream already has a per-user delete.**
+
+- `PruneExpiredMemories` exists, but nothing in kagent calls it (kagent `go/core/internal/database/memory.go:125-139`; a search of the source finds only the definition).
+- The search query does not filter on `expires_at` ("Expired rows remain searchable until pruned", `memory.go:53-66`).
+- `MemoryService.List` and `Delete` act on the caller's own user id, for one agent. `Delete` removes all of that user's rows for the agent (kagent `go/core/internal/service/memory/service.go:176-211`, `memory.go:113-122`).
+- Nothing on the write path filters the content (`service.go:254-274`).
+
+## Question 1: A2A caller authentication
+
+### Who calls port 8083 today
+
+| Caller | Where | How it identifies itself today | Evidence |
+|---|---|---|---|
+| Telegram bridge | `openagentix-gateway`, pod label `app: telegram-bridge` | `X-User-Id: telegram:<chat id>`; it can already send a static `Authorization: Bearer` | `bridges/telegram/internal/a2a/client.go:66-77`, `charts/openagentix/templates/networkpolicy.yaml:88-91` |
+| Agent Kourier broker | `agent-kourier` | `X-User-Id` = the Binding's `identity.userId` (default `kourier:<binding>`); a Binding can also carry `identity.tokenSecretRef`, an OIDC bearer token | `charts/openagentix/templates/channels.yaml:111`; live: `kubectl explain bindings.spec.identity` |
+| Schedule CronJobs | `openagentix-schedules`, label `openagentix.io/component: schedule` | `X-User-Id: schedule:<name>` | `tools/a2a-call/internal/call/call.go:144`, `networkpolicy.yaml:97-101` |
+| Agent sandboxes | through `atenet-egress` | actor JWT injected by the egress proxy (F4) | `networkpolicy.yaml:85-87` |
+| Anything in namespace `kagent` | the controller, `kagent-ui`, `kagent-tools`, the worker pool `kagent-default` (live: deployments) | whatever it sends | `networkpolicy.yaml:84` |
+| `networkPolicy.extraA2ACallers` | operator-chosen | whatever it sends | `networkpolicy.yaml:102-108` |
+| An operator testing by hand | a throw-away pod in an admitted namespace | `X-User-Id` or nothing | `docs/diary/features/runtime.md:70-80` |
+
+### Options
+
+| | A. kagent `trusted-proxy` plus `serviceAccount.authority` | B. Our own small authenticating proxy ("A2A gate") in front of an `insecure` controller | C. agentgateway route in front of the controller | D. Our own controller build with a custom authenticator |
+|---|---|---|---|---|
+| What verifies the caller | TokenReview for ServiceAccount tokens (F1). Any other JWT is accepted unverified | TokenReview for projected ServiceAccount tokens with our own audience, plus hashed static keys for callers that only have a Secret (Kourier) | `jwtAuthentication` (issuer, audiences, JWKS inline or remote; agentgateway `controller/api/v1alpha1/agentgateway/agentgateway_policy_types.go:1212-1330`) or `apiKeyAuthentication` with per-key metadata (`:1426-1470`) | anything we write, plugged in through `app.Options.Authenticator` (kagent `go/core/pkg/app/app.go:95-97`) |
+| Where `X-User-Id` comes from | the ServiceAccount UID: one user per caller (F2). The bridge loses per-chat memory | the gate sets it. Rules per caller say which values are allowed (bridge: prefix `telegram:`; schedule `x`: exactly `schedule:x`; Kourier key: one fixed id) | a CEL `transformation` can `set` and `remove` headers (`agentgateway_policy_types.go:2737-2814`). Checking a header against the caller's allowed prefix in `authorization` CEL was not verified | anything |
+| Blocks the other APIs on 8083 (F3) | no | yes: it passes only the A2A paths | yes, if routes match only A2A paths. Not verified how gRPC-Web would look to the route |
+| Forgery by an admitted pod | still possible: an unsigned JWT is accepted | possible only from pods that the NetworkPolicy still admits directly (namespace `kagent`, see below) | same as B |
+| Streaming (`SendStreamingMessage`, SSE) | native | must flush. Go `httputil.ReverseProxy` with `FlushInterval: -1`, to be tested | not verified: the A2A plugin does not inspect `text/event-stream` (agentgateway `crates/agentgateway/src/a2a/mod.rs:240-246`); pass-through is inferred |
+| Kubernetes token check | built in | TokenReview (needs the `system:auth-delegator` binding) | remote JWKS from the API server needs credentials; whether agentgateway can send them is not verified |
+| Moving parts | none new, but it breaks per-chat memory | one small Go Deployment (about 300 lines plus tests), same style as `services/notify` | a second Gateway and policy on agentgateway, CEL rules that are hard to test offline |
+| Upgrade risk | low | low: it speaks plain HTTP to kagent | medium: two products' semantics combined |
+| Effort | S, but not acceptable alone | M | M, with more unknowns |
+
+D gives the cleanest result: a verified caller and an allowed delegated user id inside kagent itself. But it means owning a controller image. The authenticators live in kagent's `internal` packages, so we would rewrite them. Every kagent upgrade then becomes our build. Effort L. Rejected for now. It stays the upstream ask (below).
+
+### Recommendation: B, the A2A gate
+
+1. A Deployment `a2a-gate` in `openagentix-gateway` (new code in `services/a2a-gate`) with a ServiceAccount bound to `system:auth-delegator`. This is the only cluster-scoped permission it needs. It is a reverse proxy to `kagent-controller:8083`.
+2. **Authentication.** A request must carry `Authorization: Bearer <token>`. The gate accepts two kinds:
+   - a projected ServiceAccount token with the audience `openagentix-a2a` (TokenReview, cached for up to 30 s, the same as kagent's own cache in `tokenreview.go:18-21`);
+   - a static key whose SHA-256 is listed in a Secret. `install.sh` creates these keys, the way it creates the gateway virtual keys, and never prints them.
+3. **Authorization, per caller.** Rules come from values and are rendered into a ConfigMap:
+   - which agents the caller may call (`POST /agents/<namespace>/<name>` and the agent card `GET`);
+   - which user ids it may assert: an exact value, a prefix, or "fixed" (the gate sets it).
+
+   Anything else gets 403. That includes gRPC (`application/grpc*`), gRPC-Web and the REST API.
+4. **Identity.** The gate deletes the caller's `Authorization`, any `X-User-Id` that breaks the caller's rule, and the `user_id` query parameter. The query parameter matters: `insecure` reads it before the header (`authn.go:25-28`). The gate then sets `X-User-Id` itself. The controller stays in `insecure` mode and never sees a caller credential.
+5. **NetworkPolicy.** With the gate on, port 8083 admits only:
+   - the gate pod;
+   - `atenet-egress` (F4);
+   - namespace `kagent`.
+
+   The bridge, Kourier, schedule and `extraA2ACallers` peers move to the gate's own ingress policy. The `kagent` namespace peer stays for now. Which of its pods really call 8083 (the UI, `kagent-tools`, the worker pool) is not verified, so narrowing it to pod labels is a follow-up after a log check. Until then, a pod in `kagent` can still impersonate a user. That is the same trust as today for that namespace, and it is stated in the docs.
+6. **How each caller authenticates:**
+   - **Bridge:** a projected token volume (audience `openagentix-a2a`, `expirationSeconds: 3600`). The client reads the token file again on every request, because the kubelet rotates it. The bridge already sends a bearer token when one is set (`client.go:75-77`); it needs a file source instead of a fixed string. Rule: agent `bridge.agent`, user id prefix `bridge.userIdPrefix` (default `telegram:`).
+   - **Schedules:** one ServiceAccount per schedule (`schedule-<name>`) and a projected token volume. The pod keeps `automountServiceAccountToken: false` (`charts/openagentix/templates/schedules.yaml:76`); the projected volume is explicit. `tools/a2a-call` gets `A2A_TOKEN_FILE`. Rule: agent = the schedule's agent, user id exactly `schedule:<name>`. This also closes "anyone who can create a labelled pod there can call any agent" (`docs/diary/features/schedules.md:83`): such a pod has no token for another schedule's ServiceAccount.
+   - **Kourier:** one static key per Binding, in a Secret in `openagentix-channels`, referenced by `identity.tokenSecretRef`. Rule: agent = the Binding's agent, user id fixed to the Binding's `userId`. The gate ignores whatever `X-User-Id` Kourier sends. Kourier refuses static `Authorization` and `X-User-Id` headers on the AgentBackend (live: `kubectl explain agentbackends.spec.headers`), so `tokenSecretRef` is the only way. Kourier's documentation calls it an "OIDC bearer token". Whether Kourier sends a non-JWT value unchanged is **not verified**. If it does not, the gate also accepts an HS256 JWT signed with a per-Binding key.
+   - **Operator by hand:** `kubectl create token <sa> --audience openagentix-a2a` for a ServiceAccount listed in `a2aGate.callers`.
+   - **Sandboxes:** unchanged (F4).
+7. **Audit line.** The gate writes one JSON line per request: time, caller (ServiceAccount or key name), agent, the user id (see the open decision on hashing), `contextId` from the request, trace id from `traceparent`, status and duration. It never logs the message text.
+8. **Upstream asks.** (a) `trusted-proxy` should verify the JWT signature against a configured JWKS. (b) A verified ServiceAccount should be allowed to act for a delegated user id under a rule. Either one would let the gate shrink or go away.
+
+Effort: M for the gate (code and Go tests), S for the chart, S for the bridge and `a2a-call` changes, S for the Kourier keys in `install.sh`.
+
+## Question 2: per-agent tool permissions
+
+### What exists, and what enforces it
+
+| Mechanism | Enforced where | Can a prompt-injected agent get around it? | Evidence |
+|---|---|---|---|
+| `AgentTemplate.spec.tools[].mcp.tools` (our `agents[].tools`) | in the sandbox, by the Go ADK filtering `tools/list` | **yes**: `bash` reaches the vMCP origin with the injected JWT; `execute_tool_script` calls any tool the vMCP advertises | F5 |
+| Cedar `toolAccess` on the one vMCP | in the vMCP | no, but it can only key on atespace or session, and all agents share the atespace `kagent` | F6, `charts/openagentix/templates/mcp.yaml:30-35` |
+| One VirtualMCPServer per permission group ("tool profile"), each with a tool `filter`, each agent pointing at its own profile's RemoteMCPServer | in the vMCP (filtered tools are not-found, also inside code mode) and in Substrate egress (the agent's allowlist contains only the origins its tools imply, so other profiles' vMCPs answer 403) | no, as far as the source shows. Not tested live | F7, F8 |
+| One Kubernetes namespace per agent, hence one atespace per agent, plus Cedar keyed on the atespace | in the vMCP | no | F6; the chart puts every agent in `kagent.namespace` |
+| `MCPToolConfig` (`toolsFilter`, `toolsOverride`) | in the vMCP, per workload | as the profile option; it is the reusable form of the inline filter | toolhive `cmd/thv-operator/api/v1beta1/toolconfig_types.go:25-35`, `pkg/vmcp/config/config.go:602` |
+
+### Recommendation: tool profiles
+
+A values block `mcp.profiles`. Each profile renders:
+
+- one more VirtualMCPServer `tools-<profile>` on the same MCPGroup, with `aggregation.tools[]` filters that list its tools per workload;
+- an MCPOIDCConfig audience `openagentix-vmcp-<profile>` (audiences must be unique, F8);
+- a RemoteMCPServer `toolhive-vmcp-<profile>` in `kagent` with `actorJwt` for that audience;
+- its share of the vMCP NetworkPolicy and observability scrape targets.
+
+An agent sets `toolProfile: <name>`, and its tools then come only from that server. The render fails if an agent lists a tool that is not in its profile. This keeps the ADK list as a convenience and moves the real limit to the vMCP and the egress proxy.
+
+Agents without `toolProfile` keep the shared vMCP, which stays as it is. So the default render does not change.
+
+`execute_tool_script` is a per-profile switch (`codeMode`), because code mode is granted by the vMCP config, not per principal (toolhive `pkg/vmcp/config/config.go:1206-1213`). Inside a profile it can call only that profile's advertised tools.
+
+Cost: one vMCP pod per profile. Its memory was not measured; the whole tool layer idles at about 112 MiB over 6 pods (`docs/diary/features/tools.md:70`). On the fixed 6 CPU / 8 GB demo VM, plan for one or two profiles.
+
+The namespace-per-agent option is cleaner for Cedar, but it moves Secrets, ModelConfigs, RemoteMCPServers and NetworkPolicies into many namespaces. Effort L. Deferred.
+
+Separately, `disableBash` is controller-wide. Turning it off shrinks what an injected agent can do, but only for every agent at once, and skills that run scripts would break. That is a decision for the owner (below). With profiles, `bash` no longer widens tool access. It can still reach the other origins the agent's own allowlist holds, such as the model gateway with the agent's own key.
+
+Effort: M (chart, render-time checks, tests). The vMCP-per-profile pattern needs one live proof before the switch is documented as supported.
+
+## Question 3: egress control per agent
+
+**Today** (F7):
+
+- **Sandboxes.** They reach only the origins their agent's models and tools imply: the model gateway (and the memory alias), the vMCP, the controller, and the OTLP endpoint when tracing is on (ADR 0003, round 1, "no egress policy had to be written by hand"). Everything else gets 403 from `atenet-egress`. That is already per agent.
+- **Tool servers.** The real internet egress happens in the tool servers, which are ordinary pods outside Substrate:
+  - `fetch` in `mcp-tools` can reach any URL. kindnet does not enforce internet egress (`docs/diary/features/security.md:71-72`).
+  - `notify` posts to chat APIs by design.
+
+**What Substrate offers:** host (exact or leftmost wildcard) and port per rule, with `http`, `https` or `tls_passthrough`, and header injection with a secret or an actor JWT. It offers no methods, paths or CIDRs (F7; substrate `api/ateapi/v1/ateapi.proto:796-860`). The per-agent object is kagent's `EgressPolicy` (`destinations[].origin`, optional `authentication`), referenced by `Agent.spec.egressPolicyRefs` (kagent `go/api/v1alpha3/egresspolicy_types.go:17-78`).
+
+**Recommendation:**
+
+1. **Extra origins.** `agents[].egress.allow` (a list of `https://host[:port]` origins) renders one `EgressPolicy` named `<agent>-egress` and adds it to the Agent's `egressPolicyRefs`. Absent means nothing renders and nothing changes. Effort S. It matters only when a skill or `bash` needs an outside API. Tools that reach the internet do so from their own pods.
+2. **Internet egress of `fetch`.** Restricting `fetch` per agent means one `fetch` server per profile with an allowlist. Whether gofetch has a host allowlist is not verified. Otherwise it takes a NetworkPolicy egress rule on an enforcing CNI, or an HTTP egress proxy. Deferred: it is a tool-server question, not a Substrate question.
+3. **Live canary for the claim in F7.** `bash` in a sandbox does `curl https://example.com`, and the expected answer is 403 from the egress proxy. Not run.
+
+## Question 4: memory governance
+
+| Need | Today | Options | Recommendation | Effort |
+|---|---|---|---|---|
+| Expiry | `ttlDays` only sets `expires_at`; nothing prunes and search ignores it (F9) | (a) a CronJob in `kagent` that runs the same SQL as `PruneExpiredMemories` (extends rows read at least 10 times by 15 days, deletes the rest; `memory.go:125-139`) with kagent's database Secret; (b) upstream: call the prune function on a timer and filter expired rows in search | (a) behind `memory.expiry.enabled`, plus the upstream issue (b). Using upstream's own statement keeps the behaviour the same when upstream turns it on | S |
+| "Forget me" | operator `psql` (`docs/diary/features/memory.md:56-63`) | `MemoryService.Delete` for the caller's own user and one agent (F9), reached through the A2A gate | after Q1: a bridge command `/forget` that calls `Delete` for the chat's own user id through the gate (gRPC-Web on 8083, as ADR 0002 used). The gate allows that RPC only for callers whose rule sets `memory: true` and only with their own user id | M |
+| Listing | `psql` | `MemoryService.List`, same scoping | a bridge command `/memories` (shows the user's own memory texts in their own chat), same gate rule | S after the above |
+| Secrets in memory | prompt advice only; no filter on the write path (`service.go:254-274`) | (a) a scan in the expiry job that deletes rows matching a short list of high-confidence patterns (private-key headers, provider key prefixes) and logs only a count; (b) a filter in the save path (needs kagent changes) | (a) as a later step, opt-in | S |
+| Memory of a Kourier Binding or schedule | one scope per Binding or schedule (`memory.md:79-80`) | unchanged | no change; documented | none |
+
+Without Q1, list and delete are unsafe: anyone admitted could forget or read another user's memories (F3). So Q4 comes after Q1.
+
+## Question 5: audit
+
+**What we already have** (ADR 0003, `docs/decisions/0003-observability.md:15-23`, `:52-66`):
+
+- gateway cost and tokens per agent virtual key;
+- vMCP `AUDIT` lines with the tool, the outcome and `subjects.user_id` = the session actor (toolhive `pkg/audit/auditor.go:537-555`);
+- the bridge's `turn` line with a salted chat hash;
+- the `a2a-call` summary;
+- traces joined by `contextId` and trace id (`hack/trace-turn.sh`).
+
+**What is missing for an audit trail:**
+
+1. **Who called.** Today nothing authenticated records which caller started a turn. The gate line (Q1) is that record.
+2. **Which agent used a tool.** The vMCP subject is the session, not the agent (F6). With tool profiles, the vMCP server name says the profile. The join from session to agent and user lives in kagent's session table, or in traces through `gen_ai.conversation.id`. The vMCP can add more subject fields only from Go code (`WithSubjectEnricher`, toolhive `pkg/audit/subject_enricher.go:10-70`), not from config.
+3. **Cost per person.** The gateway counts per agent key. Per-user cost needs a join on the trace or `contextId`. The bundled Jaeger drops `user.id` on purpose (ADR 0003).
+4. **Durability.** Everything is pod stdout. A log shipper or a persistent store is an operator choice; we document the fields.
+
+**Recommendation:** the gate line in round 1, and a documented join recipe that extends `hack/trace-turn.sh` (caller → `contextId` → tools → cost) in round 2. A durable or tamper-evident store is deferred.
+
+## Proposed MVP slice
+
+Three rounds, in this order:
+
+1. **Round 1: the A2A gate** (Q1, plus the audit line of Q5). `services/a2a-gate`, chart block `governance.a2a`, bridge and `a2a-call` token files, per-schedule ServiceAccounts, Kourier Binding keys from `install.sh`, NetworkPolicy switch. Live canary on kind.
+2. **Round 2: tool profiles** (Q2) and the egress values (Q3, item 1). `mcp.profiles`, `agents[].toolProfile`, `agents[].egress.allow`, render-time checks, live canary of `bash` and code mode against a second profile.
+3. **Round 3: memory governance** (Q4). The expiry CronJob, `/forget` and `/memories` in the bridge through the gate, and the opt-in secret scan. The upstream issues for prune and `trusted-proxy` verification are filed by then.
+
+### Values sketch
+
+```yaml
+governance:
+  a2a:
+    enabled: false                 # off: nothing below renders, port 8083 policy unchanged
+    namespace: openagentix-gateway
+    image: {repository: openagentix/a2a-gate, tag: dev, pullPolicy: IfNotPresent}
+    audience: openagentix-a2a      # projected ServiceAccount tokens must carry it
+    keysSecret: a2a-gate-keys      # SHA-256 hashes of static keys (install.sh, never printed)
+    audit:
+      userId: hash                 # hash | raw  (owner decision, see below)
+    # Rules for the chart's own callers are derived (bridge, schedules, bindings). Extra callers:
+    callers: []
+    #  - name: ci-smoke
+    #    serviceAccount: {namespace: ci, name: smoke}
+    #    agents: [assistant]
+    #    userId: {exact: "ci:smoke"}          # or {prefix: "..."} or {fixed: "..."}
+    #    memory: false                        # may call MemoryService List/Delete for its own ids
+mcp:
+  profiles: []                     # empty: only the shared vMCP, as today
+  #  - name: research
+  #    codeMode: false
+  #    tools:
+  #      fetch: [fetch]
+  #      osv: [query_vulnerability, get_vulnerability]
+agents:
+  - name: assistant
+    # toolProfile: research          # tools then come only from vMCP tools-research
+    # egress:
+    #   allow: ["https://api.github.com"]   # renders EgressPolicy assistant-egress
+memory:
+  expiry:
+    enabled: false
+    schedule: "17 3 * * *"
+    secretScan: false
+```
+
+### Default-off and compatibility rules
+
+- With `governance.a2a.enabled: false`, `mcp.profiles: []`, no `toolProfile`, no `egress`, and `memory.expiry.enabled: false`:
+  - the default render must be byte-identical to the commit before (`cmp`);
+  - every demo values file must render byte-identically too;
+  - the same rule as ADR 0003.
+- Turning the gate on changes how callers are reached:
+  - the bridge's and `a2a-call`'s A2A URL becomes the gate Service;
+  - the controller NetworkPolicy loses those peers.
+
+  `install.sh` must apply the gate and the token volumes in one `helm upgrade`, so there is no window where callers are cut off. It needs no kagent Helm change and no controller restart. This matters, because rolling the controller is risky on this node (ADR 0003).
+- `extraA2ACallers` keeps working with the gate off. With it on, the chart fails the render if `extraA2ACallers` is set without a matching `governance.a2a.callers` entry, so a caller is never silently cut off.
+- Memory scopes do not change. The user ids the gate allows are the ones the callers send today (`telegram:`, `schedule:`, `kourier:`), so existing memories stay reachable.
+
+### Test plan
+
+- **Chart tests** (`charts/openagentix/tests/run.sh`), written first:
+  - default and demo renders byte-identical;
+  - gate on renders a Deployment, a ServiceAccount, a ClusterRoleBinding to `system:auth-delegator`, a rules ConfigMap without secrets, and a gate ingress NetworkPolicy;
+  - port 8083 peers are exactly the gate, `atenet-egress` and `kagent`;
+  - the bridge has a projected token volume with the audience;
+  - each schedule has its own ServiceAccount and keeps `automountServiceAccountToken: false`;
+  - Bindings get `tokenSecretRef`;
+  - profiles render a vMCP, an OIDC config with a unique audience and a RemoteMCPServer;
+  - the render fails for a tool that is not in the profile, for an unknown profile, and for `extraA2ACallers` without a rule;
+  - `egress.allow` renders an `EgressPolicy` and `egressPolicyRefs`;
+  - no Secret values anywhere.
+- **Go unit tests for the gate** (`-race`, standard library plus `client-go` for TokenReview with a fake):
+  - no token, a wrong audience or an expired token gets 401;
+  - an agent outside the rule gets 403;
+  - a user id outside the prefix, exact or fixed rule gets 403 (fixed overwrites);
+  - the `user_id` query parameter is removed;
+  - `Authorization` is never forwarded;
+  - gRPC, gRPC-Web and non-A2A paths get 403, except the memory RPCs for callers with `memory: true`;
+  - SSE is flushed per event;
+  - canary strings in the message text never reach the audit line.
+- **Go tests for the bridge and `a2a-call`:** the token file is re-read on each request, and a missing file is a clear error.
+- **Live canary on kind**, at most three model calls:
+  1. A direct call to 8083 from the bridge pod times out. A call to the gate without a token gets 401.
+  2. A bridge-ServiceAccount token that claims `schedule:demo-brief` gets 403.
+  3. A manual schedule Job reaches `TASK_STATE_COMPLETED` through the gate (one model call).
+  4. A signed demo webhook ends with `outcome=completed` through the gate (one model call).
+  5. In round 2, `bash` in a sandbox of a profile agent calls the shared vMCP and gets 403 from the egress proxy, and `execute_tool_script` calling a tool outside the profile gets not-found (stub model, no paid call).
+  6. In round 3, `/forget` and `/memories` are covered by unit tests only (no Telegram messages). The expiry job is run once by hand. It must finish and log only counts. A row cannot be made to expire sooner than `ttlDays: 1` without editing the database, so the deletion of an expired row is proven by a Go or SQL test against a throw-away PostgreSQL, not on the cluster.
+
+## Out of scope and deferred
+
+- One namespace or atespace per agent and Cedar keyed on it (L).
+- A custom kagent controller build (option D).
+- Narrowing the `kagent` namespace peer on port 8083 to pod labels (needs a log check first).
+- Restricting `fetch` per host.
+- A tamper-evident or durable audit store; per-user cost dashboards; USD budgets.
+- Content filters on prompts or tool results (prompt injection is still not solved).
+- Revocation of actor JWTs before expiry; rotation of virtual keys and gate keys.
+- Slack-specific identity: in a bound Slack channel, everyone shares the Binding's identity.
+- Multi-tenant hardening (ADR 0001 says neither runtime is ready for hostile tenants).
+
+## Decisions only the owner can make
+
+1. **User ids in the gate's audit line:** raw (`telegram:<chat id>` is personal data, but it is what an audit needs) or a salted hash, as in the bridge's log. Settled for round 1: `hash` is the default, because a chat id must not appear in logs; `raw` stays an explicit operator switch.
+2. **`bash` for every agent:** keep it (skills can run scripts) or set `disableBash` controller-wide. The switch is not per agent, and turning it on rolls the controller.
+3. **Memory expiry by our own CronJob** with kagent's database credentials, or wait for upstream to call its own prune function.
+4. **Pod budget for tool profiles** on the fixed 6 CPU / 8 GB VM: how many extra vMCP pods are acceptable.
+
+## Not verified
+
+- The egress proxy's actor-JWT injection on the controller origin (F4), and the 403 for undeclared origins (F7), were read in the source, not observed live.
+- Kourier's handling of a non-JWT value in `identity.tokenSecretRef`, and whether it still sends `X-User-Id` when a token is set.
+- Which pods in namespace `kagent` call port 8083.
+- SSE through a Go reverse proxy to kagent; SSE through agentgateway.
+- agentgateway: remote JWKS from the Kubernetes API server, CEL on request headers in `authorization`, and the order of `transformation` against `jwtAuthentication`.
+- That `aggregation.tools[].filter` applies to `MCPServerEntry` backends (`knowledge`, `delivery`) as it does to `MCPServer` workloads.
+- The memory and CPU of one extra vMCP pod.
+- Whether gofetch can be limited to a host allowlist.

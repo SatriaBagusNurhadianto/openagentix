@@ -1,6 +1,6 @@
 # ADR 0006: Governance (who may call an agent, which tools it may use, where it may connect, what it remembers, what is recorded)
 
-- **Status:** Round 1 (the A2A gate) and round 2 (tool profiles and egress values) are implemented, opt-in and proven on kind: see "Round 1 results" and "Round 2 results" at the end. Round 3 is proposed and not started. The ADR records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
+- **Status:** Round 1 (the A2A gate), round 2 (tool profiles and egress values) and round 3 (memory governance) are implemented, opt-in and proven on kind: see "Round 1 results", "Round 2 results" and "Round 3 results" at the end. The ADR records what the upstream code really does today and a small first slice to build, behind switches that are off by default.
 - **Date:** 2026-11-24
 - **Evidence:** source of the pinned releases, read in local clones: kagent v1.0.1 (commit `558e3d7`), Agent Substrate v1.0.1 (`7ce6f439`), agentgateway v1.7.0 (`26f5aeb`), ToolHive v0.67.1 (tag clone). Paths below are relative to each repository root and prefixed with the project name. Read-only `kubectl` on the kind cluster `kind-openagentix` for three facts (marked "live"). No model call, no Telegram message, no database connection was made for this record.
 
@@ -527,3 +527,81 @@ After the run: both agents Ready, both vMCPs Ready with four backends, the stub,
 - The model gateway origin and the other always-allowed origins are still reachable from a profile agent's sandbox by design (its own key); `bash` stays on (owner decision).
 - Token revocation: an actor JWT of a profile works until it expires.
 - That a model, not a stub, can be talked into a refused call: the refusals were proven at the vMCP and the proxy, which are the same whoever asks.
+
+## Round 3 results (2026-11-24)
+
+Round 3 is built, tested and run on the kind cluster: the memory expiry CronJob (`memory.expiry`), the `/memories` and `/forget` commands of the bridge through the gate (`bridge.memoryCommands`, `memory: true` in a gate rule) and the opt-in secret scan (`memory.expiry.secretScan`, `secretScanDelete`). Everything is **off by default**: 26 renders (the default, every demo values file singly, all together, the gate on, the gate and profiles on, the bench values, `networkPolicy.enabled=false`, each with and without the Kourier API version) were saved from `HEAD` before the change and compared with `cmp` afterwards: 26 of 26 byte-identical. No kagent Helm change, no controller roll by us.
+
+### What was built
+
+- **Gate** (`services/a2a-gate`, `memory.go`, `rules.go`): a caller whose rule has `memory: true` may call `POST /kagent.runtime.v1.MemoryService/List` and `/Delete` over binary gRPC-Web, and nothing else of gRPC. The method list of the rule does not apply to them. Details in "How the user id is bound" below. 11 new Go tests, 62 in all, with `-race`; coverage of the gate package 93%.
+- **Bridge** (`bridges/telegram`): a small gRPC-Web client (`internal/memory`, no protobuf library, errors with numbers only), the commands `/memories` and `/forget` (then `/forget confirm`), and the settings `MEMORY_GATE_URL` and `MEMORY_AGENT`. About 25 new tests, 122 in all, with `-race`. The reply of `/memories` shows at most 10 items of 200 characters, at most 3500 characters, and a count of the rest. A failing call gives a generic reply; the log has the outcome (`memories`, `forget`, `forget_ask`, `memory_error`), a count, and for an error only the HTTP and gRPC status numbers. A test plants a canary string in the memory content and in the error text and asserts that neither reaches the reply or the log, nor the chat id.
+- **Expiry job** (`charts/openagentix/files/memory-expiry.sh`, `templates/memory-expiry.yaml`): a CronJob `memory-expiry` in the `kagent` namespace (schedule `17 3 * * *`, `concurrencyPolicy: Forbid`, `backoffLimit: 0`, 300 s deadline). It runs the two statements of kagent's `PruneExpiredMemories` (`go/core/internal/database/memory.go` lines 125-139, kagent v1.0.1 commit `558e3d7`; the predicates are the same, wrapped in a counting CTE) with psql from the image of kagent's own database (`pgvector/pgvector:pg17`, by digest, already on the node). The login is the existing Secret `kagent-postgres-readwrite` key `readWriteConnectionString`, by `secretKeyRef`; no value is copied, rendered or logged. The pod is non-root, read-only, drops all capabilities and mounts no ServiceAccount token. The log is two lines of counts. A NetworkPolicy `openagentix-kagent-pg` (only with `networkPolicy.enabled`) lets only the controller pods and the job's pods reach kagent's PostgreSQL, which was open to every pod before.
+- **Secret scan** (same script): ten patterns with fixed names (AWS access key id, bearer token, GitHub token, Google API key, JWT, private key header, provider `sk-` key, Slack token, Stripe key, Telegram bot token). The log gives a count per name and the number of matching rows, never text. Report only by default; `secretScanDelete: true` deletes the matching rows and needs `secretScan: true`.
+- **Chart**: `memory.expiry`, `networkPolicy.kagentPostgres`, `bridge.memoryCommands`, `governance.a2a.callers[].memory`. The render fails for `memoryCommands` without the gate, without the bridge, without the agent in `agents[]` (in the kagent namespace) or with `memory.enabled` off on it; for non-boolean switches; for `secretScanDelete` without `secretScan`; for a bad schedule, schema, role, Secret or deadline; and for a non-boolean `memory` on an extra caller. 74 new assertions (901 in all, 0 failing).
+- **SQL test** (`charts/openagentix/tests/memory-expiry-integration.sh`, 29 assertions): starts a throw-away `pgvector/pgvector:pg17` container itself (`docker run --rm`, stopped by a trap, the way `services/kb` does `make test-integration`), builds kagent's roles and schema with the repository's own `components/runtime/dl/kagent-setup.sql`, creates the `memory` table like kagent's vector migration, and runs the job script exactly as mounted, as the read/write login. It is the only database the test connects to.
+- `components/governance/memory-demo-values.yaml`: expiry on, secret scan report only, `bridge.memoryCommands`, and a caller `memory-canary` (`memory: true`, user ids with the prefix `probe:` only, inert without a ServiceAccount). `install.sh` and `uninstall.sh` needed no change: the existing image build and source hashes roll the gate and the bridge.
+
+### How the user id is bound for the memory RPCs
+
+Decided by evidence, not by assumption.
+
+- The request messages are `MemoryServiceListRequest` and `MemoryServiceDeleteRequest`, each with the single field `agent_name = 1` (`proto/kagent/runtime/v1/memory.proto`). There is no user field.
+- In the service, `managementScope` takes the user from the authenticated principal (`go/core/internal/service/memory/service.go`); the gRPC interceptor builds the principal from the forwarded metadata `x-user-id` (`go/core/internal/grpcserver/interceptors.go`), which the `insecure` authenticator reads (`go/core/internal/httpserver/auth/authn.go`; for gRPC the query is empty).
+- So the user id is **the `X-User-Id` header**, not the message. The gate sets it from the caller's rule exactly as for A2A: `exact`, `prefix` or `fixed`, two values refused, the query string dropped, `Authorization` and the other identity headers removed.
+- The message is still checked, because it names the agent and a later API version could add a field. The gate reads the one frame (at most 600 bytes, within the sniff timeout), requires exactly one string field number 1 and nothing else, requires the agent to be in the caller's rule, and forwards the bytes it verified (not the original reader). Refused with 403 and a `reason`: not POST or another path (`path`), another content type, base64 text mode or a compression header (`grpc`), no `memory: true` (`memory`), a user id outside the rule (`user_id`), a bad frame (`frame`), an agent outside the rule (`agent`). Too large: 413. Slow: 408.
+- The bridge sends `X-User-Id` = prefix + chat id, from the chat id Telegram puts on the update, never from text.
+
+Live evidence (below) shows the same: a request that names a user id in the message (field 2) gets 403 `frame`; one that names another user id in the header gets 403 `user_id`; neither reached the controller.
+
+### Does search return expired rows before the job runs? Yes
+
+`SearchAgentMemory` and `ListAgentMemories` have no `expires_at` filter (`memory.go` lines 53-66 and 85-101: "Expired rows remain searchable until pruned"). The integration test shows it with the statement of `SearchAgentMemory` against the throw-away database: a user with two expired and two valid rows gets four rows back before the job and two after. Effects:
+
+- An expired memory is still recalled into the model's context, and still listed by `/memories`, until the next run of the job (up to a day with the default schedule). With the job off, for ever.
+- A memory that is recalled often does not die: kagent's rule gives fifteen more days to an expired row that was read ten times, and each recall is one read.
+- The delete that `/forget confirm` does is immediate and does not depend on the job.
+
+### Live canary (kind, context `kind-openagentix`)
+
+Install with the eight demo files (the command of the task, with `SKIP_KB_IMAGE=1 SKIP_NOTIFY_IMAGE=1 SKIP_A2A_CALL_IMAGE=1`); it took 191 s, every pod Running afterwards. **Two model calls** (one agent turn, two chat completions in the gateway log).
+
+1. **Expiry job by hand** (`kubectl create job --from=cronjob/memory-expiry`): it completed in 4 s. Log: `total_before=9 expired=0 extended=0 deleted=0 total_after=9`, then `secret_scan=on delete=off rows_matching=0 rows_deleted=0 patterns=` and ten names with count 0. Counts only. After the probes below a second run showed `total_before=9 ... total_after=9`: the nine existing rows were untouched.
+2. **Bridge** Ready with `memory_commands: true` in its start line and the gate URL and agent in its environment. No Telegram message was sent.
+3. **Through the gate** with a test caller `memory-canary` (`memory: true`, prefix `probe:`), from a pod in the schedules namespace with a projected token, using a small throw-away client that prints status numbers and counts only:
+   - `List` and `Delete` for its own made-up id `probe:own-1`: HTTP 200, gRPC status 0, zero items.
+   - `List` naming an id with the prefix `telegram:`, `List` naming `schedule:demo-brief` (the id of the real demo schedule), `Delete` naming a `bench:` id and `List` without a user id: 403 each, audit `reason: user_id`, so nothing was forwarded. `List` naming another agent: 403 `agent`. A message with a second field: 403 `frame`. `Search` and `AddSession`: 403 `path`. Those ids were named only in the header of requests that the gate refused before anything was forwarded (the audit lines show status 403 and no agent), so no real user's memory was listed or deleted; but one of them was a real schedule's id, which the task asked to avoid even as a name.
+   - A caller without the flag (a schedule's own ServiceAccount, sending `probe:own-1`): `List` and `Delete` both 403, `reason: memory`.
+   - **One model turn** as `probe:own-3` ("remember that my probe codename is ..."): the agent saved a memory (200, `TASK_STATE_COMPLETED`, 24 s). `List` for `probe:own-3` then returned one item with HTTP 200. Its answer, captured as hex, decodes to the saved sentence and an `expires_at` 30 days later (it is now a test fixture of the bridge). `Delete` for `probe:own-3`, then `List`: zero items. This is the full path: gate, controller, database, and back.
+   - Audit lines carry `rpc` (`MemoryService/List` or `Delete`), the agent when allowed, the hashed user id and the status; no content.
+4. **The database policy** (`openagentix-kagent-pg`) was active during all this: the controller read and wrote through it, and the expiry job connected through it.
+
+The test ServiceAccounts and jobs were removed. The throw-away client image `openagentix/memprobe:dev` stays in the node's image store (nothing runs it).
+
+### Findings
+
+- **kagent's database logins are `NOINHERIT`.** The login `kagent_readwrite_user` has no privileges of its own; kagent itself runs `set_config('role', 'kagent_readwrite')` after every connect (`go/core/pkg/postgres/pool.go`). The first run of the SQL test failed with "no schema has been selected" and "permission denied": the job now runs `SET ROLE` first (`memory.expiry.role`). Found by the test, not on the cluster.
+- **The first live probe of a caller without the flag returned `unknown_caller`**, not `memory`: the memory demo file replaces the `governance.a2a.callers` list of the profiles demo file (lists are replaced, not merged), so `profile-canary` was no longer a caller. The demo file says so; the live test used a schedule's ServiceAccount instead.
+- **The kagent controller restarted once during the canary** (exit code 1 at 13:49, back Ready after about 20 seconds, restart count 143). It had restarted 142 times in the 32 hours before (leader election and start-up races were noted in round 1 and in ADR 0003). The previous log was not available; the cause was not found, and nothing links it to the new policy (it reconnected to the database and answered later calls).
+- The node's load average stayed between 4 and 7 for about half an hour after the previous round with the CPU 90% idle (a node with many processes); builds waited for the one-minute value under 4.
+
+### Deviations from this ADR, and why
+
+- **Image:** the ADR says "a tiny image already on the node or a pinned `postgres` client image matching the server major version". The job uses the server's own image, `pgvector/pgvector:pg17` by digest: it is already on the node, has the same major version and has psql. It is large (676 MB on disk) and not tiny.
+- **`SET ROLE`** (see Findings). The SQL is kagent's statements with a counting wrapper (`WITH x AS (UPDATE ... RETURNING 1) SELECT count(*)`), so the log can have counts; the predicates are unchanged.
+- **The SQL test is a shell script with `docker exec psql`, not a Go test**, because the job is a psql script and the chart ships it. It publishes no port (the kb test publishes one on 127.0.0.1); the start, readiness wait and trap-stop follow the kb test.
+- **Policy on kagent's PostgreSQL** is added only with `memory.expiry.enabled` (it is open to every pod otherwise, as before). The task text allowed reading "only this job's pods in addition to today's peers"; the only peer found in the cluster is the controller, so those two are the peers. Not verified: that nothing else of kagent connects (the controller's own migrations and pools were not disturbed).
+- **gRPC-Web only.** The gate listens on HTTP/1.1, so native gRPC cannot reach it and the memory RPCs are open for binary gRPC-Web only; base64 text mode and compression are refused.
+- **The upstream issues** (call the prune function, filter `expires_at` in search, verify `trusted-proxy` signatures) are **not filed**; the ADR said they would be by round 3. They need your decision and an account.
+- `bridge.memoryCommands` needs the bridge's agent in `agents[]` in the kagent namespace; a bridge that talks to an agent outside this chart cannot use it.
+
+### Not verified
+
+- A real Telegram `/memories` and `/forget confirm` (no Telegram message was sent). The bridge side is covered by unit tests with a fake gate, and one of them decodes a real controller answer; the gate side was run live with the same protocol.
+- The deletion of an **expired** row on the cluster. Expiry is proven in the throw-away database only (a row cannot expire on the cluster before its `ttlDays`, and the cluster has no expired row); the cluster run found `expired=0`.
+- A cron-fired run of the CronJob (only a manual run), the secret scan deleting rows on the cluster, and the scan patterns on real text (false positives and misses were not measured).
+- PostgreSQL versions other than 17, and a fresh cluster pulling the job image from a registry.
+- Many parallel memory calls through the gate, group chats, and a user id with unusual characters through the bridge.
+- That nothing else in the cluster needs kagent's PostgreSQL than the controller and the job.
+- The cause of the controller restart.
+

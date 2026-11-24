@@ -179,3 +179,14 @@ ADR 0006 round 2 is built and run on the kind cluster. `mcp.profiles` renders on
 - Proven live with two model calls (a profile agent answered with an allowed tool through the gate; `assistant` still completed on the shared vMCP). The refusals ran through the real sandbox with a stub model and no paid call.
 - Not verified: more than one profile on the node, a fresh install from an empty cluster, Cedar `toolAccess` together with profiles.
 
+## 2026-11-24: memory governance (governance round 3)
+
+ADR 0006 round 3 is built and run on the kind cluster: expiry for kagent's memories, `/memories` and `/forget` in the Telegram bridge, and an opt-in scan for secrets. All three are off by default, and 26 renders (default, each demo file, all together, gate on and more) stayed byte-identical to before.
+
+- The problem: kagent 1.0.1 has a function that deletes expired memories and nothing calls it, so `ttlDays` did nothing. Its search and list do not look at `expires_at` either. And only an operator with `psql` could see or delete what is stored about a user.
+- Expiry: a nightly CronJob runs kagent's own two prune statements with the controller's own read/write login, by reference. The log has counts only. The SQL was proven against a throw-away PostgreSQL that the test starts itself (29 assertions), including that search returns expired rows before the job and not after.
+- Forget and list: the gate now lets a caller with `memory: true` call `MemoryService` `List` and `Delete` over gRPC-Web. The user id is the `X-User-Id` header, which the gate sets from the caller's rule, not the message; the gate also parses the one frame and refuses anything but one allowed agent name.
+- Proven live with one model turn: the job completed and the existing nine rows were untouched; own-id calls worked, other ids, other agents, extra message fields, other RPCs and a caller without the flag were refused; a memory saved by the agent was listed and deleted through the gate.
+- One bug on the way, found by the SQL test: kagent's database logins are `NOINHERIT`, so the job must assume the read/write role first, as kagent does.
+- Not verified: a real Telegram `/memories` or `/forget`, an expired row deleted on the cluster, a cron-fired run. The kagent controller restarted once during the canary (it restarts about every 15 minutes on this node); the cause was not found.
+

@@ -103,6 +103,28 @@ governance:
 
 Try it with `VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/governance/demo-values.yaml" ./install.sh`. Evidence from the live run is in ADR 0006, "Round 1 results".
 
+## Memory governance (opt-in, ADR 0006 round 3)
+
+Round 3 closes three gaps around long-term memory, each behind a switch that is off by default (with all off, every default and demo render is byte-identical to before). The full explanation is in [Memory](./memory.md); the security side is this:
+
+```mermaid
+flowchart LR
+  B["Telegram bridge (memory true)"] -->|"gRPC-Web List or Delete, X-User-Id set from the rule"| G["a2a-gate"]
+  S["Schedule or Kourier (no memory flag)"] -.->|"403 reason memory"| G
+  G -->|"one frame, field agent_name only, agent in the rule"| C["kagent controller :8083"]
+  G -.->|"Search, AddSession, every other service and path: 403"| C
+  J["memory-expiry CronJob"] -->|"kagent's prune statements, counts in the log"| P[("kagent PostgreSQL")]
+  C --> P
+  X["Any other pod"] -.->|"times out (policy openagentix-kagent-pg)"| P
+```
+
+- **The gate opens two RPCs, for callers that say so.** A caller whose rule has `memory: true` may call `MemoryService` `List` and `Delete` over binary gRPC-Web, and nothing else of gRPC. The user is not in the message: kagent takes it from `X-User-Id`, which the gate sets from the caller's rule as for A2A (a user id outside the rule gets 403). The gate parses the one frame and refuses anything but one `agent_name` that the rule allows, within 600 bytes. Fail closed: a trailer or compressed frame, a second or unknown field, trailing bytes, a slow body, a wrong length all get 403 or 413 and never reach the controller. Each call is one audit line with `rpc` and no content. The bridge gets the flag only when `bridge.memoryCommands` is on.
+- **A user can see and delete their own memories.** `/memories` and `/forget confirm` in the Telegram chat, for the chat's own user id. The reply is bounded and the log has only an outcome and a count.
+- **Memory expires.** A nightly CronJob runs kagent's own prune statements. The database login is the existing `kagent-postgres-readwrite` Secret by reference. Kagent's PostgreSQL, which was open to every pod, now admits only the controller and this job (`openagentix-kagent-pg`). Whoever can create pods with the job's label in the `kagent` namespace can reach the database, so the boundary is the RBAC for creating pods there.
+- **Secret scan, report only by default.** Counts per pattern name; with `secretScanDelete` it removes the rows. A conservative list, not a guarantee.
+
+What this does not protect: the gate trusts the bridge for which chat sent a command (any user id with the `telegram:` prefix), in a group chat any member can forget the group's memories, expired rows are recalled until the job runs, memory is still plain text in a development database, and there is no filter on the save path.
+
 ## The kagent UI is closed
 
 The kagent UI proxies `/api/`, `/a2a/` and `/mcp` to the controller and forwards `X-User-Id`, and the controller serves memory, sessions and A2A over gRPC-Web on that path. A pod that reached the UI could therefore do what the gate refuses, with the gate on or off. Before the review of round 1 nothing selected the UI pods, and a pod in `default` got HTTP 200 on the memory List call.

@@ -1,0 +1,4 @@
+bin/
+# the Svelte build is copied here by build-web.sh; only the placeholder is committed
+web/dist/*
+!web/dist/PLACEHOLDER

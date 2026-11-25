@@ -2,6 +2,6 @@ apiVersion: v2
 name: openagentix
 description: First-party OpenAgentix resources (Telegram bridge, model gateway config, MCP tool layer, kagent agents). Upstream components are installed by ../../install.sh.
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/openagentix/openagentix

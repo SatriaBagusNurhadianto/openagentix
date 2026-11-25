@@ -60,7 +60,7 @@ export TELEGRAM_ALLOWED_CHAT_IDS=111111111       # required: the bridge refuses 
 ./install.sh
 ```
 
-A cold install from an empty cluster (images already in the local Docker cache) took about 10 minutes (604 s) on a 5 CPU / 7.7 GiB VM; allow longer when every image has to be pulled. If a required variable is missing the script says which one and changes nothing. Re-running is safe.
+A cold install from an empty cluster (images already in the local Docker cache) took about 10 minutes (604 s) on a 5 CPU / 7.7 GiB VM; allow longer when every image has to be pulled. With every demo values file (channels, schedules, notify, observability, knowledge graph, governance) a fresh install on 2026-11-25 took about 23 minutes on a 6 CPU / 8 GiB VM. If a required variable is missing the script says which one and changes nothing. Re-running is safe.
 
 Useful switches: `CREATE_CLUSTER=0`, `SKIP_PREREQS=1`, `FORCE_PREREQS=1`, `SKIP_SKILL=1`, `SKIP_BRIDGE_IMAGE=1`, `SKIP_KB_IMAGE=1`, `SKIP_KB_INGEST=1`, `SKIP_NOTIFY_IMAGE=1`, `VALUES_FILE="my-values.yaml"`. They are documented at the top of `install.sh`.
 

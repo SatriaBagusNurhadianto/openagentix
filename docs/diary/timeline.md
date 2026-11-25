@@ -190,3 +190,14 @@ ADR 0006 round 3 is built and run on the kind cluster: expiry for kagent's memor
 - One bug on the way, found by the SQL test: kagent's database logins are `NOINHERIT`, so the job must assume the read/write role first, as kagent does.
 - Not verified: a real Telegram `/memories` or `/forget`, an expired row deleted on the cluster, a cron-fired run. The kagent controller restarted once during the canary (it restarts about every 15 minutes on this node); the cause was not found.
 
+## 2026-11-25: fresh install from an empty cluster, release 0.2.0
+
+The kind cluster was deleted and built again with one `./install.sh` run and all eight demo values files (channels, schedules, notify, observability, knowledge graph, A2A gate, tool profiles, memory governance). This was the first install from nothing since the bring-up scripts moved to `components/runtime/` and since the governance rounds.
+
+- The run ended with exit code 0 after 22 min 46 s. The longest steps were Substrate (about 7.5 min, image pulls) and kagent (about 4 min).
+- 45 pods Running, agents `assistant` and `profile-demo` Ready, both Kourier bindings Ready, the gate and the profile vMCP `tools-lookup` up. No error or warning in the installer log.
+- A locally signed demo webhook got 200 and the turn ended `completed` in 15 s through the A2A gate (audit line: caller `kourier-demo-assistant`, `SendStreamingMessage`, status 200, user id hashed). A wrong signature got 401.
+- The memory expiry job, started by hand from the CronJob, completed and logged counts only (0 rows on the new cluster).
+- Not verified in this run: a Telegram turn, a schedule run, the knowledge graph canary, and tool-profile refusals (all proven on the previous cluster).
+
+Release `v0.2.0` was tagged after this run. The changelog has one section for it, with upgrade notes for the changed defaults.

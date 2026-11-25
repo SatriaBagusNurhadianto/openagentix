@@ -107,6 +107,9 @@ export interface AgentList {
     items: Agent[];
     used: number;
     warnings: string[];
+    /** True when the cluster holds more objects than the console reads; `cap` is how many it read of each kind. */
+    truncated?: boolean;
+    cap?: number;
 }
 
 export interface OwnedObject {
@@ -122,6 +125,8 @@ export interface Detail extends Agent {
     status?: Status;
     yaml: string;
     objects: OwnedObject[];
+    /** Spec fields the stored object has and the console cannot edit (instructionsFrom, or a later release's). A save keeps them. */
+    unmanaged?: string[];
 }
 
 export interface WriteRequest {
@@ -146,6 +151,8 @@ export interface Session {
     subject: string;
     role: 'operator' | 'viewer';
     canWrite: boolean;
+    /** What the Authorizer allows for a bare resource, per action: create, update, delete, validate. */
+    capabilities?: Record<string, boolean>;
     demo: boolean;
     version: string;
     edition: string;

@@ -140,6 +140,15 @@
         </Notice>
     {/if}
 
+    {#if list?.truncated}
+        <Notice kind="warn" title="The list is cut">
+            <p class="sm" data-testid="truncated">
+                Showing the first {list.cap} agents of each kind. The cluster holds more. Use
+                <code>kubectl get agentdefinitions</code> to see all of them.
+            </p>
+        </Notice>
+    {/if}
+
     <div class="panel">
         <div class="toolbar">
             <input

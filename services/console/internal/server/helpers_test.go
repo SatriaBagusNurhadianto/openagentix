@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,8 @@ type fakeAPI struct {
 	reqs []seen
 	srv  *httptest.Server
 	slow chan struct{}
+	// override, when set, may answer a request itself (return true) before the stateful fake looks at it.
+	override func(w http.ResponseWriter, r *http.Request) bool
 }
 
 func newFakeAPI(t *testing.T) *fakeAPI {
@@ -88,6 +91,9 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	f.reqs = append(f.reqs, seen{r.Method, r.URL.Path, r.URL.RawQuery, r.Header.Clone()})
 	f.mu.Unlock()
+	if f.override != nil && f.override(w, r) {
+		return
+	}
 	if f.slow != nil {
 		select {
 		case <-f.slow:
@@ -102,11 +108,25 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 	dry := r.URL.Query().Get("dryRun") == "All"
 	switch {
 	case r.URL.Path == defs && r.Method == http.MethodGet:
-		items := []any{}
-		for _, d := range f.defs {
-			items = append(items, d)
+		names := []string{}
+		for n := range f.defs {
+			names = append(names, n)
 		}
-		send(w, 200, map[string]any{"items": items})
+		sort.Strings(names)
+		start, end := 0, len(names)
+		if c := r.URL.Query().Get("continue"); c != "" {
+			start, _ = strconv.Atoi(c)
+		}
+		meta := map[string]any{}
+		if l, _ := strconv.Atoi(r.URL.Query().Get("limit")); l > 0 && start+l < end {
+			end = start + l
+			meta["continue"] = strconv.Itoa(end)
+		}
+		items := []any{}
+		for _, n := range names[min(start, len(names)):end] {
+			items = append(items, f.defs[n])
+		}
+		send(w, 200, map[string]any{"items": items, "metadata": meta})
 	case r.URL.Path == defs && r.Method == http.MethodPost:
 		var o map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&o)
@@ -116,7 +136,7 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if sp, _ := o["spec"].(map[string]any); sp["instructions"] == "" || sp["instructions"] == nil {
-			status(w, 422, "Invalid", "invalid", map[string]string{"field": "spec.instructions", "message": "Required value"})
+			status(w, 422, "Invalid", "invalid", map[string]string{"field": "spec.instructions", "message": "Required value", "reason": "FieldValueRequired"})
 			return
 		}
 		o["metadata"].(map[string]any)["resourceVersion"] = f.next()
@@ -144,7 +164,7 @@ func (f *fakeAPI) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if sp, _ := o["spec"].(map[string]any); sp["model"] == "" || sp["model"] == nil {
-				status(w, 422, "Invalid", "invalid", map[string]string{"field": "spec.model", "message": "Required value"})
+				status(w, 422, "Invalid", "invalid", map[string]string{"field": "spec.model", "message": "Required value", "reason": "FieldValueRequired"})
 				return
 			}
 			o["metadata"].(map[string]any)["resourceVersion"] = f.next()
@@ -195,6 +215,9 @@ type rigOpt struct {
 	static  func() *fstest.MapFS
 	timeout int
 	fake    bool
+	// mod changes the server options after the rig has filled them in; kube changes the backend.
+	mod  func(*server.Options)
+	kube func(*backend.Kube)
 }
 
 func newRig(t *testing.T, opts ...func(*rigOpt)) *rig {
@@ -220,7 +243,11 @@ func newRig(t *testing.T, opts ...func(*rigOpt)) *rig {
 		if err != nil {
 			t.Fatal(err)
 		}
-		be = backend.NewKube(kc, "kagent", "api.kagent.dev/v1alpha3", plat)
+		kb := backend.NewKube(kc, "kagent", "api.kagent.dev/v1alpha3", plat)
+		if o.kube != nil {
+			o.kube(kb)
+		}
+		be = kb
 	}
 	var static fstest.MapFS
 	if o.static != nil {
@@ -228,9 +255,15 @@ func newRig(t *testing.T, opts ...func(*rigOpt)) *rig {
 	} else {
 		static = fstest.MapFS{"index.html": {Data: []byte("<!doctype html><title>app</title>")}, "_app/immutable/a.js": {Data: []byte("1")}}
 	}
-	h := server.New(server.Options{Backend: be, Platform: plat, Authenticator: &builtin.TokenAuth{Path: tokPath},
+	sopts := server.Options{Backend: be, Platform: plat, Authenticator: &builtin.TokenAuth{Path: tokPath},
 		Authorizer: builtin.RoleAuthz{Viewer: o.viewer}, Audit: builtin.LogAudit{Log: slog.New(slog.NewJSONHandler(r.audit, nil))},
-		Static: static, Log: slog.New(slog.NewJSONHandler(r.logs, nil)), Namespace: "kagent", Version: "test"})
+		Static: static, Log: slog.New(slog.NewJSONHandler(r.logs, nil)), Namespace: "kagent", Version: "test",
+		// the throttles are tested on their own; the many wrong-token cases of the other tests must not trip them
+		AuthFailLimit: -1, ValidatePerMinute: -1}
+	if o.mod != nil {
+		o.mod(&sopts)
+	}
+	h := server.New(sopts)
 	r.ts = httptest.NewServer(h)
 	t.Cleanup(r.ts.Close)
 	return r
@@ -252,7 +285,9 @@ func (r *rig) do(t *testing.T, method, path string, body any, hdr ...string) (*h
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for i := 0; i+1 < len(hdr); i += 2 {
-		if hdr[i+1] == "" {
+		if hdr[i] == "Host" {
+			req.Host = hdr[i+1]
+		} else if hdr[i+1] == "" {
 			req.Header.Del(hdr[i])
 		} else {
 			req.Header.Set(hdr[i], hdr[i+1])
@@ -302,4 +337,11 @@ func newRigTimeout(t *testing.T, d time.Duration) *rig {
 	r.ts = httptest.NewServer(h)
 	t.Cleanup(r.ts.Close)
 	return r
+}
+
+// decodeBody reads a request body for an override and puts it back for the fake that follows.
+func decodeBody(r *http.Request, v any) error {
+	b, _ := io.ReadAll(r.Body)
+	r.Body = io.NopCloser(bytes.NewReader(b))
+	return json.Unmarshal(b, v)
 }

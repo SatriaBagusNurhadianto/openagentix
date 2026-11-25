@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -16,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,13 +69,31 @@ type Options struct {
 	Context        string
 	Version        string
 	RequestTimeout time.Duration
+
+	// AllowedHosts are host names (optionally with a port) accepted in the Host header besides localhost, 127.0.0.1 and
+	// [::1]; a future Ingress name goes here. Any other Host is answered 421 before routing.
+	AllowedHosts []string
+	// AuthFailLimit is how many failed authentications one remote address may make per ThrottleWindow before it is
+	// answered 429 for a growing back-off. 0: 10. Negative: no throttle (tests).
+	AuthFailLimit int
+	// AuthFailLimitGlobal is the same cap over all addresses together. 0: 10 times AuthFailLimit.
+	AuthFailLimitGlobal int
+	ThrottleWindow      time.Duration // 0: one minute
+	// ValidatePerMinute caps POST /agents/validate per identity. 0: 60. Negative: no cap.
+	ValidatePerMinute int
+	// HSTS adds Strict-Transport-Security to every response. Turn it on when the console is served behind TLS.
+	HSTS bool
+	Now  func() time.Time // the clock of the throttles; nil: time.Now
 }
 
 // Server is the http.Handler.
 type Server struct {
-	o   Options
-	mux *http.ServeMux
-	reg []string
+	o        Options
+	mux      *http.ServeMux
+	reg      []string
+	hosts    *hostList
+	throttle *throttle
+	vrate    *rateLimiter
 }
 
 // New builds the handler.
@@ -84,7 +104,12 @@ func New(o Options) *Server {
 	if o.Log == nil {
 		o.Log = slog.New(slog.NewJSONHandler(io.Discard, nil))
 	}
-	s := &Server{o: o, mux: http.NewServeMux()}
+	s := &Server{o: o, mux: http.NewServeMux(), hosts: newHostList(o.AllowedHosts)}
+	s.throttle = newThrottle(o.AuthFailLimit, o.AuthFailLimitGlobal, o.ThrottleWindow, o.Now)
+	if o.ValidatePerMinute == 0 {
+		o.ValidatePerMinute = 60
+	}
+	s.vrate = newRateLimiter(o.ValidatePerMinute, time.Minute, o.Now)
 	s.handle("GET /healthz", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, 200, map[string]string{"status": "ok"}) })
 	s.handle("GET /api/v1/session", s.api(ext.ActionRead, s.session))
 	s.handle("GET /api/v1/platform", s.api(ext.ActionRead, s.platform))
@@ -113,6 +138,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Cross-Origin-Opener-Policy", "same-origin")
+	h.Set("Cross-Origin-Resource-Policy", "same-origin")
+	if s.o.HSTS {
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+	}
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
 	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz" {
@@ -122,6 +151,18 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = rand.Read(id)
 	rid := hex.EncodeToString(id)
 	h.Set("X-Request-Id", rid)
+	// Before routing, before the token: a Host that is not on the list is answered with a bare 421 (nothing to learn from
+	// it), and an Origin, on any method, must be the allowed host the request itself used.
+	if !s.hosts.allows(r.Host) {
+		w.WriteHeader(http.StatusMisdirectedRequest)
+		return
+	}
+	for _, o := range r.Header.Values("Origin") {
+		if !s.hosts.originOK(o, r.Host) {
+			writeErr(w, http.StatusForbidden, "cross_origin", "This request came from another origin. The console answers only its own pages.")
+			return
+		}
+	}
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete:
 	default:
@@ -179,18 +220,27 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, b)
 }
 
-func (s *Server) backendErr(w http.ResponseWriter, err error) {
+// backendErr answers with the backend's own sentence. An error the console could not classify (code cluster_error) gets
+// one generic sentence plus the request id, and the detail goes to the log under that id: upstream text never reaches
+// the browser.
+func (s *Server) backendErr(w http.ResponseWriter, r *http.Request, err error) {
 	var be *backend.Error
+	rid, _ := r.Context().Value(ridKey{}).(string)
 	switch {
 	case errors.As(err, &be):
-		writeErr(w, be.Status, be.Code, be.Message)
+		msg := be.Message
+		if be.Code == "cluster_error" {
+			msg += " Request id: " + rid + "."
+			s.o.Log.Error("backend", "request_id", rid, "detail", be.Detail)
+		}
+		writeErr(w, be.Status, be.Code, msg)
 	case errors.Is(err, context.DeadlineExceeded):
 		writeErr(w, http.StatusGatewayTimeout, "timeout", "The console did not get an answer in time. Try again.")
 	case errors.Is(err, context.Canceled):
 		writeErr(w, 499, "canceled", "The request was canceled.")
 	default:
-		s.o.Log.Error("backend", "err", err)
-		writeErr(w, http.StatusInternalServerError, "internal", "The console failed to handle this request. Check the console log for the request id.")
+		s.o.Log.Error("backend", "request_id", rid, "err", err)
+		writeErr(w, http.StatusInternalServerError, "internal", "The console failed to handle this request. Check the console log for the request id "+rid+".")
 	}
 }
 
@@ -239,10 +289,11 @@ type call struct {
 	ID  ext.Identity
 	RID string
 	// Name is what the audit line names. A handler whose name comes from the body (create) sets it.
-	Name string
+	Name   string
+	action ext.Action
 }
 
-// api wraps a handler of the API: origin check, authentication, authorisation, and the audit line of a write.
+// api wraps a handler of the API: throttle, authentication, authorisation, and the audit line of a write.
 func (s *Server) api(action ext.Action, h func(http.ResponseWriter, *http.Request, *call)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		rid, _ := r.Context().Value(ridKey{}).(string)
@@ -250,33 +301,114 @@ func (s *Server) api(action ext.Action, h func(http.ResponseWriter, *http.Reques
 			writeErr(w, http.StatusForbidden, "cross_origin", "This request came from another origin. The console accepts changes only from its own pages.")
 			return
 		}
+		addr := remoteAddr(r)
+		if wait := s.throttle.wait(addr); wait > 0 {
+			tooMany(w, "too_many_attempts", "Too many failed sign-in attempts. Wait before you try again.", wait)
+			return
+		}
 		id, err := s.o.Authenticator.Authenticate(r)
 		if err != nil {
+			s.throttle.fail(addr)
 			w.Header().Set("WWW-Authenticate", `Bearer realm="openagentix-console"`)
 			writeErr(w, http.StatusUnauthorized, "unauthenticated", "Sign in with the console token.")
 			return
 		}
 		res := ext.Resource{Kind: "agentdefinition", Name: r.PathValue("name")}
 		sw := &statusWriter{ResponseWriter: w}
-		c := &call{ID: id, RID: rid, Name: res.Name}
+		c := &call{ID: id, RID: rid, Name: res.Name, action: action}
 		audit := func(outcome string) {
+			if !action.Writes() || s.o.Audit == nil {
+				return
+			}
 			res.Name = c.Name
 			if len(res.Name) > 64 {
 				res.Name = res.Name[:64]
 			}
-			if action.Writes() && s.o.Audit != nil {
-				s.o.Audit.Record(r.Context(), ext.AuditEvent{Time: time.Now().UTC(), Subject: id.Subject, Action: action, Resource: res,
-					Outcome: outcome, Status: sw.code, RequestID: rid})
-			}
+			s.record(r.Context(), rid, ext.AuditEvent{Time: time.Now().UTC(), Subject: id.Subject, Action: action, Resource: res, Outcome: outcome, Status: sw.code, RequestID: rid})
 		}
 		if d := s.o.Authorizer.Authorize(r.Context(), id, action, res); !d.Allowed {
 			writeErr(sw, http.StatusForbidden, "forbidden", d.Reason)
 			audit("denied")
 			return
 		}
+		if action == ext.ActionValidate {
+			if ok, wait := s.vrate.allow(id.Subject); !ok {
+				tooMany(sw, "rate_limited", "Too many checks in a minute. Wait a moment, then try again.", wait)
+				return
+			}
+		}
 		h(sw, r, c)
 		audit(outcomeOf(sw.code))
 	}
+}
+
+func tooMany(w http.ResponseWriter, code, msg string, wait time.Duration) {
+	w.Header().Set("Retry-After", strconv.Itoa(int(wait/time.Second)+b2i(wait%time.Second > 0)))
+	writeErr(w, http.StatusTooManyRequests, code, msg)
+}
+
+func b2i(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// record writes the audit line. It is best effort and never changes the response: a panic or an error of the sink is
+// logged with the request id and nothing else happens.
+func (s *Server) record(ctx context.Context, rid string, e ext.AuditEvent) {
+	defer func() {
+		if p := recover(); p != nil {
+			s.o.Log.Error("audit sink panicked", "request_id", rid, "panic", fmt.Sprint(p))
+		}
+	}()
+	if err := s.o.Audit.Record(ctx, e); err != nil {
+		s.o.Log.Error("audit sink failed", "request_id", rid, "err", err.Error())
+	}
+}
+
+// authorizeSpec is the second authorization of a create or an update: now the name and a summary of the spec are known.
+func (s *Server) authorizeSpec(w http.ResponseWriter, r *http.Request, c *call, name string, sum *ext.SpecSummary) bool {
+	d := s.o.Authorizer.Authorize(r.Context(), c.ID, c.action, ext.Resource{Kind: "agentdefinition", Name: name, Spec: sum})
+	if !d.Allowed {
+		writeErr(w, http.StatusForbidden, "forbidden", d.Reason)
+		return false
+	}
+	return true
+}
+
+// preWrite gives a sink that implements ext.PreWriter the chance to refuse the write. It fails closed: an error that is
+// not ext.ErrRefused, or a panic, is 503 and the cluster is not touched.
+func (s *Server) preWrite(w http.ResponseWriter, r *http.Request, c *call) (ok bool) {
+	pw, is := s.o.Audit.(ext.PreWriter)
+	if !is || s.o.Audit == nil {
+		return true
+	}
+	name := c.Name
+	if len(name) > 64 {
+		name = name[:64]
+	}
+	var err error
+	func() {
+		defer func() {
+			if p := recover(); p != nil {
+				err = fmt.Errorf("panic: %v", p)
+			}
+		}()
+		err = pw.PreWrite(r.Context(), ext.AuditEvent{Time: time.Now().UTC(), Subject: c.ID.Subject, Action: c.action,
+			Resource: ext.Resource{Kind: "agentdefinition", Name: name}, Outcome: "pending", RequestID: c.RID})
+	}()
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, ext.ErrRefused):
+		s.o.Log.Warn("write refused by the audit sink", "request_id", c.RID)
+		writeErr(w, http.StatusForbidden, "forbidden", "This change was refused by the console's audit policy.")
+	default:
+		s.o.Log.Error("audit sink unavailable before a write", "request_id", c.RID, "err", err.Error())
+		writeErr(w, http.StatusServiceUnavailable, "audit_unavailable", "The console cannot record this change right now, so it did not make it. Try again later.")
+	}
+	return false
 }
 
 func outcomeOf(code int) string {
@@ -298,19 +430,27 @@ func outcomeOf(code int) string {
 // --- handlers ---
 
 type sessionBody struct {
-	Subject   string `json:"subject"`
-	Role      string `json:"role"`
-	CanWrite  bool   `json:"canWrite"`
-	Demo      bool   `json:"demo"`
-	Version   string `json:"version"`
-	Edition   string `json:"edition"`
-	Namespace string `json:"namespace"`
-	Context   string `json:"context"`
+	Subject  string `json:"subject"`
+	Role     string `json:"role"`
+	CanWrite bool   `json:"canWrite"`
+	// Capabilities is what the Authorizer allows for a bare resource, per action; canWrite is true only when create,
+	// update and delete are all allowed.
+	Capabilities map[string]bool `json:"capabilities"`
+	Demo         bool            `json:"demo"`
+	Version      string          `json:"version"`
+	Edition      string          `json:"edition"`
+	Namespace    string          `json:"namespace"`
+	Context      string          `json:"context"`
 }
 
 func (s *Server) session(w http.ResponseWriter, r *http.Request, c *call) {
 	res := ext.Resource{Kind: "agentdefinition"}
-	can := s.o.Authorizer.Authorize(r.Context(), c.ID, ext.ActionCreate, res).Allowed
+	caps := map[string]bool{}
+	for _, a := range []ext.Action{ext.ActionCreate, ext.ActionUpdate, ext.ActionDelete, ext.ActionValidate} {
+		caps[string(a)] = s.o.Authorizer.Authorize(r.Context(), c.ID, a, res).Allowed
+	}
+	// canWrite is what the UI shows its write controls for: it must not promise more than the Authorizer would allow.
+	can := caps["create"] && caps["update"] && caps["delete"]
 	role := "viewer"
 	if can {
 		role = "operator"
@@ -319,7 +459,7 @@ func (s *Server) session(w http.ResponseWriter, r *http.Request, c *call) {
 	if b, err := s.o.Platform.Get(); err == nil && b.Catalog.Demo {
 		demo = true
 	}
-	writeJSON(w, 200, sessionBody{Subject: c.ID.Subject, Role: role, CanWrite: can, Demo: demo, Version: s.o.Version, Edition: "community",
+	writeJSON(w, 200, sessionBody{Subject: c.ID.Subject, Role: role, CanWrite: can, Capabilities: caps, Demo: demo, Version: s.o.Version, Edition: "community",
 		Namespace: s.o.Namespace, Context: s.o.Context})
 }
 
@@ -345,7 +485,7 @@ func (s *Server) platform(w http.ResponseWriter, r *http.Request, _ *call) {
 func (s *Server) list(w http.ResponseWriter, r *http.Request, _ *call) {
 	l, err := s.o.Backend.List(r.Context())
 	if err != nil {
-		s.backendErr(w, err)
+		s.backendErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, l)
@@ -369,7 +509,7 @@ func (s *Server) get(w http.ResponseWriter, r *http.Request, _ *call) {
 	}
 	d, err := s.o.Backend.Get(r.Context(), name)
 	if err != nil {
-		s.backendErr(w, err)
+		s.backendErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, d)
@@ -402,16 +542,23 @@ func (s *Server) create(w http.ResponseWriter, r *http.Request, c *call) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid", "The name is not valid: "+p+".")
 		return
 	}
+	if !s.authorizeSpec(w, r, c, req.Name, summary(req.Spec, "", "")) || !s.preWrite(w, r, c) {
+		return
+	}
 	d, err := s.o.Backend.Create(r.Context(), req.Name, req.Spec)
 	if err != nil {
-		s.backendErr(w, err)
+		s.backendErr(w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/api/v1/agents/"+url.PathEscape(req.Name))
 	writeJSON(w, http.StatusCreated, d)
 }
 
-func (s *Server) update(w http.ResponseWriter, r *http.Request, _ *call) {
+func summary(sp model.Spec, team, project string) *ext.SpecSummary {
+	return &ext.SpecSummary{Model: sp.Model, ToolProfile: sp.ToolProfile, Team: team, Project: project}
+}
+
+func (s *Server) update(w http.ResponseWriter, r *http.Request, c *call) {
 	var req model.WriteRequest
 	if !decode(w, r, &req) {
 		return
@@ -424,27 +571,39 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request, _ *call) {
 		writeErr(w, http.StatusUnprocessableEntity, "invalid", "Names cannot change; create a new agent instead.")
 		return
 	}
+	c.Name = name
+	// the stored labels are part of the summary: read them (a missing object is answered by the update itself)
+	var team, project string
+	if cur, err := s.o.Backend.Get(r.Context(), name); err == nil {
+		team, project = cur.Team, cur.Project
+	}
+	if !s.authorizeSpec(w, r, c, name, summary(req.Spec, team, project)) || !s.preWrite(w, r, c) {
+		return
+	}
 	d, err := s.o.Backend.Update(r.Context(), name, req.ResourceVersion, req.Spec)
 	if err != nil {
-		s.backendErr(w, err)
+		s.backendErr(w, r, err)
 		return
 	}
 	writeJSON(w, 200, d)
 }
 
-func (s *Server) remove(w http.ResponseWriter, r *http.Request, _ *call) {
+func (s *Server) remove(w http.ResponseWriter, r *http.Request, c *call) {
 	name, ok := pathName(w, r)
 	if !ok {
 		return
 	}
+	if !s.preWrite(w, r, c) {
+		return
+	}
 	if err := s.o.Backend.Delete(r.Context(), name); err != nil {
-		s.backendErr(w, err)
+		s.backendErr(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"name": name, "deleting": true})
 }
 
-func (s *Server) validate(w http.ResponseWriter, r *http.Request, _ *call) {
+func (s *Server) validate(w http.ResponseWriter, r *http.Request, c *call) {
 	var req model.WriteRequest
 	if !decode(w, r, &req) {
 		return
@@ -454,14 +613,19 @@ func (s *Server) validate(w http.ResponseWriter, r *http.Request, _ *call) {
 		return
 	}
 	res := model.ValidateResult{Predicted: []model.Prediction{}, Prediction: true, Note: model.PredictionNote}
-	if req.Name == "" {
+	// A dry run is a write request to the API server. An identity that may not write gets the predictions only.
+	canWrite := s.o.Authorizer.Authorize(r.Context(), c.ID, ext.ActionCreate, ext.Resource{Kind: "agentdefinition"}).Allowed &&
+		s.o.Authorizer.Authorize(r.Context(), c.ID, ext.ActionUpdate, ext.Resource{Kind: "agentdefinition"}).Allowed
+	if !canWrite {
+		res.Schema = model.SchemaResult{OK: true, Skipped: true, Errors: []string{}}
+	} else if req.Name == "" {
 		res.Schema = model.SchemaResult{OK: true, Skipped: true, Errors: []string{}}
 	} else if p := nameProblem(req.Name); p != "" {
 		res.Schema = model.SchemaResult{Errors: []string{p}}
 	} else {
 		sr, err := s.o.Backend.Schema(r.Context(), req.Name, req.Spec)
 		if err != nil {
-			s.backendErr(w, err)
+			s.backendErr(w, r, err)
 			return
 		}
 		res.Schema = sr

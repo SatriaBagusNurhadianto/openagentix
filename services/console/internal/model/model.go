@@ -136,6 +136,9 @@ type AgentList struct {
 	Items    []Agent  `json:"items"`
 	Used     int      `json:"used"` // built definitions, the count maxAgents applies to
 	Warnings []string `json:"warnings"`
+	// Truncated is true when the cluster holds more objects than the console reads; Cap is how many it read of each kind.
+	Truncated bool `json:"truncated"`
+	Cap       int  `json:"cap"`
 }
 
 // Detail is GET /agents/{name}.
@@ -147,6 +150,9 @@ type Detail struct {
 	YAML     string          `json:"yaml"`
 	Chart    json.RawMessage `json:"chart,omitempty"` // chart agents: what could be read of their runtime objects
 	Objects  []OwnedObject   `json:"objects"`
+	// Unmanaged lists the spec fields the stored object has and the console has no control for (instructionsFrom, or a
+	// field a later release added). A save keeps them as they are.
+	Unmanaged []string `json:"unmanaged,omitempty"`
 }
 
 // OwnedObject is a line of the Deploy tab.

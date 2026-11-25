@@ -3,6 +3,7 @@
 package yamlout
 
 import (
+	"bytes"
 	"encoding/json"
 	"regexp"
 	"strconv"
@@ -18,7 +19,7 @@ type Meta struct {
 }
 
 var plain = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_./@-]*$`)
-var reserved = map[string]bool{"true": true, "false": true, "null": true, "yes": true, "no": true, "on": true, "off": true, "~": true}
+var reserved = map[string]bool{"true": true, "false": true, "null": true, "yes": true, "no": true, "on": true, "off": true, "y": true, "n": true, "~": true}
 
 // Scalar renders a string value, quoted only when YAML would read it as something else.
 func Scalar(s string) string {
@@ -28,8 +29,12 @@ func Scalar(s string) string {
 	if plain.MatchString(s) && !reserved[strings.ToLower(s)] {
 		return s
 	}
-	b, _ := json.Marshal(s) // a JSON string is a valid YAML double-quoted scalar
-	return string(b)
+	// a JSON string is a valid YAML double-quoted scalar, and it escapes every character a plain or block scalar could not carry
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(s)
+	return strings.TrimSuffix(buf.String(), "\n")
 }
 
 func flow(items []string) string {
@@ -45,7 +50,7 @@ type w struct{ b strings.Builder }
 func (w *w) line(indent int, f string, a ...any) {
 	w.b.WriteString(strings.Repeat(" ", indent))
 	if len(a) > 0 {
-		w.b.WriteString(strings.TrimRight(sprintf(f, a...), " "))
+		w.b.WriteString(sprintf(f, a...))
 	} else {
 		w.b.WriteString(f)
 	}
@@ -77,8 +82,31 @@ func (w *w) list(indent int, key string, items []string) {
 	}
 }
 
+// blockSafe reports whether a text can be written as a block scalar and read back unchanged: more than one line, no
+// control character (a block scalar cannot carry one), no carriage return or Unicode line break, no line of only
+// whitespace and not only newlines. Anything else is written as a double-quoted scalar with escapes.
+func blockSafe(text string) bool {
+	if !strings.Contains(text, "\n") || strings.Trim(text, "\n") == "" {
+		return false
+	}
+	for _, r := range text {
+		if r == '\n' || r == '\t' {
+			continue
+		}
+		if r < 0x20 || r == 0x7f || r == 0x85 || r == 0x2028 || r == 0x2029 || r == 0xFEFF || r == 0xFFFD {
+			return false
+		}
+	}
+	for _, l := range strings.Split(text, "\n") {
+		if l != "" && strings.TrimSpace(l) == "" {
+			return false
+		}
+	}
+	return true
+}
+
 func (w *w) block(indent int, key, text string) {
-	if !strings.Contains(text, "\n") && !strings.HasPrefix(text, " ") {
+	if !blockSafe(text) {
 		w.line(indent, "%s: %s", key, Scalar(text))
 		return
 	}
@@ -89,15 +117,11 @@ func (w *w) block(indent int, key, text string) {
 	case strings.HasSuffix(text, "\n\n"):
 		mark = "|+"
 	}
-	if strings.HasPrefix(text, " ") || strings.HasPrefix(text, "\n") {
-		mark += "2"
+	if strings.HasPrefix(text, " ") || strings.HasPrefix(text, "\n") || strings.HasPrefix(text, "\t") {
+		mark += "2" // the first line decides the indentation unless it is told
 	}
 	w.line(indent, "%s: %s", key, mark)
-	body := strings.TrimSuffix(text, "\n")
-	if mark == "|+" {
-		body = strings.TrimSuffix(text, "\n")
-	}
-	for _, l := range strings.Split(body, "\n") {
+	for _, l := range strings.Split(strings.TrimSuffix(text, "\n"), "\n") {
 		if l == "" {
 			w.b.WriteByte('\n')
 			continue
@@ -179,7 +203,7 @@ func Render(m Meta, spec model.Spec, st *model.Status) string {
 		if len(st.Conditions) > 0 {
 			o.line(2, "conditions:")
 			for _, c := range st.Conditions {
-				o.line(4, "- type: %s", c.Type)
+				o.line(4, "- type: %s", Scalar(c.Type))
 				o.line(6, "status: %s", Scalar(c.Status))
 				o.line(6, "reason: %s", Scalar(c.Reason))
 				if c.Message != "" {

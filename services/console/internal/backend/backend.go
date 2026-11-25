@@ -14,6 +14,8 @@ type Error struct {
 	Status  int
 	Code    string
 	Message string
+	// Detail is for the log only (the upstream status and a shortened reason). It is never sent to the browser.
+	Detail string
 }
 
 func (e *Error) Error() string { return e.Message }

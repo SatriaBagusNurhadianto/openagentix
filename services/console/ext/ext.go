@@ -44,11 +44,24 @@ const (
 // read-only (viewer) configuration.
 func (a Action) Writes() bool { return a == ActionCreate || a == ActionUpdate || a == ActionDelete }
 
+// SpecSummary is the small part of a definition an Authorizer may decide on. It is set only on the second authorization
+// of a create or an update, after the body was decoded; the instructions and every other field stay out of it.
+type SpecSummary struct {
+	Model       string
+	ToolProfile string
+	// Team and Project are the labels openagentix.io/team and openagentix.io/project. The console does not set labels
+	// itself, so on a create they are empty; on an update they are the ones stored on the object.
+	Team    string
+	Project string
+}
+
 // Resource names what the action is about. Kind is "agentdefinition" for everything this API offers. Name is empty for
-// list and platform reads.
+// list and platform reads, and for the first authorization of a create (the body is not decoded yet). Spec is nil unless
+// the request carries a definition (create and update, second authorization).
 type Resource struct {
 	Kind string
 	Name string
+	Spec *SpecSummary
 }
 
 // Decision is the answer of an Authorizer. Reason is shown to the caller as the 403 message when Allowed is false, so it
@@ -59,6 +72,12 @@ type Decision struct {
 }
 
 // Authorizer decides whether an identity may do an action to a resource.
+//
+// For a create and an update the server asks twice: first with the bare resource (no name for a create, no Spec), a cheap
+// gate before any body is read; then, after the body is decoded, with the name and a SpecSummary. Both must allow. An
+// implementation that decides on the name or the spec must therefore allow the bare question whenever the identity may
+// create or update something, and refuse in the second one. GET /api/v1/session asks the bare question for create, update,
+// delete and validate and reports only what is allowed, so the UI never promises more than the second question would give.
 type Authorizer interface {
 	Authorize(ctx context.Context, id Identity, action Action, res Resource) Decision
 }
@@ -70,13 +89,30 @@ type AuditEvent struct {
 	Subject   string
 	Action    Action
 	Resource  Resource
-	Outcome   string // ok, denied, conflict, not_found, invalid or error
-	Status    int    // the HTTP status sent to the caller
+	Outcome   string // ok, denied, conflict, not_found, invalid or error; "pending" in a PreWrite call
+	Status    int    // the HTTP status sent to the caller; 0 in a PreWrite call
 	RequestID string
 }
 
-// AuditSink receives one event per write. Record must not block for long and must not panic; the server ignores errors
-// (a sink that can fail keeps its own queue).
+// AuditSink receives one event per write.
+//
+// Audit is written AFTER the write and is best effort: Record is called once the answer for the caller is decided, the
+// server recovers from a panic in it, logs an error it returns, and neither changes the response. A write that succeeded
+// and whose audit line then failed is still a write that happened. Record must not block for long.
+//
+// A sink that must never lose a line (fail closed) also implements PreWriter.
 type AuditSink interface {
-	Record(ctx context.Context, e AuditEvent)
+	Record(ctx context.Context, e AuditEvent) error
 }
+
+// PreWriter is an optional interface of an AuditSink. PreWrite is called before the console writes to the cluster (create,
+// update, delete), after authentication and both authorizations, with the same event as the later Record call but
+// Outcome "pending" and Status 0. Returning an error refuses the write: the cluster is not touched and the caller gets 403
+// when the error is or wraps ErrRefused, 503 for any other error (the sink is not available) or a panic. The built-in sink
+// does not implement it.
+type PreWriter interface {
+	PreWrite(ctx context.Context, e AuditEvent) error
+}
+
+// ErrRefused is what a PreWrite returns to say "this write is not allowed" rather than "the sink is broken".
+var ErrRefused = errors.New("refused")

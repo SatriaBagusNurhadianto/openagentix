@@ -277,3 +277,24 @@ test.describe('390 px wide', () => {
         await done();
     });
 });
+
+test('the token field hides the token and can show it', async ({ page }) => {
+    await page.goto('/');
+    const field = page.getByLabel('Console token');
+    await expect(field).toHaveAttribute('type', 'password');
+    await page.getByRole('button', { name: 'Show token' }).click();
+    await expect(field).toHaveAttribute('type', 'text');
+    await page.getByRole('button', { name: 'Hide token' }).click();
+    await expect(field).toHaveAttribute('type', 'password');
+});
+
+test('a request with a foreign Host is refused before anything else (DNS rebinding)', async ({ request }) => {
+    const rebound = await request.get('/api/v1/session', {
+        headers: { Host: 'rebound.example', Authorization: `Bearer ${TOKEN}` },
+    });
+    expect(rebound.status()).toBe(421);
+    expect(await rebound.text()).toBe('');
+    const own = await request.get('/api/v1/session', { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(own.status()).toBe(200);
+    expect(own.headers()['cross-origin-resource-policy']).toBe('same-origin');
+});

@@ -15,9 +15,39 @@ export interface TrapOptions {
     onescape?: () => void;
 }
 
+const SKIP_TAGS = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'LINK', 'META']);
+
 /**
- * Keeps keyboard focus inside the node while it exists, closes on Escape and gives focus back to the element that had it
- * before. This is the focus handling of every overlay (dialog, side sheet, drawer).
+ * Makes everything that is not on the path from `node` up to the body inert, so that nothing behind an overlay can be
+ * reached by keyboard, pointer or screen reader. Elements marked `data-overlay-part` (the scrim) or `data-inert-exempt`
+ * (the toast live region) stay live. Returns the function that lifts exactly what it set.
+ */
+function inertBackground(node: HTMLElement): () => void {
+    const changed: HTMLElement[] = [];
+    let el: HTMLElement | null = node;
+    while (el && el !== document.body) {
+        const parent: HTMLElement | null = el.parentElement;
+        if (!parent) break;
+        for (const sib of Array.from(parent.children)) {
+            if (sib === el || !(sib instanceof HTMLElement) || SKIP_TAGS.has(sib.tagName)) continue;
+            if (
+                sib.hasAttribute('data-overlay-part') ||
+                sib.hasAttribute('data-inert-exempt') ||
+                sib.hasAttribute('inert')
+            )
+                continue;
+            sib.setAttribute('inert', '');
+            changed.push(sib);
+        }
+        el = parent;
+    }
+    return () => changed.forEach((e) => e.removeAttribute('inert'));
+}
+
+/**
+ * The focus handling of every overlay (dialog, side sheet, drawer): the background is inert while it exists, keyboard
+ * focus stays inside it (Tab wraps, and focus that a mouse click or a script moved out is pulled back), Escape closes it,
+ * and focus goes back to the element that had it before.
  */
 export function trapFocus(node: HTMLElement, opts: TrapOptions = {}) {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
@@ -28,7 +58,12 @@ export function trapFocus(node: HTMLElement, opts: TrapOptions = {}) {
         if (i) return i;
         return focusables(node)[0] ?? null;
     }
+    const hadTabindex = node.hasAttribute('tabindex');
+    if (!hadTabindex) node.setAttribute('tabindex', '-1'); // so that a click on empty space inside can still hold focus
+    const lift = inertBackground(node);
     (first() ?? node).focus();
+    let lastInside: HTMLElement | null = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+
     function onkey(e: KeyboardEvent) {
         if (e.key === 'Escape') {
             e.stopPropagation();
@@ -53,13 +88,39 @@ export function trapFocus(node: HTMLElement, opts: TrapOptions = {}) {
             a.focus();
         }
     }
+    // focus moved to another element of the page (a script, or a click on something focusable): bring it back
+    function onfocusin(e: FocusEvent) {
+        const t = e.target;
+        if (!(t instanceof Node)) return;
+        if (node.contains(t)) {
+            if (t instanceof HTMLElement) lastInside = t;
+            return;
+        }
+        if (t instanceof Element && t.closest('[data-inert-exempt], [data-overlay-part]')) return;
+        (lastInside && node.contains(lastInside) ? lastInside : (first() ?? node)).focus();
+    }
+    // focus fell to the body (a click on empty space): once the click has settled, take it back unless it is inside
+    function onfocusout(e: FocusEvent) {
+        if (e.relatedTarget instanceof Node) return; // onfocusin handles a move to an element
+        setTimeout(() => {
+            const a = document.activeElement;
+            if (a && a !== document.body && a !== document.documentElement) return; // the window lost focus, or it is elsewhere
+            (lastInside && node.contains(lastInside) ? lastInside : (first() ?? node)).focus();
+        }, 0);
+    }
     node.addEventListener('keydown', onkey);
+    node.addEventListener('focusout', onfocusout);
+    document.addEventListener('focusin', onfocusin);
     return {
         update(o: TrapOptions) {
             current = o;
         },
         destroy() {
             node.removeEventListener('keydown', onkey);
+            node.removeEventListener('focusout', onfocusout);
+            document.removeEventListener('focusin', onfocusin);
+            if (!hadTabindex) node.removeAttribute('tabindex');
+            lift(); // an inert element cannot take focus, so lift first
             if (opener && document.contains(opener)) opener.focus();
         },
     };

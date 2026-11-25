@@ -10,7 +10,8 @@ export default defineConfig({
     fullyParallel: false,
     retries: 0,
     timeout: 30_000,
-    reporter: [['list']],
+    // in CI the HTML report (with traces and screenshots of failures) is uploaded as an artifact
+    reporter: process.env.CI ? [['list'], ['html', { open: 'never' }]] : [['list']],
     use: { baseURL: `http://127.0.0.1:${PORT}`, trace: 'retain-on-failure', screenshot: 'only-on-failure' },
     projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
     webServer: {

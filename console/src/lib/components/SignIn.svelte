@@ -7,6 +7,7 @@
 
     let token = $state('');
     let busy = $state(false);
+    let show = $state(false);
     let local = $state('');
     const error = $derived(local || ctx.signInError);
     let input: HTMLInputElement | undefined = $state();
@@ -63,19 +64,21 @@
                 label="Console token"
                 bind:value={token}
                 bind:input
-                type="text"
+                type={show ? 'text' : 'password'}
                 mono
                 autocomplete="off"
                 hint="From the Secret console-token in the agents namespace."
-            />
+            >
+                {#snippet trailing()}
+                    <Button
+                        type="button"
+                        variant="secondary"
+                        aria-pressed={show ? 'true' : 'false'}
+                        onclick={() => (show = !show)}>{show ? 'Hide token' : 'Show token'}</Button
+                    >
+                {/snippet}
+            </TextField>
             <div><Button variant="primary" type="submit" {busy}>Sign in</Button></div>
         </form>
     </div>
 </main>
-
-<style>
-    /* the token is a secret: hide it as the person types, without the browser's password manager */
-    :global(.signin input) {
-        -webkit-text-security: disc;
-    }
-</style>

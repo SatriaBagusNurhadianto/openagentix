@@ -14,7 +14,9 @@ this program builds.
    what the fake API server received, and `TestOnlyFixedUpstreamPaths` on the paths.
 2. **Narrow identity.** The console's ServiceAccount reads (see "Deploying") and writes only `agentdefinitions.openagentix.io`.
 3. **Closed network.** The chart's NetworkPolicy admits nobody; the console is reached with `kubectl port-forward`.
-4. **Login.** A bearer token from a mounted Secret, compared in constant time, read again when the file changes. Strict CSP.
+4. **Login.** A bearer token from a mounted Secret, compared in constant time, read again when the file changes. Strict CSP. The
+   real mode refuses to start with a token shorter than 32 characters or equal to `demo-token`; failed sign-ins are throttled; a
+   Host allowlist closes DNS rebinding (see "Protections").
 5. **One operator identity.** Every user acts as `console`.
 6. **Only real data.** The API returns what the cluster and the two mounted files hold, nothing else. The demo mode says so.
 
@@ -23,18 +25,36 @@ this program builds.
 | Route | Does |
 |---|---|
 | `GET /healthz` | liveness and readiness; no token |
-| `GET /api/v1/session` | who am I (`console`), role (`operator` or `viewer`), `canWrite`, `demo`, version, namespace |
+| `GET /api/v1/session` | who am I (`console`), role (`operator` or `viewer`), `canWrite`, `capabilities` (`create`, `update`, `delete`, `validate`: what the Authorizer allows for a bare resource; `canWrite` is true only when the first three are), `demo`, version, namespace |
 | `GET /api/v1/platform` | catalog and policy summary read from the two mounted JSON files; no secrets, no images |
-| `GET /api/v1/agents` | built definitions plus chart agents (`source: "chart"`, read-only), `used` = built definitions counted by `maxAgents` |
+| `GET /api/v1/agents` | built definitions plus chart agents (`source: "chart"`, read-only), `used` = built definitions counted by `maxAgents`; `truncated` and `cap` when the cluster holds more than the console reads (see "Bounded reads") |
 | `POST /api/v1/agents` | create a definition: body `{name, spec}`; 201, 409 `exists`, 422 `invalid` |
-| `POST /api/v1/agents/validate` | dry run: the API server's schema check with `dryRun=All` (nothing is written) and a **predicted** list |
-| `GET /api/v1/agents/{name}` | spec, status, conditions, YAML text; for a chart agent what could be read of it, `readOnly: true` |
+| `POST /api/v1/agents/validate` | dry run: the API server's schema check with `dryRun=All` (nothing is written) and a **predicted** list. An identity that may not write (viewer) gets the predictions only (`schema.skipped: true`): no request reaches the cluster. Limited per identity per minute (429 `rate_limited`) |
+| `GET /api/v1/agents/{name}` | spec, status, conditions, YAML text; for a chart agent what could be read of it, `readOnly: true`; `unmanaged` lists spec fields the console cannot edit (see "Saving keeps what it does not know") |
 | `PUT /api/v1/agents/{name}` | update `spec`; body `{resourceVersion, spec}`; 409 `conflict` when the version is stale |
 | `DELETE /api/v1/agents/{name}` | delete a definition; 202 (the controller's finalizer removes the rest) |
 | `/` | any other path: the web app for `GET` and `HEAD` (files, then `index.html` for single-page routes), a JSON 404 or 405 otherwise |
 
 Everything under `/api/` needs `Authorization: Bearer <token>` (401 otherwise, `WWW-Authenticate: Bearer`). Methods other than
 GET, HEAD, POST, PUT and DELETE are 405. Errors are `{"error": {"code", "message"}}` with one plain sentence.
+
+**Errors from the cluster.** Nothing the Kubernetes API server wrote (its message, a cause's message, the text of an admission
+webhook or policy) is sent to the browser. A refusal is mapped to the console's own sentence: `not_found`, `conflict` or `exists`,
+`cluster_forbidden` (the ServiceAccount may not), `quota_exceeded`, `admission_denied` ("a policy in the cluster refused it"),
+and `invalid`, which names the field paths (`spec.instructions is required`) and nothing else. Anything the console cannot classify
+is one generic sentence, `cluster_error`, with the request id (also the `X-Request-Id` header); the upstream status and a shortened
+reason are in the console log under that id. Tests: `TestUpstreamErrorTextIsNeverEchoed`, `TestUpstreamErrorTextOnReadAndValidate`.
+
+**Bounded reads.** Lists are read from the API server a page at a time (`limit=100` and `continue`), up to `CONSOLE_LIST_MAX`
+objects per kind (500). When there is more, the answer says `truncated: true, cap: N` and the registry shows "Showing the first N
+agents of each kind". `used`, which the policy limit `maxAgents` is compared with, then counts only what was read.
+
+**Saving keeps what it does not know.** An update reads the stored object and replaces only the fields the console manages
+(`description`, `model`, `instructions`, `toolProfile`, `tools`, `knowledge`, `notify`, `memory`, `skills`, `egress`, `suspend`; a
+field the editor left empty is removed). Every other field of `spec`, and all metadata, is sent back as it was, so
+`kubectl`-added fields survive; the same merged object is what the dry run of `validate` sends. A definition that takes its prompt
+from a ConfigMap (`instructionsFrom`) is shown with the instructions read-only and a notice, a save sends no `instructions`, and
+`instructions` typed next to it is refused with 422.
 
 **Chart agents.** kagent `agents.api.kagent.dev` objects that carry no `openagentix.io/agent-definition` label are listed as
 `source: chart`. Their template, harness and model config are read (best effort; a refusal becomes a `warnings` entry) to
@@ -54,7 +74,8 @@ The console reads and writes `AgentDefinition` in the shape of ADR 0012 ("Change
 `{enabled, collections|destinations}`, `spec.skills` is `[{name, version?}]`, `spec.suspend` pauses an agent (state `paused`).
 The old boolean and string-list forms are refused (400, unknown or mistyped field). From `status` it reads only the public contract:
 `conditions`, `observedGeneration`, `endpoint`, `revision`, `effectiveTools`, `effectiveEgress`, `violations`, `capabilities`,
-`agentRef`; `status.controller` is passed on as internal and never relied on. Labels `openagentix.io/team` and `openagentix.io/project`
+`agentRef`; `status.controller` is passed on as opaque JSON for a collapsed "internal" section and nothing reads a named field of it
+(the Deploy tab lists the runtime Agent from `status.agentRef`, not a Secret from the controller block). Labels `openagentix.io/team` and `openagentix.io/project`
 are shown as tags. Chart agents are read from kagent objects and mapped to the same shape.
 
 ## Settings (environment)
@@ -62,7 +83,7 @@ are shown as tags. Chart agents are read from kagent objects and mapped to the s
 | Variable | Default | Meaning |
 |---|---|---|
 | `CONSOLE_ADDR` | `:8080` (`127.0.0.1:8080` in demo mode) | listen address |
-| `CONSOLE_TOKEN_FILE` | required | file holding the login token (the mounted Secret); read again when it changes |
+| `CONSOLE_TOKEN_FILE` | required | file holding the login token (the mounted Secret); read again when it changes. In the real mode at least 32 characters and not `demo-token`: the console will not start with a weaker one, and a rotation to a weaker one makes it refuse everybody. Generate one with `openssl rand -hex 32` |
 | `CONSOLE_CATALOG_FILE` | required | the platform catalog JSON the controller reads |
 | `CONSOLE_POLICY_FILE` | required | the platform policy JSON the controller reads |
 | `CONSOLE_NAMESPACE` | the catalog's `namespaces.agents` | the only namespace the console reads and writes |
@@ -74,6 +95,13 @@ are shown as tags. Chart agents are read from kagent objects and mapped to the s
 | `CONSOLE_CONTEXT` | empty | text shown under the wordmark (for example `kind-openagentix · kagent`) |
 | `CONSOLE_REQUEST_TIMEOUT` | `15s` | per-request deadline, also passed to the Kubernetes calls |
 | `CONSOLE_LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error` |
+| `CONSOLE_ALLOWED_HOSTS` | empty | comma-separated host names (optional `:port`) accepted in the `Host` header besides `localhost`, `127.0.0.1` and `[::1]`; set it for an Ingress name. Any other Host is answered `421` |
+| `CONSOLE_AUTH_FAIL_LIMIT` | `10` | failed sign-ins per remote address per minute before `429` with `Retry-After`; the back-off doubles per round up to 15 minutes |
+| `CONSOLE_AUTH_FAIL_LIMIT_GLOBAL` | `100` | the same cap over all addresses together |
+| `CONSOLE_VALIDATE_PER_MINUTE` | `60` | `POST /agents/validate` per identity per minute |
+| `CONSOLE_LIST_MAX` | `500` | most definitions (and most chart agents) a list reads |
+| `CONSOLE_HSTS` | off | `1` sends `Strict-Transport-Security: max-age=31536000; includeSubDomains`; turn it on when the console is served behind TLS |
+| `CONSOLE_ALLOW_INSECURE_KUBE_API` | off | development only: accept an `http://` `CONSOLE_KUBE_API`. Otherwise the console refuses to start, because the ServiceAccount token is sent with every request |
 | `CONSOLE_DEV_FAKE` | off | demo mode, see below |
 | `CONSOLE_DEV_FAKE_SETTLE` | `8` | demo mode: seconds before the fake controller gives a new or changed definition a verdict (0: never) |
 
@@ -85,22 +113,62 @@ call `server.New`, once that package is made public too; today only `ext` is pub
 ```go
 type Authenticator interface { Authenticate(r *http.Request) (Identity, error) }      // error: 401
 type Authorizer    interface { Authorize(ctx, Identity, Action, Resource) Decision }  // not allowed: 403 with Decision.Reason
-type AuditSink     interface { Record(ctx, AuditEvent) }                              // one call per write
+type AuditSink     interface { Record(ctx, AuditEvent) error }                        // one call per write, best effort
+type PreWriter     interface { PreWrite(ctx, AuditEvent) error }                      // optional, on the sink: refuse a write
 ```
 
-Community implementations (`internal/builtin`): `TokenAuth` (bearer token from a file, constant-time compare), `RoleAuthz` (one
-role that may do everything; `CONSOLE_VIEWER` makes writes 403) and `LogAudit` (one JSON log line per write on stdout:
-`who`, `action`, `agent`, `outcome`, `status`, `request_id`). `AuditEvent` has no field for a body, an instruction text or a
+**Authorizer.** `Resource` is `{Kind, Name, Spec *SpecSummary}`; `SpecSummary` is `{Model, ToolProfile, Team, Project}` (the labels
+`openagentix.io/team` and `openagentix.io/project`; the console sets no labels, so on a create they are empty and on an update they
+are the stored ones). For a create and an update the Authorizer is asked **twice**: first with the bare resource (no name for a
+create, no spec), as a cheap gate before any body is read; then, after the body is decoded, with the name and the summary. Both must
+allow; a refusal on the second is a 403 with the Authorizer's own `Reason`, audited as `denied`, and nothing reaches the cluster.
+An implementation that decides on name or spec must therefore allow the bare question whenever the identity may create or update
+something. `GET /api/v1/session` asks the bare question for create, update, delete and validate and reports `capabilities` and
+`canWrite` from the answers, so the UI does not promise more than the Authorizer will give.
+
+**AuditSink.** The audit line is written **after** the write, from the answer that is about to be sent, and is **best effort**: a
+panic in `Record` is recovered and an error it returns is logged with the request id; neither can crash the request or change the
+response. A write that happened and whose audit line failed still happened. A sink that must not lose a line implements
+`PreWriter` as well: `PreWrite` runs after authentication and both authorizations and before the cluster is touched, with the event
+(`Outcome: "pending"`, `Status: 0`). An error that is, or wraps, `ext.ErrRefused` answers 403; any other error, or a panic, answers
+503 `audit_unavailable` (fail closed); the write is not made. The built-in sink does not implement it.
+
+Community implementations (`internal/builtin`): `TokenAuth` (bearer token from a file, constant-time compare, optional minimum
+length), `RoleAuthz` (one role that may do everything; `CONSOLE_VIEWER` makes writes 403) and `LogAudit` (one JSON log line per write
+on stdout: `who`, `action`, `agent`, `outcome`, `status`, `request_id`). `AuditEvent` has no field for a body, an instruction text or a
 token, so a sink cannot log them. Denied writes are audited too (`outcome: denied`).
 
 ## Protections
 
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'` and
-  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin` on **every** response; `Cache-Control: no-store` on the API.
-- A `POST`, `PUT` or `DELETE` with a foreign `Origin`, or `Sec-Fetch-Site` other than `same-origin` or `none`, gets 403 `cross_origin`.
+- **Host allowlist, before routing, on every request** (also `/healthz` and the app shell): `localhost`, `127.0.0.1` and `[::1]` with
+  any port, plus `CONSOLE_ALLOWED_HOSTS`. Anything else is a bare `421`. A web page that rebinds its own name to `127.0.0.1` reaches a
+  port-forward with that name in `Host` and in `Origin`, so comparing the two proves nothing; the list does. An `Origin` header, on any
+  method, must be on the list and name the host and port of the request (`null` and the rest: 403 `cross_origin`).
+  *Kubelet probes:* an `httpGet` probe sends the pod IP as `Host`, which is not on the list. The chart's probes for the console must
+  carry `httpHeaders: [{name: Host, value: localhost}]`.
+- **Failed-sign-in throttle:** after `CONSOLE_AUTH_FAIL_LIMIT` failed authentications from one remote address inside a minute, that
+  address gets `429` (code `too_many_attempts`, `Retry-After`) for a minute, then two, four, up to fifteen; a global cap
+  (`CONSOLE_AUTH_FAIL_LIMIT_GLOBAL`) does the same for all addresses together. During a back-off even the right token waits, so the
+  answer is no oracle. Successful requests are not counted, the app shell and `/healthz` are never throttled, memory is bounded (at
+  most 2048 addresses; beyond that new addresses share one entry), and the clock is injectable (`Options.Now`). The remote address is
+  the TCP peer: `X-Forwarded-For` is not read. Behind a port-forward every client is `127.0.0.1`, so the per-address cap is then also a cap
+  for everybody; that is why the lock-out is short at first.
+- **Token strength:** the real mode refuses to start, with a message that says why, for a token shorter than 32 characters or equal to
+  `demo-token`.
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Resource-Policy: same-origin` on **every** answer the console writes (including the 421 and 403 above);
+  `Cache-Control: no-store` on the API. **Exception:** the 400 and 431 answers that Go's `net/http` writes itself (a malformed request line, a header block over
+  16 KiB) are produced before any handler runs and carry no console headers; they are a fixed plain-text line that reflects nothing
+  of the request. **HSTS** (`Strict-Transport-Security`) is required whenever the console is served behind TLS (an Ingress, a mesh);
+  set `CONSOLE_HSTS=1` there. It is off by default because a console on plain HTTP behind a port-forward must not tell browsers to
+  insist on HTTPS for `localhost`.
+- A `POST`, `PUT` or `DELETE` with `Sec-Fetch-Site` other than `same-origin` or `none`, or a foreign `Origin`, gets 403 `cross_origin`.
 - Bodies must be `application/json` (415), at most 256 KiB (413), without unknown fields or trailing data (400).
 - Header block at most 16 KiB (431), read deadline, per-request deadline (504), `{name}` in a path must be a definition name.
-- A write is sent to the API server with the console's own ServiceAccount token and `fieldManager=openagentix-console`.
+- A write is sent to the API server with the console's own ServiceAccount token and `fieldManager=openagentix-console`. The API
+  address must be `https://` (the console refuses `http://` unless `CONSOLE_ALLOW_INSECURE_KUBE_API=1`, for a local development server).
+- `POST /agents/validate` is limited per identity (`CONSOLE_VALIDATE_PER_MINUTE`), and sends no dry-run write for an identity that may not write.
 
 ## Demo mode
 
@@ -119,13 +187,19 @@ CONSOLE_DEV_FAKE=1 go run ./cmd/console        # open http://127.0.0.1:8080 and 
 ## Build and test
 
 ```sh
-make test          # go test ./... -race
+make test          # go test ./... -race (the YAML tests use gopkg.in/yaml.v3, a test-only dependency)
 make web           # ./build-web.sh
 make build         # CGO_ENABLED=0 go build -o bin/console ./cmd/console (with the web app embedded)
 make docker        # docker build; the Dockerfile builds the web app in a Node stage first
 ```
 
-`web/dist/` holds only `PLACEHOLDER` in Git; `build-web.sh` fills it. Before the first front-end build the binary still compiles, and
+The image build (`docker build -f services/console/Dockerfile .`) uses the **repository root** as its context: it copies `console/`
+and `services/console/`. A root `.dockerignore` sends nothing else. CI builds it that way (the Dockerfile carries the comment line
+`# build-context: .`, which `hack/ci/dockerfiles.sh` reads). The base images are pinned by digest (the tag is in a comment above each
+`FROM`); pnpm is the version pinned by `packageManager` in `console/package.json`. CI jobs for the web app: `console`,
+`console-audit`, `console-e2e` (`make test-console`, `make test-console-e2e`).
+
+`web/dist/` holds only `PLACEHOLDER` in Git; `build-web.sh` fills it (and keeps the placeholder). Before the first front-end build the binary still compiles, and
 the app shell answers 503 with a hint.
 
 ## Deploying (what the chart needs)
@@ -137,6 +211,8 @@ the app shell answers 503 with a hint.
 - **Secret** `console-token`, key `token`, generated by `install.sh` when absent and never printed; mounted as a file, path in `CONSOLE_TOKEN_FILE`.
 - **Mounts** the two ConfigMaps the controller reads (catalog and policy) as files, paths in `CONSOLE_CATALOG_FILE` and `CONSOLE_POLICY_FILE`.
 - **NetworkPolicy** ingress: nobody (use `kubectl port-forward svc/console 8080:8080`); egress: DNS and the Kubernetes API only.
-- **Probes** `GET /healthz` (no token) on 8080.
-- **Env** `CONSOLE_NAMESPACE=kagent`, optionally `CONSOLE_CONTEXT`, `CONSOLE_VIEWER=1` for a read-only console.
+- **Probes** `GET /healthz` (no token) on 8080, with the header `Host: localhost` (`httpGet.httpHeaders`): the Host allowlist answers 421 to the
+  pod IP that the kubelet would send otherwise.
+- **Env** `CONSOLE_NAMESPACE=kagent`, optionally `CONSOLE_CONTEXT`, `CONSOLE_VIEWER=1` for a read-only console, `CONSOLE_ALLOWED_HOSTS`
+  and `CONSOLE_HSTS=1` when an Ingress with TLS is added. `install.sh` must create a `console-token` of at least 32 characters.
 - The catalog may carry `"demo": true` (rendered from the demo values files); then the web app shows its "Demo data" tag.

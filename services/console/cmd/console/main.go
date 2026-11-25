@@ -82,21 +82,30 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 		if ns == "" {
 			return errors.New("CONSOLE_NAMESPACE is not set and the catalog names no agents namespace")
 		}
-		ta := &builtin.TokenAuth{Path: cfg.TokenFile}
-		if st, err := os.Stat(cfg.TokenFile); err != nil || st.Size() == 0 {
+		ta := &builtin.TokenAuth{Path: cfg.TokenFile, MinLen: config.MinTokenLen, Reject: []string{config.DemoToken}}
+		st, err := os.Stat(cfg.TokenFile)
+		if err != nil || st.Size() == 0 {
 			return fmt.Errorf("CONSOLE_TOKEN_FILE %s is missing or empty: the installer creates the console token Secret", cfg.TokenFile)
+		}
+		if tok, err := os.ReadFile(cfg.TokenFile); err != nil {
+			return fmt.Errorf("CONSOLE_TOKEN_FILE %s cannot be read: %w", cfg.TokenFile, err)
+		} else if why := builtin.WeakToken(string(tok), config.MinTokenLen, ta.Reject); why != "" {
+			return fmt.Errorf("the console token in %s is too weak (%s). Anyone who can reach the port can try tokens, so the console will not start with it; generate a long random one, for example: openssl rand -hex 32", cfg.TokenFile, why)
 		}
 		auth = ta
 		kc, err := kube.New(cfg.KubeAPI, cfg.KubeTokenFile, cfg.KubeCAFile)
 		if err != nil {
 			return err
 		}
-		be = backend.NewKube(kc, ns, cfg.KagentAPI, plat)
+		kb := backend.NewKube(kc, ns, cfg.KagentAPI, plat)
+		kb.Cap = cfg.ListMax
+		be = kb
 	}
 	h := server.New(server.Options{
 		Backend: be, Platform: plat, Authenticator: auth, Authorizer: builtin.RoleAuthz{Viewer: cfg.Viewer},
 		Audit:  builtin.LogAudit{Log: slog.New(slog.NewJSONHandler(d.Stdout, nil))},
 		Static: web.FS(), Log: d.Log, Demo: cfg.DevFake, Namespace: ns, Context: cfg.Context, Version: version, RequestTimeout: cfg.RequestTimeout,
+		AllowedHosts: cfg.AllowedHosts, AuthFailLimit: cfg.AuthFailLimit, AuthFailLimitGlobal: cfg.AuthFailLimitGlobal, ValidatePerMinute: cfg.ValidatePerMinute, HSTS: cfg.HSTS,
 	})
 	ln, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {

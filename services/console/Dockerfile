@@ -1,21 +1,31 @@
 # syntax=docker/dockerfile:1
 # Build context is the repository root: docker build -f services/console/Dockerfile .
-FROM node:22 AS web
+# build-context: .
+#
+# Base images are pinned by digest (the multi-platform index; the tag each digest was taken from is in the comment above it).
+# To update: docker buildx imagetools inspect <tag>, copy the "Digest:" line here.
+
+# node:22
+FROM node:22@sha256:7c400d78797d8cbe3f6bb21d2227b86af4cd24b0014cc9f62ff989cc16de988e AS web
+# package.json carries "packageManager": "pnpm@<version>+sha512.<hash>", so corepack fetches exactly that pnpm and checks its hash
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN corepack enable
 WORKDIR /src/console
-COPY console/package.json console/pnpm-lock.yaml ./
+COPY console/package.json console/pnpm-lock.yaml console/pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 COPY console/ ./
 RUN pnpm build
 
-FROM golang:1.25 AS build
+# golang:1.25
+FROM golang:1.25@sha256:699337d620559a59b4a2bb298ad59611e535d2ee755a34cf2d2a98f37578dc80 AS build
 WORKDIR /src
 COPY services/console/ ./
 COPY --from=web /src/console/build ./web/dist
 ARG VERSION=dev
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/console ./cmd/console
 
-FROM gcr.io/distroless/static:nonroot
+# gcr.io/distroless/static:nonroot
+FROM gcr.io/distroless/static:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
 COPY --from=build /out/console /console
 USER nonroot:nonroot
 EXPOSE 8080

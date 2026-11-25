@@ -21,6 +21,7 @@ interface World {
     validate: ValidateResult;
     calls: { method: string; url: string; body?: unknown }[];
     putStatus?: number;
+    listExtra?: Record<string, unknown>;
 }
 let w: World;
 
@@ -43,6 +44,7 @@ function route(world: World) {
                 ],
                 used: 2,
                 warnings: [],
+                ...world.listExtra,
             });
         }
         if (url === '/api/v1/agents/validate') return json(200, world.validate);
@@ -334,3 +336,77 @@ describe('builder', () => {
 function cleanupCalls() {
     w.calls.length = 0;
 }
+
+describe('bounded lists', () => {
+    it('says how many agents it shows when the console cut the list', async () => {
+        w.listExtra = { truncated: true, cap: 500 };
+        render(AgentRegistry);
+        await screen.findByRole('link', { name: 'researcher' });
+        const n = screen.getByTestId('truncated');
+        expect(n).toHaveTextContent('Showing the first 500 agents of each kind');
+        expect(n).toHaveTextContent('kubectl');
+    });
+    it('says nothing when the list is complete', async () => {
+        render(AgentRegistry);
+        await screen.findByRole('link', { name: 'researcher' });
+        expect(screen.queryByTestId('truncated')).toBeNull();
+    });
+});
+
+describe('fields the console does not manage', () => {
+    it('opens the instructions read-only when they come from a ConfigMap, and saves without them', async () => {
+        w.detail = detail({
+            unmanaged: ['instructionsFrom'],
+            spec: { model: 'claude-haiku', instructions: '', description: 'd' },
+        });
+        render(AgentBuilder, { name: 'researcher' });
+        const ins = await screen.findByLabelText('Instructions');
+        expect(ins).toHaveAttribute('readonly');
+        expect(screen.getByTestId('unmanaged')).toHaveTextContent('instructionsFrom');
+        expect(screen.getByTestId('unmanaged')).toHaveTextContent('ConfigMap');
+        // the other fields stay editable, and the empty instructions do not block a save
+        await userEvent.type(screen.getByLabelText('Description'), '!');
+        await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+        await waitFor(() => expect(w.calls.find((c) => c.method === 'PUT')).toBeTruthy());
+        expect(w.calls.find((c) => c.method === 'PUT')!.body).toMatchObject({
+            spec: { description: 'd!', instructions: '' },
+        });
+    });
+    it('names other fields it keeps untouched', async () => {
+        w.detail = detail({ unmanaged: ['futureField'] });
+        render(AgentBuilder, { name: 'researcher' });
+        await screen.findByLabelText('Instructions');
+        expect(screen.getByLabelText('Instructions')).not.toHaveAttribute('readonly');
+        expect(screen.getByTestId('unmanaged')).toHaveTextContent('futureField');
+        expect(screen.getByTestId('unmanaged')).toHaveTextContent('kept as they are');
+    });
+});
+
+describe('the live check is debounced', () => {
+    it('sends one validate request for a burst of typing', async () => {
+        render(AgentBuilder, { name: 'researcher' });
+        const ins = await screen.findByLabelText('Instructions');
+        await userEvent.type(ins, ' one two three four five');
+        await waitFor(() => expect(w.calls.some((c) => c.url === '/api/v1/agents/validate')).toBe(true), {
+            timeout: 3000,
+        });
+        await new Promise((r) => setTimeout(r, 900));
+        expect(w.calls.filter((c) => c.url === '/api/v1/agents/validate').length).toBe(1);
+    });
+});
+
+describe('overlays', () => {
+    it('makes the page inert behind the delete dialog and gives focus back to the button', async () => {
+        const { container } = render(AgentBuilder, { name: 'researcher' });
+        await screen.findByLabelText('Instructions');
+        const opener = screen.getByRole('button', { name: 'Delete' });
+        await userEvent.click(opener);
+        const dlg = await screen.findByRole('alertdialog');
+        expect(dlg.contains(document.activeElement)).toBe(true);
+        expect(container.querySelector('.bgrid')?.closest('[inert]')).not.toBeNull();
+        await userEvent.keyboard('{Escape}');
+        await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+        expect(container.querySelector('[inert]')).toBeNull();
+        expect(document.activeElement).toBe(opener);
+    });
+});

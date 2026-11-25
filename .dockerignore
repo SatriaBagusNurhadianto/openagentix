@@ -1,0 +1,27 @@
+# Used by builds whose context is the repository root. Today that is one image: services/console/Dockerfile (it copies
+# console/ and services/console/). Every other Dockerfile is built with its own directory as the context and is not
+# affected. Everything is excluded first, then what the console image copies is let back in, so a stray .env, a spike or
+# a local build output can never end up in the build context (or in a layer).
+*
+!console
+!services/console
+
+# what must not travel even inside those two directories
+**/node_modules
+**/.svelte-kit
+console/build
+console/test-results
+console/playwright-report
+console/.vite
+services/console/bin
+services/console/web/dist/*
+!services/console/web/dist/PLACEHOLDER
+**/.env*
+**/*.local
+**/coverage.out
+
+# named for clarity (the first line already excludes them)
+.git
+spikes
+WHAT.txt
+website/node_modules

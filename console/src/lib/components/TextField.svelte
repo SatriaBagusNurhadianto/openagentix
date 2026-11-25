@@ -1,4 +1,5 @@
 <script lang="ts">
+    import type { Snippet } from 'svelte';
     // A label above a single-line control, with hint, counter and error below it (UI-SPEC section 5, "Field").
     interface Props {
         label: string;
@@ -13,7 +14,7 @@
         mono?: boolean;
         maxlength?: number;
         placeholder?: string;
-        type?: 'text' | 'number' | 'search';
+        type?: 'text' | 'number' | 'search' | 'password';
         min?: number;
         max?: number;
         autocomplete?: 'off' | 'on';
@@ -21,6 +22,8 @@
         oninput?: () => void;
         onchange?: () => void;
         input?: HTMLInputElement;
+        /** A control shown after the input (the show and hide button of a secret). */
+        trailing?: Snippet;
     }
     let {
         label,
@@ -43,6 +46,7 @@
         oninput,
         onchange,
         input = $bindable(),
+        trailing,
     }: Props = $props();
     const uid = $props.id();
     const fid = $derived(id ?? `f-${uid}`);
@@ -53,25 +57,28 @@
 
 <div class="field {error ? 'bad' : ''} {cls}">
     <label for={fid}>{label}</label>
-    <input
-        id={fid}
-        bind:this={input}
-        bind:value
-        class={mono ? 'mono' : ''}
-        {type}
-        {readonly}
-        {disabled}
-        {maxlength}
-        {placeholder}
-        {min}
-        {max}
-        {autocomplete}
-        spellcheck="false"
-        aria-invalid={error ? 'true' : undefined}
-        aria-describedby={described}
-        {oninput}
-        {onchange}
-    />
+    <div class={trailing ? 'flex gap-2' : 'contents'}>
+        <input
+            id={fid}
+            bind:this={input}
+            bind:value
+            class={mono ? 'mono' : ''}
+            {type}
+            {readonly}
+            {disabled}
+            {maxlength}
+            {placeholder}
+            {min}
+            {max}
+            {autocomplete}
+            spellcheck="false"
+            aria-invalid={error ? 'true' : undefined}
+            aria-describedby={described}
+            {oninput}
+            {onchange}
+        />
+        {@render trailing?.()}
+    </div>
     {#if hint || counter}
         <div class="hint">
             <span id="{fid}-hint">{hint ?? ''}</span>

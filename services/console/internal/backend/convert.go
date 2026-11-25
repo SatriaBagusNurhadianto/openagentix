@@ -25,6 +25,8 @@ type Definition struct {
 	Meta   Meta         `json:"metadata"`
 	Spec   model.Spec   `json:"spec"`
 	Status model.Status `json:"status"`
+	// Unmanaged are the keys of the stored spec the console has no control for (see model.Detail.Unmanaged).
+	Unmanaged []string `json:"-"`
 }
 
 func nz[T any](s []T) []T {
@@ -82,13 +84,14 @@ func BuiltDetail(d Definition) model.Detail {
 		Agent: BuiltAgent(d), Spec: &spec, Status: &st,
 		YAML: yamlout.Render(yamlout.Meta{Name: d.Meta.Name, Namespace: d.Meta.Namespace, Generation: d.Meta.Generation,
 			ResourceVersion: d.Meta.ResourceVersion, CreationTimestamp: d.Meta.CreationTimestamp}, d.Spec, &st),
-		Objects: ownedObjects(d),
+		Objects: ownedObjects(d), Unmanaged: d.Unmanaged,
 	}
 	return det
 }
 
-// ownedObjects lists what the runtime adapter makes for a definition. Only the Agent and the key Secret are named by
-// the status; the others are listed by kind, because the console does not read them (and so does not invent their names).
+// ownedObjects lists what the runtime adapter makes for a definition. Only the Agent is named by the public status
+// (agentRef); the others are listed by kind, because the console does not read them (and so does not invent their names).
+// Nothing here reads status.controller: that block is internal, shown opaque and relied on by nothing.
 func ownedObjects(d Definition) []model.OwnedObject {
 	var out []model.OwnedObject
 	for _, k := range []string{"ModelConfig", "Harness", "AgentTemplate", "EgressPolicy"} {
@@ -109,10 +112,6 @@ func ownedObjects(d Definition) []model.OwnedObject {
 			}
 		}
 		out = append(out[:3:3], append([]model.OwnedObject{a}, out[3:]...)...)
-	}
-	// the key Secret's name lives under status.controller (internal): shown when present, never depended on
-	if n, _ := d.Status.Controller["keySecret"].(string); n != "" {
-		out = append(out, model.OwnedObject{Kind: "Secret", Name: n, Note: "exists; its value is never shown"})
 	}
 	return out
 }

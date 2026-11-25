@@ -83,3 +83,30 @@ func TestLogAuditWritesOneJSONLine(t *testing.T) {
 		t.Fatal(b.String())
 	}
 }
+
+func TestTokenAuthRefusesAWeakTokenWhenAMinimumIsSet(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "token")
+	_ = os.WriteFile(p, []byte("short"), 0o600)
+	a := &TokenAuth{Path: p, MinLen: 32, Reject: []string{"demo-token"}}
+	if _, err := a.Authenticate(req("Bearer short")); err == nil {
+		t.Fatal("a token below the minimum was accepted")
+	}
+	strong := strings.Repeat("k", 40)
+	_ = os.WriteFile(p, []byte(strong+"\n"), 0o600)
+	future := time.Now().Add(time.Hour)
+	_ = os.Chtimes(p, future, future)
+	if _, err := a.Authenticate(req("Bearer " + strong)); err != nil {
+		t.Fatal(err)
+	}
+	// a rotation to a weak value takes the console back to refusing everybody
+	_ = os.WriteFile(p, []byte("demo-token"), 0o600)
+	later := future.Add(time.Hour)
+	_ = os.Chtimes(p, later, later)
+	if _, err := a.Authenticate(req("Bearer demo-token")); err == nil {
+		t.Fatal("the demo token was accepted")
+	}
+	if WeakToken("demo-token", 32, []string{"demo-token"}) == "" || WeakToken(strings.Repeat("a", 31), 32, nil) == "" || WeakToken(strings.Repeat("a", 32), 32, nil) != "" {
+		t.Fatal("WeakToken")
+	}
+}

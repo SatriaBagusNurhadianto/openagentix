@@ -81,7 +81,12 @@
 
 <a class="skip" href="#content">Skip to content</a>
 <div class="app {collapsed ? 'collapsed' : ''} {drawer ? 'drawer' : ''}" id="app">
-    {#if drawer}<div class="sidebar-scrim" role="presentation" onclick={() => (drawer = false)}></div>{/if}
+    {#if drawer}<div
+            class="sidebar-scrim"
+            data-overlay-part=""
+            role="presentation"
+            onclick={() => (drawer = false)}
+        ></div>{/if}
     <nav class="sb" aria-label="Main" id="sidebar" bind:this={nav} aria-hidden={undefined}>
         <div class="brand">
             <div class="mark" aria-hidden="true">

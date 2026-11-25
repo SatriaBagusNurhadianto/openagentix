@@ -4,7 +4,8 @@ The Svelte single-page app of the OpenAgentix console (ADR 0007). It is built to
 `services/console`, which also serves its JSON API. Design contract: `docs/console/UI-SPEC.md`; visual reference:
 `docs/console/mockup.html`. Third-party software and licences: `THIRD-PARTY.md`.
 
-Stack: Svelte 5 (runes only), SvelteKit with `@sveltejs/adapter-static` (SPA, `fallback: index.html`, `ssr = false`), Vite,
+Stack: Svelte 5 (runes only), SvelteKit 3 with `@sveltejs/adapter-static` (SPA, `fallback: index.html`, `ssr = false`; SvelteKit 3 reads its
+configuration from the `sveltekit({...})` call in `vite.config.ts`, there is no `svelte.config.js`), Vite 8,
 TypeScript strict (no `any`), Tailwind 4 (`@theme` tokens of UI-SPEC section 3 and a `.dark` class), pnpm. No component kit.
 
 ## Dev loop
@@ -25,7 +26,7 @@ The token is kept in memory: a reload asks for it again (on purpose).
 | `pnpm dev`      | Vite dev server                                                                                                            |
 | `pnpm build`    | production build to `build/`, then `scripts/externalize-boot.mjs` (see "CSP")                                              |
 | `pnpm check`    | `svelte-kit sync` and `svelte-check` (strict, warnings fail)                                                               |
-| `pnpm test`     | Vitest, jsdom, Testing Library, axe-core                                                                                   |
+| `pnpm test`     | Vitest, jsdom, Testing Library, axe-core (the YAML tests parse the output back with the `yaml` package)                    |
 | `pnpm test:e2e` | Playwright (Chromium, one worker) against `go run ./cmd/console` in demo mode; needs `services/console/build-web.sh` first |
 | `pnpm lint`     | `prettier --check` and `eslint` (flat config)                                                                              |
 | `pnpm format`   | `prettier --write`                                                                                                         |
@@ -33,6 +34,14 @@ The token is kept in memory: a reload asks for it again (on purpose).
 One-time for Playwright: `pnpm exec playwright install chromium`.
 
 To embed the build in the Go binary: `services/console/build-web.sh`.
+
+From the repository root: `make test-console` (install with the frozen lockfile, lint, check, vitest) and `make test-console-e2e`
+(build the web app, install Chromium, run Playwright). CI runs the same as the jobs `console`, `console-audit` (`pnpm audit --prod`
+blocks, the full `pnpm audit` is a report) and `console-e2e` (the Playwright report is uploaded when it fails). pnpm is pinned by
+`packageManager` in `package.json`, with the hash of its tarball, so corepack and CI use exactly that version.
+
+The `$lib` alias is set in `vite.config.ts` (`alias`). SvelteKit 3 calls it deprecated in favour of `#lib` subpath imports, which
+cannot name the `.svelte.ts` modules without their extension; move when that is possible.
 
 ## Design rules (short)
 
@@ -42,11 +51,16 @@ To embed the build in the Go binary: `services/console/build-web.sh`.
   the controller's `status.violations` are shown word for word after save and are the authority.
 - **The status contract** (ADR 0012): the UI reads `conditions` (Accepted and Ready are the contract), `observedGeneration`,
   `endpoint`, `revision`, `effectiveTools`, `effectiveEgress`, `violations`, `capabilities`, `agentRef`. `status.controller` is
-  shown only in a collapsed "Controller details (internal)" section.
+  shown only in a collapsed "Controller details (internal)" section, as opaque key and value pairs; no code reads a named field of it.
 - **Tokens.** Colours, type and spacing come from `src/app.css` (`@theme static` + `.dark`). Component classes (`.btn`, `.badge`,
   `.panel`, ...) are the mockup's. Status colours are used only for state, and never alone: every status has an icon and a word.
 - **Accessibility.** Native controls where possible, visible focus, skip link, `g`+letter shortcuts (off in text fields and in Settings),
-  focus trap and Escape in dialogs, sheet and drawer, axe-core in the component tests.
+  focus trap and Escape in dialogs, sheet and drawer (the page behind an open one is `inert`, focus that a mouse click or a script moves
+  out is pulled back, focus returns to the opener on close; `src/lib/actions.ts`), axe-core in the component tests.
+- **Bounded.** The registry says "Showing the first N agents of each kind" when the API cut the list. The live check is debounced
+  (600 ms) and the API limits it per minute. The token field is a password field with a show and hide button.
+- **What it does not edit, it keeps.** A definition with fields the form does not know (`instructionsFrom`, a field of a later release)
+  opens with a notice; the instructions of an `instructionsFrom` definition are read-only; a save leaves the other fields as they are.
 - **Style.** 4-space indent, single quotes, semicolons (Prettier). Svelte runes only. No inline `style=`.
 
 ## CSP

@@ -4,7 +4,7 @@
     import IconButton from './IconButton.svelte';
 </script>
 
-<div class="toasts" role="status" aria-live="polite">
+<div class="toasts" data-inert-exempt="" role="status" aria-live="polite">
     {#each toasts.items as t (t.id)}
         <div
             class="toast {t.kind === 'error' ? 'err' : t.kind === 'info' ? 'info' : ''}"

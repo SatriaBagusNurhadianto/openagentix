@@ -104,7 +104,7 @@ func TestRealModeRefusesAnEmptyTokenFileAndMissingCatalog(t *testing.T) {
 		return p
 	}
 	base := map[string]string{"CONSOLE_CATALOG_FILE": w("c.json", `{"namespaces":{"agents":"kagent"}}`), "CONSOLE_POLICY_FILE": w("p.json", `{}`),
-		"CONSOLE_KUBE_API": "http://127.0.0.1:1", "CONSOLE_ADDR": "127.0.0.1:0"}
+		"CONSOLE_KUBE_API": "http://127.0.0.1:1", "CONSOLE_ALLOW_INSECURE_KUBE_API": "1", "CONSOLE_ADDR": "127.0.0.1:0"}
 	d := deps{Stdout: &bytes.Buffer{}, Log: slog.New(slog.NewJSONHandler(io.Discard, nil))}
 	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	m := map[string]string{"CONSOLE_TOKEN_FILE": w("t", "")}
@@ -119,4 +119,52 @@ func TestRealModeRefusesAnEmptyTokenFileAndMissingCatalog(t *testing.T) {
 	if err := run(context.Background(), env(m), d); err == nil || !strings.Contains(err.Error(), "platform files") {
 		t.Fatal(err)
 	}
+}
+
+func TestRealModeRefusesAWeakToken(t *testing.T) {
+	dir := t.TempDir()
+	w := func(name, content string) string {
+		p := dir + "/" + name
+		if err := writeFile(p, content); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	env := map[string]string{"CONSOLE_CATALOG_FILE": w("c.json", `{"namespaces":{"agents":"kagent"}}`), "CONSOLE_POLICY_FILE": w("p.json", `{}`),
+		"CONSOLE_KUBE_API": "http://127.0.0.1:1", "CONSOLE_ALLOW_INSECURE_KUBE_API": "1", "CONSOLE_ADDR": "127.0.0.1:0"}
+	d := deps{Stdout: &bytes.Buffer{}, Log: slog.New(slog.NewJSONHandler(io.Discard, nil))}
+	for name, tok := range map[string]string{"short": "short-token-31-characters-abcde", "demo": "demo-token", "padded demo": "  demo-token\n"} {
+		env["CONSOLE_TOKEN_FILE"] = w("t-"+strings.ReplaceAll(name, " ", "-"), tok)
+		err := run(context.Background(), func(k string) string { return env[k] }, d)
+		if err == nil || !strings.Contains(err.Error(), "token") || (name != "demo" && name != "padded demo" && !strings.Contains(err.Error(), "32")) {
+			t.Errorf("%s: want a refusal that says why, got %v", name, err)
+		}
+	}
+	env["CONSOLE_TOKEN_FILE"] = w("strong", strings.Repeat("a1", 16)+"\n")
+	ready := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	d.OnListen = func(a string) { ready <- a }
+	errc := make(chan error, 1)
+	go func() { errc <- run(ctx, func(k string) string { return env[k] }, d) }()
+	select {
+	case <-ready:
+	case err := <-errc:
+		t.Fatalf("a 32-character token must start: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("not listening")
+	}
+	cancel()
+	<-errc
+}
+
+func TestDemoModeKeepsItsFixedToken(t *testing.T) {
+	addr, _, stop := start(t, map[string]string{"CONSOLE_DEV_FAKE": "1", "CONSOLE_ADDR": "127.0.0.1:0"})
+	defer stop()
+	req, _ := http.NewRequest("GET", "http://"+addr+"/api/v1/session", nil)
+	req.Header.Set("Authorization", "Bearer demo-token")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatal(resp, err)
+	}
+	resp.Body.Close()
 }

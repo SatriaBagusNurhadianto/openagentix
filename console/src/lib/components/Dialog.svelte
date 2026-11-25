@@ -15,7 +15,7 @@
     const uid = $props.id();
 </script>
 
-<div class="scrim" role="presentation" onclick={onclose}></div>
+<div class="scrim" data-overlay-part="" role="presentation" onclick={onclose}></div>
 <div
     class="dialog"
     role={destructive ? 'alertdialog' : 'dialog'}

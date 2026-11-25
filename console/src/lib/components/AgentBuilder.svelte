@@ -174,6 +174,10 @@
 
     const chart = $derived(detail?.source === 'chart');
     const readOnly = $derived(chart || (!!session && !session.canWrite));
+    // spec fields the stored object has and this form has no control for; a save keeps them
+    const unmanaged = $derived(detail?.unmanaged ?? []);
+    const promptFromConfigMap = $derived(unmanaged.includes('instructionsFrom'));
+    const otherUnmanaged = $derived(unmanaged.filter((k) => k !== 'instructionsFrom'));
     const spec = $derived(specFromDraft(draft));
     const dirty = $derived(baseline ? !sameSpec(spec, baseline) : false);
     const dirtyNew = $derived(isNew && (draft.name !== '' || draft.instructions !== '' || draft.description !== ''));
@@ -204,7 +208,7 @@
             } catch (e) {
                 void e; // a failed prediction leaves the last one in place; saving still works
             }
-        }, 400);
+        }, 600);
         return () => {
             clearTimeout(timer);
             ctl.abort();
@@ -286,7 +290,7 @@
         if (isNew && !draft.name) return 'Give the agent a name first.';
         if (isNew && nameError) return nameError;
         if (!draft.model) return 'Choose a model first.';
-        if (!draft.instructions.trim()) return 'Write the instructions first.';
+        if (!promptFromConfigMap && !draft.instructions.trim()) return 'Write the instructions first.';
         if (!isNew && !dirty) return 'Nothing to save: the form matches the cluster.';
         return undefined;
     });
@@ -552,6 +556,20 @@
                         </div>
                     </Notice>
                 {/if}
+                {#if promptFromConfigMap || otherUnmanaged.length}
+                    <Notice kind="info" title="Some of this definition is not edited here">
+                        <p class="sm" data-testid="unmanaged">
+                            {#if promptFromConfigMap}
+                                The instructions come from a ConfigMap (<code>instructionsFrom</code>), so they are
+                                shown read-only. Change the ConfigMap, or edit the definition with kubectl.
+                            {/if}
+                            {#if otherUnmanaged.length}
+                                The definition also has fields this form does not know ({otherUnmanaged.join(', ')}).
+                                They are kept as they are when you save.
+                            {/if}
+                        </p>
+                    </Notice>
+                {/if}
                 {#if refused}
                     <Notice kind="refused" title="Refused by the platform policy" alert bind:this={refusedNotice}>
                         <p class="sm">
@@ -634,7 +652,7 @@
                             <TextArea
                                 label="Instructions"
                                 bind:value={draft.instructions}
-                                readonly={readOnly}
+                                readonly={readOnly || promptFromConfigMap}
                                 rows={11}
                                 hint="The system prompt. Checked for anything shaped like a secret."
                                 counter={counterText(instrBytes, MAX_INSTRUCTIONS_BYTES, 'bytes')}

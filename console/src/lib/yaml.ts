@@ -24,7 +24,7 @@ export function highlightYaml(line: string): Seg[] {
 // --- a client-side rendering of the spec, for the "Draft" view of the YAML sheet ---
 
 const PLAIN = /^[A-Za-z_][A-Za-z0-9_./@-]*$/;
-const RESERVED = new Set(['true', 'false', 'null', 'yes', 'no', 'on', 'off', '~']);
+const RESERVED = new Set(['true', 'false', 'null', 'yes', 'no', 'on', 'off', 'y', 'n', '~']);
 
 export function scalar(s: string): string {
     if (s === '') return '""';
@@ -36,6 +36,22 @@ function list(out: string[], indent: number, key: string, items: string[] | unde
     if (!items?.length) return;
     out.push(`${' '.repeat(indent)}${key}:`);
     for (const i of items) out.push(`${' '.repeat(indent + 2)}- ${scalar(i)}`);
+}
+
+/**
+ * Whether a text can be written as a block scalar and read back unchanged (the same rule as the server's yamlout): more
+ * than one line, no control character other than tab, no carriage return or Unicode line break, no line of only
+ * whitespace, not only newlines. Anything else is written as a double-quoted scalar with escapes.
+ */
+export function blockSafe(text: string): boolean {
+    if (!text.includes('\n') || text.replace(/\n/g, '') === '') return false;
+    for (const ch of text) {
+        const c = ch.codePointAt(0)!;
+        if (c === 0x0a || c === 0x09) continue;
+        if (c < 0x20 || c === 0x7f || c === 0x85 || c === 0x2028 || c === 0x2029 || c === 0xfeff || c === 0xfffd)
+            return false;
+    }
+    return !text.split('\n').some((l) => l !== '' && l.trim() === '');
 }
 
 /** The metadata and spec of a definition as YAML, in the order the console's server writes them. */
@@ -51,10 +67,11 @@ export function renderSpecYaml(name: string, namespace: string, s: Spec): string
     if (s.description) o.push(`  description: ${scalar(s.description)}`);
     o.push(`  model: ${scalar(s.model)}`);
     const text = s.instructions;
-    if (!text.includes('\n') && !text.startsWith(' ')) o.push(`  instructions: ${scalar(text)}`);
+    if (!blockSafe(text)) o.push(`  instructions: ${scalar(text)}`);
     else {
         const mark = !text.endsWith('\n') ? '|-' : text.endsWith('\n\n') ? '|+' : '|';
-        o.push(`  instructions: ${text.startsWith(' ') || text.startsWith('\n') ? mark + '2' : mark}`);
+        const lead = text.startsWith(' ') || text.startsWith('\n') || text.startsWith('\t');
+        o.push(`  instructions: ${lead ? mark + '2' : mark}`);
         for (const l of text.replace(/\n$/, '').split('\n')) o.push(l === '' ? '' : `    ${l}`);
     }
     if (s.toolProfile) o.push(`  toolProfile: ${scalar(s.toolProfile)}`);

@@ -109,10 +109,8 @@ func TestGetBuiltChartAndMissing(t *testing.T) {
 	if resp.StatusCode != 200 || d.ReadOnly || d.Spec == nil || !strings.Contains(d.YAML, "kind: AgentDefinition") || !strings.Contains(d.YAML, "    - osv_query_vulnerability") || d.ResourceVersion == "" {
 		t.Fatalf("built detail: %s", b)
 	}
-	if !slices.ContainsFunc(d.Objects, func(o model.OwnedObject) bool {
-		return o.Kind == "Secret" && o.Name == "researcher-virtual-key-1a2b3c4d"
-	}) {
-		t.Errorf("objects: %+v", d.Objects)
+	if slices.ContainsFunc(d.Objects, func(o model.OwnedObject) bool { return o.Kind == "Secret" }) {
+		t.Errorf("an object was derived from status.controller: %+v", d.Objects)
 	}
 	_, b = r.do(t, "GET", "/api/v1/agents/assistant", nil)
 	d = decodeInto[model.Detail](t, b)
@@ -177,7 +175,7 @@ func TestCreateUpdateDeleteAndConflict(t *testing.T) {
 	}
 	bad := spec("claude-haiku")
 	bad["instructions"] = ""
-	if resp, b = r.do(t, "POST", "/api/v1/agents", map[string]any{"name": "empty", "spec": bad}); resp.StatusCode != 422 || !strings.Contains(string(b), "spec.instructions: Required value") {
+	if resp, b = r.do(t, "POST", "/api/v1/agents", map[string]any{"name": "empty", "spec": bad}); resp.StatusCode != 422 || !strings.Contains(string(b), "spec.instructions is required") {
 		t.Fatal(resp.Status, string(b))
 	}
 	// delete
@@ -231,7 +229,7 @@ func TestValidateDryRunAndPrediction(t *testing.T) {
 	bad := spec("claude-haiku")
 	bad["instructions"] = ""
 	_, b = r.do(t, "POST", "/api/v1/agents/validate", map[string]any{"name": "draft", "spec": bad})
-	if v = decodeInto[model.ValidateResult](t, b); v.Schema.OK || !strings.Contains(strings.Join(v.Schema.Errors, " "), "Required value") {
+	if v = decodeInto[model.ValidateResult](t, b); v.Schema.OK || !strings.Contains(strings.Join(v.Schema.Errors, " "), "spec.instructions") {
 		t.Fatalf("%+v", v)
 	}
 	// no name yet: nothing is sent to the API server
@@ -482,15 +480,19 @@ func TestOnlyFixedUpstreamPaths(t *testing.T) {
 	for _, p := range []string{"/api/v1/agents", "/api/v1/agents/researcher", "/api/v1/agents/../../etc", "/api/v1/agents/%2e%2e%2fsecrets", "/api/v1/agents/a%2Fb"} {
 		r.do(t, "GET", p, nil)
 	}
+	const defs = "/apis/openagentix.io/v1alpha1/namespaces/kagent/agentdefinitions"
+	const kag = "/apis/api.kagent.dev/v1alpha3/namespaces/kagent/"
+	// exactly these, and nothing else: the list reads definitions and four kagent kinds, the one valid name reads one object,
+	// and the climbing, encoded and slash-carrying names never leave the console
+	want := []string{"GET " + defs, "GET " + defs + "/researcher", "GET " + kag + "agents", "GET " + kag + "agenttemplates", "GET " + kag + "harnesses", "GET " + kag + "modelconfigs"}
+	var got []string
 	for _, q := range r.api.requests() {
-		ok := strings.HasPrefix(q.Path, "/apis/openagentix.io/v1alpha1/namespaces/kagent/agentdefinitions") ||
-			strings.HasPrefix(q.Path, "/apis/api.kagent.dev/v1alpha3/namespaces/kagent/")
-		if !ok || strings.Contains(q.Path, "..") || strings.Contains(q.Path, "secrets") {
-			t.Errorf("unexpected upstream path %s", q.Path)
-		}
-		if q.Method != "GET" {
-			t.Errorf("unexpected %s", q.Method)
-		}
+		got = append(got, q.Method+" "+q.Path)
+	}
+	slices.Sort(got)
+	slices.Sort(want)
+	if len(got) == 0 || !slices.Equal(got, want) {
+		t.Fatalf("upstream requests\n got  %q\n want %q", got, want)
 	}
 }
 

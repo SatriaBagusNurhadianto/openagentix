@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,10 @@ const Operator = "console"
 // a rotated Secret takes effect without a restart. An empty or unreadable file refuses everybody.
 type TokenAuth struct {
 	Path string
+	// MinLen and Reject make a weak token unusable: a file holding fewer than MinLen characters, or one of the Reject
+	// values (the demo token), refuses everybody, also after a rotation. Zero values: no check.
+	MinLen int
+	Reject []string
 
 	mu    sync.Mutex
 	mtime time.Time
@@ -44,12 +49,26 @@ func (t *TokenAuth) current() ([sha256.Size]byte, bool) {
 	}
 	b, err := os.ReadFile(t.Path)
 	tok := strings.TrimSpace(string(b))
-	if err != nil || tok == "" {
+	if err != nil || tok == "" || WeakToken(tok, t.MinLen, t.Reject) != "" {
 		t.ok = false
 		return t.sum, false
 	}
 	t.sum, t.mtime, t.size, t.ok = sha256.Sum256([]byte(tok)), fi.ModTime(), fi.Size(), true
 	return t.sum, true
+}
+
+// WeakToken says why a token must not be used ("" when it may): shorter than min characters, or one of the rejected values.
+func WeakToken(tok string, min int, reject []string) string {
+	tok = strings.TrimSpace(tok)
+	if len(tok) < min {
+		return "it has " + strconv.Itoa(len(tok)) + " characters; a token needs at least " + strconv.Itoa(min)
+	}
+	for _, r := range reject {
+		if tok == r {
+			return "it is the published demo token"
+		}
+	}
+	return ""
 }
 
 // Authenticate implements ext.Authenticator.
@@ -103,7 +122,7 @@ func (a RoleAuthz) Authorize(_ context.Context, _ ext.Identity, action ext.Actio
 type LogAudit struct{ Log *slog.Logger }
 
 // Record implements ext.AuditSink.
-func (l LogAudit) Record(ctx context.Context, e ext.AuditEvent) {
+func (l LogAudit) Record(ctx context.Context, e ext.AuditEvent) error {
 	l.Log.LogAttrs(ctx, slog.LevelInfo, "audit",
 		slog.Bool("audit", true),
 		slog.String("who", e.Subject),
@@ -114,4 +133,5 @@ func (l LogAudit) Record(ctx context.Context, e ext.AuditEvent) {
 		slog.Int("status", e.Status),
 		slog.String("request_id", e.RequestID),
 	)
+	return nil
 }

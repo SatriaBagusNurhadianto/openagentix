@@ -73,17 +73,6 @@ Sizes are relative. Each release has its own decision records before code.
 
 Candidates to adopt behind adapters (licences as read on 2026-11-25; check again before bundling): SPIFFE/SPIRE and Keycloak for identity, OpenBao with External Secrets for credentials, Presidio and NeMo Guardrails for safety, Argo Rollouts or Flagger for canary, promptfoo, DeepEval and Inspect for evaluation, garak and PyRIT for red teaming, Capsule or vCluster and Kueue for tenancy, OpenCost for cluster cost, `kubernetes-sigs/agent-sandbox` for code execution, Playwright MCP for the browser, Argo Workflows or Temporal for workflows, Karmada or Open Cluster Management for fleets. A broker for on-behalf-of-user OAuth with a consent step has no mature open-source project that we could confirm; expect to build a small one.
 
-## Open core and enterprise
+## Community and enterprise
 
-A first cut, to be settled with the licensing decision:
-
-| Open | Enterprise candidates |
-|---|---|
-| All resource kinds, controllers, adapters, the console, the gate, egress control, budgets per key, skills, knowledge, memory | Single sign-on with groups, fine-grained console roles, writes per user |
-| Guardrail kinds and engines, evaluation and red-team runners, canary, code sandbox, workflows | Tenancy, team quotas, chargeback |
-| Basic OpenID Connect login | Approval routing and escalation, audit history with retention |
-| One-approver approval | Fleet management across clusters |
-| | Credential vault integrations, signed skills, key rotation |
-| | Compliance evidence pack, support |
-
-The rule of thumb: what one team needs to run agents safely is open; what an organisation with many teams, auditors and several clusters needs is the enterprise line.
+Decided in [ADR 0010](decisions/0010-community-and-enterprise-editions.md). The rule: what one team needs to build, run and govern agents safely on one cluster is community; what an organisation needs because it has many teams, auditors, several clusters and a support contract is enterprise. Security is never an enterprise feature, the community edition has no limits by count, and nothing moves from community to enterprise later.

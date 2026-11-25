@@ -5,6 +5,7 @@ package policy
 
 import (
 	"fmt"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
@@ -23,8 +24,8 @@ const (
 
 var nameRE = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
 
-// secretShapes are the ten patterns of charts/openagentix/files/memory-expiry.sh, with the same names. PostgreSQL's word
-// boundaries (\m, \M) became \b.
+// secretShapes are the ten patterns of charts/openagentix/files/memory-expiry.sh, with the same names, and one more of
+// the platform's own (platform_virtual_key). PostgreSQL's word boundaries (\m, \M) became \b.
 var secretShapes = []struct {
 	name string
 	re   *regexp.Regexp
@@ -39,6 +40,8 @@ var secretShapes = []struct {
 	{"slack_token", regexp.MustCompile(`\bxox[abeprs]-[A-Za-z0-9-]{10,}`)},
 	{"stripe_secret_key", regexp.MustCompile(`\b(sk|rk)_(live|test)_[0-9A-Za-z]{16,}`)},
 	{"telegram_bot_token", regexp.MustCompile(`\b[0-9]{8,10}:[A-Za-z0-9_-]{35}`)},
+	// not in the memory scan: the platform's own virtual keys (keys.Mint), which must never be pasted into a definition
+	{"platform_virtual_key", regexp.MustCompile(`\bvk-[0-9a-f]{32}\b`)},
 }
 
 // PatternNames lists the secret shapes by name.
@@ -95,6 +98,20 @@ func Validate(in Input) []string {
 	for _, sh := range secretShapes {
 		if sh.re.MatchString(s.Instructions) {
 			add("instructions contain something shaped like a secret (%s); remove it", sh.name)
+		}
+	}
+	// every other free-text field: a secret in a description or a name would land in an object, a log or a status
+	for _, f := range []struct {
+		name string
+		text []string
+	}{
+		{"description", []string{s.Description}}, {"model", []string{s.Model}}, {"toolProfile", []string{s.ToolProfile}},
+		{"tools", s.Tools}, {"skills", s.Skills}, {"egress.allow", s.Egress.Allow},
+	} {
+		for _, sh := range secretShapes {
+			if slices.ContainsFunc(f.text, sh.re.MatchString) {
+				add("%s contains something shaped like a secret (%s); remove it", f.name, sh.name)
+			}
 		}
 	}
 
@@ -234,13 +251,44 @@ func Validate(in Input) []string {
 				add("egress.allow lists %q twice", o)
 			case inNamespace(o, c.Namespaces.Tools):
 				add("egress.allow entry %q is inside the tools namespace %q: that would reach a tool server around the profile", o, c.Namespaces.Tools)
+			case internalHost(o, c.Namespaces.Agents, c.Namespaces.Gateway):
+				add("egress.allow entry %q names a cluster-internal or local host (.svc, .cluster.local, a name without a dot, an address, or a platform namespace); the policy cannot allow it", o)
 			case !originAllowed(o, p.Egress.AllowedOrigins):
 				add("egress.allow entry %q is not matched by the platform policy", o)
 			}
 			seen[o] = true
 		}
 	}
+	// a sentence that quotes a value (a model, a tool, an origin) must not repeat something shaped like a secret
+	for i := range v {
+		for _, sh := range secretShapes {
+			v[i] = sh.re.ReplaceAllString(v[i], "[redacted]")
+		}
+	}
 	return v
+}
+
+// internalHost reports whether the origin's host is something that is not on the public internet from the cluster's point
+// of view, whatever the policy patterns say: an IP literal, a name without a dot, .svc and .cluster.local names, and names
+// inside the given namespaces (short, .svc or full).
+func internalHost(origin string, namespaces ...string) bool {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return true
+	}
+	h := strings.TrimPrefix(u.Hostname(), "*.")
+	if _, err := netip.ParseAddr(h); err == nil {
+		return true
+	}
+	if !strings.Contains(h, ".") || h == "svc" || strings.HasSuffix(h, ".svc") || strings.HasSuffix(h, ".cluster.local") || strings.Contains(h, ".svc.") {
+		return true
+	}
+	for _, ns := range namespaces {
+		if ns != "" && inNamespace(origin, ns) {
+			return true
+		}
+	}
+	return false
 }
 
 // inNamespace reports whether the origin's host is a name inside ns (short, .svc or full cluster name).

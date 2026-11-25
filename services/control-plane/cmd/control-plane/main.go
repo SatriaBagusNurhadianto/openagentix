@@ -32,8 +32,9 @@ var version = "dev"
 // deps are the parts a test replaces.
 type deps struct {
 	Log      *slog.Logger
-	Kube     *kube.Client // nil: the in-cluster client
-	OnListen func(string) // receives the bound health address
+	Kube     *kube.Client           // nil: the in-cluster client
+	OnListen func(string)           // receives the bound health address
+	Mint     func() (string, error) // nil: keys.Mint
 }
 
 func main() {
@@ -83,7 +84,7 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 		Namespace: cat.Namespaces.Agents, Catalog: cat, Policy: pol,
 		Kube: cl, Secrets: &keys.KubeSecrets{C: cl},
 		Runtime: kagent.New(cat, cl), Gateway: agentgateway.New(cl, cat.Namespaces.Gateway), Tools: toolhive.New(cat),
-		Log: d.Log, Mint: keys.Mint, Resync: cfg.Resync, Backoff: cfg.Backoff,
+		Log: d.Log, Mint: d.Mint, Resync: cfg.Resync, Backoff: cfg.Backoff, MinInterval: cfg.MinInterval,
 	})
 
 	mux := http.NewServeMux()

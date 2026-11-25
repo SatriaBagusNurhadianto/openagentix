@@ -13,7 +13,7 @@ func TestDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.HealthAddr != ":8081" || c.Resync != 60*time.Second || c.Backoff != 10*time.Second || c.LogLevel != "info" {
+	if c.HealthAddr != ":8081" || c.Resync != 60*time.Second || c.Backoff != 10*time.Second || c.LogLevel != "info" || c.MinInterval != time.Second {
 		t.Fatalf("%+v", c)
 	}
 }
@@ -32,16 +32,21 @@ func TestOverridesAndRefusals(t *testing.T) {
 	if err != nil || c.Resync != 5*time.Second {
 		t.Fatalf("%+v %v", c, err)
 	}
+	if c, err = Load(env(with("CONTROL_PLANE_MIN_INTERVAL", "250ms"))); err != nil || c.MinInterval != 250*time.Millisecond {
+		t.Fatalf("%+v %v", c, err)
+	}
 	for name, tc := range map[string]struct {
 		m    map[string]string
 		want string
 	}{
-		"no catalog":  {map[string]string{"CONTROL_PLANE_POLICY_FILE": "/p"}, "CONTROL_PLANE_CATALOG_FILE"},
-		"no policy":   {map[string]string{"CONTROL_PLANE_CATALOG_FILE": "/c"}, "CONTROL_PLANE_POLICY_FILE"},
-		"bad resync":  {with("CONTROL_PLANE_RESYNC", "soon"), "CONTROL_PLANE_RESYNC"},
-		"tiny resync": {with("CONTROL_PLANE_RESYNC", "100ms"), "CONTROL_PLANE_RESYNC"},
-		"bad backoff": {with("CONTROL_PLANE_BACKOFF", "-1s"), "CONTROL_PLANE_BACKOFF"},
-		"bad level":   {with("CONTROL_PLANE_LOG_LEVEL", "loud"), "CONTROL_PLANE_LOG_LEVEL"},
+		"no catalog":        {map[string]string{"CONTROL_PLANE_POLICY_FILE": "/p"}, "CONTROL_PLANE_CATALOG_FILE"},
+		"no policy":         {map[string]string{"CONTROL_PLANE_CATALOG_FILE": "/c"}, "CONTROL_PLANE_POLICY_FILE"},
+		"bad resync":        {with("CONTROL_PLANE_RESYNC", "soon"), "CONTROL_PLANE_RESYNC"},
+		"tiny resync":       {with("CONTROL_PLANE_RESYNC", "100ms"), "CONTROL_PLANE_RESYNC"},
+		"bad backoff":       {with("CONTROL_PLANE_BACKOFF", "-1s"), "CONTROL_PLANE_BACKOFF"},
+		"bad min interval":  {with("CONTROL_PLANE_MIN_INTERVAL", "often"), "CONTROL_PLANE_MIN_INTERVAL"},
+		"zero min interval": {with("CONTROL_PLANE_MIN_INTERVAL", "0s"), "CONTROL_PLANE_MIN_INTERVAL"},
+		"bad level":         {with("CONTROL_PLANE_LOG_LEVEL", "loud"), "CONTROL_PLANE_LOG_LEVEL"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := Load(env(tc.m))

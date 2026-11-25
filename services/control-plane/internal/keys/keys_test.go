@@ -45,15 +45,11 @@ func (f *fakeRegistry) Register(_ context.Context, user, hash string) error {
 	f.entries[user] = hash
 	return nil
 }
-func (f *fakeRegistry) Registered(_ context.Context, user string) (bool, error) {
-	_, ok := f.entries[user]
-	return ok, nil
-}
 
 const secrets = "secrets"
 
 func params() Params {
-	return Params{Namespace: "kagent", SecretName: "r-virtual-key", DataKey: "OPENAI_API_KEY", User: "r",
+	return Params{Namespace: "kagent", SecretName: "r-virtual-key-0a1b2c3d", DataKey: "OPENAI_API_KEY", User: "r",
 		Labels: map[string]string{"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "r"},
 		Owner:  OwnerRef{APIVersion: "openagentix.io/v1alpha1", Kind: "AgentDefinition", Name: "r", UID: "u-1"}}
 }
@@ -69,14 +65,14 @@ func fixed(key string) func() (string, error) { return func() (string, error) { 
 
 func TestCreated201WritesHash(t *testing.T) {
 	s, sec, reg := setup(t)
-	out, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-one"))
-	if err != nil || out != Created {
-		t.Fatalf("%v %v", out, err)
+	res, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-one"))
+	if err != nil || res.Outcome != Created || res.Fingerprint != Fingerprint(Hash("vk-one")) {
+		t.Fatalf("%+v %v", res, err)
 	}
 	if reg.entries["r"] != Hash("vk-one") {
 		t.Fatalf("%v", reg.entries)
 	}
-	o, ok := s.Get(secrets, "kagent", "r-virtual-key")
+	o, ok := s.Get(secrets, "kagent", "r-virtual-key-0a1b2c3d")
 	if !ok {
 		t.Fatal("secret not created")
 	}
@@ -97,15 +93,17 @@ func TestCreated201WritesHash(t *testing.T) {
 	}
 }
 
-func TestConflictWithHashPresentDoesNothing(t *testing.T) {
+func TestConflictWithHashPresentAndNothingKnownAdoptsIt(t *testing.T) {
 	s, sec, reg := setup(t)
-	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key", "namespace": "kagent"}})
-	reg.entries["r"] = "sha256:existing"
-	out, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-two"))
-	if err != nil || out != Exists {
-		t.Fatalf("%v %v", out, err)
+	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}})
+	reg.entries["r"] = "sha256:0123456789abcdef0123456789abcdef"
+	p := params()
+	p.Registered = "sha256:0123456789abcdef0123456789abcdef"
+	res, err := Ensure(context.Background(), p, sec, reg, fixed("vk-two"))
+	if err != nil || res.Outcome != Exists || res.Fingerprint != "0123456789abcdef" {
+		t.Fatalf("%+v %v", res, err)
 	}
-	if reg.entries["r"] != "sha256:existing" {
+	if reg.entries["r"] != "sha256:0123456789abcdef0123456789abcdef" {
 		t.Fatal("hash must be left alone")
 	}
 	if len(s.Matching("DELETE", "secrets")) != 0 {
@@ -113,23 +111,56 @@ func TestConflictWithHashPresentDoesNothing(t *testing.T) {
 	}
 }
 
+func TestKnownFingerprintMatchingTheRegisteredHashSendsNothing(t *testing.T) {
+	s, sec, reg := setup(t)
+	p := params()
+	p.Registered = "sha256:0123456789abcdef0123456789abcdef"
+	p.Known = "0123456789abcdef"
+	minted := false
+	res, err := Ensure(context.Background(), p, sec, reg, func() (string, error) { minted = true; return "vk-x", nil })
+	if err != nil || res.Outcome != Unchanged || res.Fingerprint != "0123456789abcdef" {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if minted || len(s.Requests()) != 0 {
+		t.Fatalf("a key that is in order costs no mint and no request: minted=%v, requests=%v", minted, s.Requests())
+	}
+}
+
+func TestRegisteredHashThatIsNotTheKnownOneReplacesTheKey(t *testing.T) {
+	s, sec, reg := setup(t)
+	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}, "data": kubetest.Object{"OPENAI_API_KEY": "b2xk"}})
+	p := params()
+	p.Registered = "sha256:ffffffffffffffff0000000000000000" // an older hash was restored into the gateway's map
+	p.Known = "0123456789abcdef"
+	res, err := Ensure(context.Background(), p, sec, reg, fixed("vk-new"))
+	if err != nil || res.Outcome != Replaced || res.Fingerprint != Fingerprint(Hash("vk-new")) {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if reg.entries["r"] != Hash("vk-new") {
+		t.Fatalf("%v", reg.entries)
+	}
+	o, _ := s.Get(secrets, "kagent", "r-virtual-key-0a1b2c3d")
+	if raw, _ := base64.StdEncoding.DecodeString(o["data"].(map[string]any)["OPENAI_API_KEY"].(string)); string(raw) != "vk-new" {
+		t.Fatalf("secret was not replaced: %q", raw)
+	}
+}
+
 func TestConflictWithoutHashDeletesOwnSecretAndRecreates(t *testing.T) {
 	s, sec, reg := setup(t)
-	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key", "namespace": "kagent"}, "data": kubetest.Object{"OPENAI_API_KEY": "b2xk"}})
-	out, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-three"))
-	if err != nil || out != Replaced {
-		t.Fatalf("%v %v", out, err)
+	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}, "data": kubetest.Object{"OPENAI_API_KEY": "b2xk"}})
+	res, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-three"))
+	if err != nil || res.Outcome != Replaced {
+		t.Fatalf("%+v %v", res, err)
 	}
 	if reg.entries["r"] != Hash("vk-three") {
 		t.Fatalf("%v", reg.entries)
 	}
-	o, _ := s.Get(secrets, "kagent", "r-virtual-key")
+	o, _ := s.Get(secrets, "kagent", "r-virtual-key-0a1b2c3d")
 	if raw, _ := base64.StdEncoding.DecodeString(o["data"].(map[string]any)["OPENAI_API_KEY"].(string)); string(raw) != "vk-three" {
 		t.Fatalf("secret was not replaced: %q", raw)
 	}
-	reqs := s.Requests()
 	var seq []string
-	for _, r := range reqs {
+	for _, r := range s.Requests() {
 		seq = append(seq, r.Method)
 	}
 	if strings.Join(seq, ",") != "POST,DELETE,POST" {
@@ -137,9 +168,21 @@ func TestConflictWithoutHashDeletesOwnSecretAndRecreates(t *testing.T) {
 	}
 }
 
+func TestSecretCarriesTheFingerprintAsAnAnnotation(t *testing.T) {
+	s, sec, reg := setup(t)
+	if _, err := Ensure(context.Background(), params(), sec, reg, fixed("vk-one")); err != nil {
+		t.Fatal(err)
+	}
+	o, _ := s.Get(secrets, "kagent", "r-virtual-key-0a1b2c3d")
+	a, _ := o["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if a["openagentix.io/key-fingerprint"] != Fingerprint(Hash("vk-one")) {
+		t.Fatalf("annotations %v", a)
+	}
+}
+
 func TestNeverReadsSecrets(t *testing.T) {
 	s, sec, reg := setup(t)
-	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key", "namespace": "kagent"}})
+	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}})
 	_, _ = Ensure(context.Background(), params(), sec, reg, fixed("vk-x"))
 	for _, r := range s.Requests() {
 		if r.Method == "GET" {
@@ -163,7 +206,7 @@ func TestKeyNeverInErrors(t *testing.T) {
 
 func TestSecondCreateConflictIsAnError(t *testing.T) {
 	s, sec, reg := setup(t)
-	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key", "namespace": "kagent"}})
+	s.Seed(secrets, kubetest.Object{"metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}})
 	s.Intercept = func(r kubetestRequest) (int, any, bool) {
 		if r.Method == "DELETE" {
 			return 200, map[string]any{}, true // delete "succeeds" but nothing is removed

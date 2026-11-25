@@ -1,7 +1,11 @@
 // Package kubetest is a small fake Kubernetes API server for tests. It speaks just enough REST: get, list (with label
-// selectors), watch (resume by resourceVersion, forced 410), create (409 when present), server-side apply (modelled as
-// a deep merge), merge patch (also on /status), update, and delete (finalizers hold an object with deletionTimestamp).
+// selectors and limit/continue pagination), watch (resume by resourceVersion, forced 410), create (409 when present),
+// server-side apply, merge patch (also on /status), update, and delete (finalizers hold an object with deletionTimestamp).
 // It records every request so a test can assert what was sent, and what was never sent.
+//
+// Server-side apply is modelled for the fields a client sends: the leaf paths (maps are descended, lists and scalars
+// are leaves) of the last apply are remembered per object, and a later apply that no longer sends a path removes it from
+// the object. It does not model several field managers, conflicts, list merge keys or defaulting.
 package kubetest
 
 import (
@@ -42,12 +46,13 @@ type Server struct {
 	rv     int
 	log    []Request
 	gone   map[string]string
+	owned  map[string]map[string]bool // "plural/ns/name" -> leaf paths of the last server-side apply
 	// Intercept, when set, may answer a request itself (return handled=true) before the fake does. It runs without the lock.
 	Intercept func(r Request) (code int, body any, handled bool)
 }
 
 func New() *Server {
-	s := &Server{objs: map[string]Object{}, events: map[string][]event{}, gone: map[string]string{}}
+	s := &Server{objs: map[string]Object{}, events: map[string][]event{}, gone: map[string]string{}, owned: map[string]map[string]bool{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.handle))
 	return s
 }
@@ -145,7 +150,7 @@ func (s *Server) bump(o Object) {
 func (s *Server) stampNew(o Object) {
 	m := meta(o)
 	if _, ok := m["uid"]; !ok {
-		m["uid"] = fmt.Sprintf("uid-%d", s.rv+1)
+		m["uid"] = fmt.Sprintf("%08x-0000-4000-8000-%012x", s.rv+1, s.rv+1) // UUID-shaped, like the real API server's
 	}
 	if _, ok := m["creationTimestamp"]; !ok {
 		m["creationTimestamp"] = time.Now().UTC().Format(time.RFC3339)
@@ -265,7 +270,21 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 		items := s.list(plural, ns, q.Get("labelSelector"))
 		rv := strconv.Itoa(s.rv)
 		s.mu.Unlock()
-		writeJSON(w, 200, Object{"kind": "List", "metadata": Object{"resourceVersion": rv}, "items": items})
+		md := Object{"resourceVersion": rv}
+		if lim, _ := strconv.Atoi(q.Get("limit")); lim > 0 {
+			start, _ := strconv.Atoi(q.Get("continue"))
+			if start > len(items) {
+				start = len(items)
+			}
+			end := start + lim
+			if end < len(items) {
+				md["continue"] = strconv.Itoa(end)
+			} else {
+				end = len(items)
+			}
+			items = items[start:end]
+		}
+		writeJSON(w, 200, Object{"kind": "List", "metadata": md, "items": items})
 	case r.Method == http.MethodGet:
 		o, ok := s.Get(plural, ns, name)
 		if !ok {
@@ -322,6 +341,7 @@ func (s *Server) patch(w http.ResponseWriter, plural, ns, name, sub, ct string, 
 		meta(p)["namespace"] = ns
 		s.stampNew(p)
 		s.objs[k] = p
+		s.owned[k] = leafPaths(p)
 		s.emit(plural, ns, "ADDED", p)
 		writeJSON(w, 201, deepCopy(p))
 		return
@@ -336,6 +356,9 @@ func (s *Server) patch(w http.ResponseWriter, plural, ns, name, sub, ct string, 
 	if sub == "status" {
 		merge(cur, Object{"status": p["status"]})
 	} else {
+		if apply {
+			s.removeUnsent(k, cur, p)
+		}
 		merge(cur, p)
 		if after, _ := json.Marshal(cur["spec"]); string(before) != string(after) {
 			m := meta(cur)
@@ -346,6 +369,48 @@ func (s *Server) patch(w http.ResponseWriter, plural, ns, name, sub, ct string, 
 	s.bump(cur)
 	s.emit(plural, ns, "MODIFIED", cur)
 	writeJSON(w, 200, deepCopy(cur))
+}
+
+// leafPaths lists the paths of the leaves of o: maps are descended, everything else (lists included) is a leaf.
+func leafPaths(o Object) map[string]bool {
+	out := map[string]bool{}
+	var walk func(prefix string, m map[string]any)
+	walk = func(prefix string, m map[string]any) {
+		for k, v := range m {
+			if sub, ok := v.(map[string]any); ok && len(sub) > 0 {
+				walk(prefix+k+"\x00", sub)
+				continue
+			}
+			out[prefix+k] = true
+		}
+	}
+	walk("", o)
+	return out
+}
+
+// removeUnsent deletes from cur the leaves the previous apply owned and this apply (p) no longer sends, then records p's
+// leaves as the owned set. A leaf another writer changed is still removed: one field manager is modelled.
+func (s *Server) removeUnsent(k string, cur, p Object) {
+	now := leafPaths(p)
+	for path := range s.owned[k] {
+		if now[path] {
+			continue
+		}
+		parts := strings.Split(path, "\x00")
+		m := cur
+		for _, part := range parts[:len(parts)-1] {
+			next, ok := m[part].(map[string]any)
+			if !ok {
+				m = nil
+				break
+			}
+			m = next
+		}
+		if m != nil {
+			delete(m, parts[len(parts)-1])
+		}
+	}
+	s.owned[k] = now
 }
 
 func (s *Server) update(w http.ResponseWriter, plural, ns, name string, body []byte) {

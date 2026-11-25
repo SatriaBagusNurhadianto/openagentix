@@ -45,25 +45,50 @@ func TestRegisterWritesTheInstallersEntryFormat(t *testing.T) {
 	}
 }
 
-func TestRegisteredAndUnregister(t *testing.T) {
+func TestEntriesAndUnregister(t *testing.T) {
 	_, a := setup(t)
 	ctx := context.Background()
-	if ok, err := a.Registered(ctx, "x"); err != nil || ok {
-		t.Fatalf("%v %v", ok, err)
+	if m, err := a.Entries(ctx); err != nil || len(m) != 0 {
+		t.Fatalf("%v %v", m, err)
 	}
 	_ = a.Register(ctx, "x", "sha256:1")
 	_ = a.Register(ctx, "y", "sha256:2")
-	if ok, _ := a.Registered(ctx, "x"); !ok {
-		t.Fatal("x should be registered")
+	m, err := a.Entries(ctx)
+	if err != nil || m["x"] != "sha256:1" || m["y"] != "sha256:2" || len(m) != 2 {
+		t.Fatalf("%v %v", m, err)
 	}
 	if err := a.Unregister(ctx, "x"); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := a.Registered(ctx, "x"); ok {
+	m, _ = a.Entries(ctx)
+	if _, ok := m["x"]; ok {
 		t.Fatal("x should be gone")
 	}
-	if ok, _ := a.Registered(ctx, "y"); !ok {
+	if m["y"] != "sha256:2" {
 		t.Fatal("y must stay")
+	}
+}
+
+func TestEntriesListsAnUnreadableEntryWithAnEmptyHash(t *testing.T) {
+	s, a := setup(t)
+	s.Modify("configmaps", "agentgateway-system", ConfigMapName, func(o kubetest.Object) {
+		o["data"] = map[string]any{"junk": "not json", "empty": ""}
+	})
+	m, err := a.Entries(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h, ok := m["junk"]; !ok || h != "" {
+		t.Fatalf("an entry nobody can use must be listed (so it can be swept) with no hash: %v", m)
+	}
+}
+
+func TestEntriesOfAMissingConfigMapIsAnError(t *testing.T) {
+	s := kubetest.New()
+	defer s.Close()
+	a := New(kube.New(s.URL, s.Client(), func() (string, error) { return "t", nil }), "agentgateway-system")
+	if _, err := a.Entries(context.Background()); err == nil {
+		t.Fatal("want an error")
 	}
 }
 

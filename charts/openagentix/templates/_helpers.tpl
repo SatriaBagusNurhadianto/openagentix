@@ -390,3 +390,149 @@ reach a vMCP or an unauthenticated backend proxy around the profile. */}}
 {{- end -}}
 {{- $allow | toJson -}}
 {{- end -}}
+
+{{/* ---- Control plane (ADR 0007, slice 1): controlPlane ------------------------------------------------------- */}}
+
+{{/* "true" when the control plane is switched on (the block may be absent: `controlPlane: null`). */}}
+{{- define "oa.cpOn" -}}
+{{- $c := .Values.controlPlane | default dict -}}
+{{- if $c.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* Namespace of the controller: controlPlane.namespace, else the release namespace. */}}
+{{- define "oa.cpNamespace" -}}
+{{- default .Release.Namespace .Values.controlPlane.namespace -}}
+{{- end -}}
+
+{{/* The platform catalog the controller reads (services/control-plane/README.md, "The catalog"), as pretty JSON. It is derived from the
+SAME values and helpers that render the chart agents (kagent.yaml), so the two cannot drift. It holds no secret: names, URLs, tool names,
+prompts and digest-pinned skill references only. Fails the render for a skill that is not digest-pinned (the controller refuses the file). */}}
+{{- define "oa.cpCatalog" -}}
+{{- $k := .Values.kagent -}}
+{{- $models := list -}}{{- range .Values.gateway.models }}{{ $models = append $models .name }}{{ end -}}
+{{- $profiles := list -}}
+{{- if and .Values.mcp.enabled $k.remoteMCPServer.enabled -}}
+{{- $_ := include "oa.profilesCheck" . -}}
+{{- range $p := (.Values.mcp.profiles | default list) -}}
+{{- $profiles = append $profiles (dict "name" $p.name "toolServer" (printf "%s-%s" $k.remoteMCPServer.name $p.name) "codeMode" (eq (toString (default false $p.codeMode)) "true") "tools" (include "oa.profileToolNames" (dict "root" $ "profile" $p) | fromJsonArray)) -}}
+{{- end -}}
+{{- end -}}
+{{- $knOn := and .Values.knowledge.enabled .Values.mcp.enabled -}}
+{{- $knowledge := dict "available" false "tools" (list) "prompt" "" -}}
+{{- if $knOn }}{{ $knowledge = dict "available" true "tools" (include "oa.knowledgeTools" . | fromJsonArray) "prompt" (include "oa.knowledgeAgentPrompt" . | trim) }}{{ end -}}
+{{- $ntOn := and .Values.notify.enabled .Values.mcp.enabled -}}
+{{- $notify := dict "available" false "tools" (list) "prompt" "" -}}
+{{- if $ntOn }}{{ $notify = dict "available" true "tools" (include "oa.notifyTools" . | fromJsonArray) "prompt" (include "oa.notifyAgentPrompt" . | trim) }}{{ end -}}
+{{- $memory := dict "available" (eq (include "oa.memoryEnabled" .) "true") "expiryEnabled" (ternary true false (and .Values.memory.expiry.enabled $k.enabled)) "defaultTtlDays" (int .Values.controlPlane.memoryDefaultTtlDays) "modelConfig" .Values.memory.modelConfig.name "prompt" (trim .Values.memory.agentPrompt) -}}
+{{- $skills := dict -}}
+{{- range $n, $s := (.Values.skills | default dict) -}}
+{{- if not (regexMatch "@sha256:[0-9a-f]{64}$" (toString $s.oci)) }}{{ fail (printf "skill %q must be a digest-pinned OCI ref (...@sha256:<64 hex>), got %q: the control plane catalog lists every skill" $n (toString $s.oci)) }}{{ end -}}
+{{- $_ := set $skills $n $s.oci -}}
+{{- end -}}
+{{- $env := list -}}
+{{- if and (include "oa.obsOn" .) .Values.observability.baggage }}{{ $env = append $env (dict "name" "OTEL_PROPAGATORS" "value" (include "oa.obsPropagators" .)) }}{{ end -}}
+{{- $gate := "" -}}
+{{- if include "oa.a2aGateOn" . }}{{ $gate = include "oa.a2aGateUrl" . }}{{ end -}}
+{{- $reserved := list -}}
+{{- range .Values.agents }}{{ $reserved = append $reserved .name }}{{ end -}}
+{{- /* Names a definition may not take, because its objects would collide with chart objects. The gateway user ids the installer registers
+(ModelConfig annotation openagentix.io/agent: every agent and "memory"; Deployment annotations openagentix.io/gateway-user*: "kb" and "kb-extract")
+are covered by the agents and the three platform names; tests/run.sh derives the users from the render and fails if one is missing. */ -}}
+{{- $reserved = concat $reserved (list "kb" "kb-extract" "memory") -}}
+{{- /* the base name of every virtualKeySecret override (<base>-virtual-key; a name without that ending counts whole), memory's key included */ -}}
+{{- range .Values.agents }}{{ if .virtualKeySecret }}{{ $reserved = append $reserved (trimSuffix "-virtual-key" (toString .virtualKeySecret)) }}{{ end }}{{ end -}}
+{{- if eq (include "oa.memoryEnabled" .) "true" }}{{ $reserved = append $reserved (trimSuffix "-virtual-key" (toString .Values.memory.modelConfig.virtualKeySecret)) }}{{ end -}}
+{{- /* the suffix (after gateway-) of every ModelConfig name that is not gateway-<agent>: a definition of that name would get that ModelConfig */ -}}
+{{- range .Values.agents }}{{ if and .modelConfigName (ne (toString .modelConfigName) (printf "gateway-%s" .name)) }}{{ $reserved = append $reserved (trimPrefix "gateway-" (toString .modelConfigName)) }}{{ end }}{{ end -}}
+{{- if eq (include "oa.memoryEnabled" .) "true" }}{{ $reserved = append $reserved (trimPrefix "gateway-" (toString .Values.memory.modelConfig.name)) }}{{ end -}}
+{{- $reserved = uniq $reserved -}}
+{{- $cat := dict
+    "adapters" (dict "runtime" "kagent" "modelGateway" "agentgateway" "tools" "toolhive")
+    "namespaces" (dict "agents" $k.namespace "gateway" .Values.gateway.namespace "tools" .Values.mcp.namespace)
+    "gatewayBaseUrl" (include "oa.gatewayBaseUrl" .)
+    "models" $models
+    "toolServer" $k.remoteMCPServer.name
+    "profiles" $profiles
+    "knowledge" $knowledge
+    "notify" $notify
+    "memory" $memory
+    "skills" $skills
+    "harnessImage" $k.harnessImage
+    "workerPool" $k.workerPool
+    "snapshotLocation" $k.snapshotLocation
+    "harnessEnv" $env
+    "gateUrl" $gate
+    "reservedNames" $reserved -}}
+{{- $cat | toPrettyJson -}}
+{{- end -}}
+
+{{/* The policy file the controller reads (README, "The policy"), as pretty JSON, from controlPlane.policy. */}}
+{{- define "oa.cpPolicy" -}}
+{{- $p := .Values.controlPlane.policy -}}
+{{- $m := $p.memory | default dict -}}
+{{- $e := $p.egress | default dict -}}
+{{- dict
+    "maxAgents" (int $p.maxAgents)
+    "allowedModels" ($p.allowedModels | default list)
+    "requireToolProfile" $p.requireToolProfile
+    "allowedProfiles" ($p.allowedProfiles | default list)
+    "allowKnowledge" $p.allowKnowledge
+    "allowNotify" $p.allowNotify
+    "allowedSkills" ($p.allowedSkills | default list)
+    "memory" (dict "allowed" $m.allowed "maxTtlDays" (int $m.maxTtlDays) "requireExpiry" $m.requireExpiry)
+    "egress" (dict "allowedOrigins" ($e.allowedOrigins | default list))
+    "reservedNames" ($p.reservedNames | default list)
+  | toPrettyJson -}}
+{{- end -}}
+
+{{/* Fails the render when controlPlane is malformed or the catalog makes it meaningless. Prints nothing. */}}
+{{- define "oa.cpCheck" -}}
+{{- $c := .Values.controlPlane -}}
+{{- $p := $c.policy | default dict -}}
+{{- $m := $p.memory | default dict -}}
+{{- $e := $p.egress | default dict -}}
+{{- if not .Values.kagent.enabled }}{{ fail "controlPlane.enabled needs kagent.enabled=true (it writes kagent objects)" }}{{ end -}}
+{{- if not .Values.gateway.enabled }}{{ fail "controlPlane.enabled needs gateway.enabled=true (every built agent gets a key at the model gateway)" }}{{ end -}}
+{{- if not .Values.gateway.models }}{{ fail "controlPlane.enabled needs at least one entry in gateway.models: the catalog would have no model to offer" }}{{ end -}}
+{{- if eq .Values.kagent.namespace .Values.gateway.namespace }}{{ fail "controlPlane.enabled needs kagent.namespace and gateway.namespace to differ: the controller's Roles are one per namespace" }}{{ end -}}
+{{- range $f := list "requireToolProfile" "allowKnowledge" "allowNotify" }}
+{{- if not (kindIs "bool" (get $p $f)) }}{{ fail (printf "controlPlane.policy.%s must be true or false" $f) }}{{ end }}
+{{- end }}
+{{- if not (kindIs "bool" $m.allowed) }}{{ fail "controlPlane.policy.memory.allowed must be true or false" }}{{ end }}
+{{- if not (kindIs "bool" $m.requireExpiry) }}{{ fail "controlPlane.policy.memory.requireExpiry must be true or false" }}{{ end }}
+{{- range $f := list (dict "n" "maxAgents" "v" $p.maxAgents "min" 0) (dict "n" "memory.maxTtlDays" "v" $m.maxTtlDays "min" 0) (dict "n" "memoryDefaultTtlDays (controlPlane level)" "v" $c.memoryDefaultTtlDays "min" 1) }}
+{{- if not (or (kindIs "float64" $f.v) (kindIs "int64" $f.v) (kindIs "int" $f.v)) }}{{ fail (printf "controlPlane %s must be a whole number" $f.n) }}{{ end }}
+{{- if lt (int $f.v) $f.min }}{{ fail (printf "controlPlane %s must be at least %d, got %v" $f.n $f.min $f.v) }}{{ end }}
+{{- end }}
+{{- if and $m.allowed (lt (int $m.maxTtlDays) 1) }}{{ fail "controlPlane.policy.memory.maxTtlDays must be at least 1 when memory.allowed is true" }}{{ end }}
+{{- $models := list -}}{{- range .Values.gateway.models }}{{ $models = append $models .name }}{{ end -}}
+{{- $profiles := list -}}{{- range $x := (.Values.mcp.profiles | default list) }}{{ $profiles = append $profiles $x.name }}{{ end -}}
+{{- $skills := keys (.Values.skills | default dict) -}}
+{{- range $f := list (dict "n" "allowedModels" "have" $models "what" "a gateway.models name") (dict "n" "allowedProfiles" "have" $profiles "what" "an mcp.profiles name") (dict "n" "allowedSkills" "have" $skills "what" "a name of the top-level skills") }}
+{{- $l := (get $p $f.n) | default list }}
+{{- if not (kindIs "slice" $l) }}{{ fail (printf "controlPlane.policy.%s must be a list (an empty list allows nothing, the single entry \"*\" allows everything)" $f.n) }}{{ end }}
+{{- range $x := $l }}
+{{- if not (and (kindIs "string" $x) (or (eq $x "*") (has $x $f.have))) }}{{ fail (printf "controlPlane.policy.%s lists %v, which is not %s (have: %s). A typo here would silently allow nothing" $f.n $x $f.what (join ", " $f.have)) }}{{ end }}
+{{- end }}
+{{- end }}
+{{- if not (kindIs "slice" ($p.reservedNames | default list)) }}{{ fail "controlPlane.policy.reservedNames must be a list of names" }}{{ end }}
+{{- $o := $e.allowedOrigins | default list -}}
+{{- if not (kindIs "slice" $o) }}{{ fail "controlPlane.policy.egress.allowedOrigins must be a list of origins (an empty list allows no egress)" }}{{ end -}}
+{{- $_ := include "oa.agentEgress" (dict "root" . "agent" (dict "name" "controlPlane.policy.egress.allowedOrigins" "egress" (dict "allow" $o))) -}}
+{{- if and $p.allowNotify (not (and .Values.notify.enabled .Values.mcp.enabled)) }}{{ fail "controlPlane.policy.allowNotify needs notify.enabled=true and mcp.enabled=true: the catalog has no notify tools, so every definition asking for notify would be refused" }}{{ end -}}
+{{- if $m.allowed -}}
+{{- if not (include "oa.memoryEnabled" .) }}{{ fail "controlPlane.policy.memory.allowed needs the memory stack: it is installed only when a chart agent has memory.enabled (agents[].memory.enabled), see README Memory. Without it every definition asking for memory would be refused" }}{{ end -}}
+{{- if and $m.requireExpiry (not .Values.memory.expiry.enabled) }}{{ fail "controlPlane.policy.memory.allowed with requireExpiry needs memory.expiry.enabled=true: without the expiry job the time limit of a memory is not enforced. Enable the job or set requireExpiry=false on purpose" }}{{ end -}}
+{{- end -}}
+{{- if not (kindIs "slice" ($c.apiServerCIDRs | default list)) }}{{ fail "controlPlane.apiServerCIDRs must be a list of CIDRs" }}{{ end -}}
+{{- range $x := ($c.apiServerCIDRs | default list) }}
+{{- if not (and (kindIs "string" $x) (or (regexMatch "^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$" $x) (regexMatch "^[0-9a-fA-F:]*:[0-9a-fA-F:.]*/([0-9]{1,2}|1[01][0-9]|12[0-8])$" $x))) }}{{ fail (printf "controlPlane.apiServerCIDRs entry %v is not a CIDR (for example 10.0.0.0/24)" $x) }}{{ end }}
+{{- end }}
+{{- if not (or (kindIs "float64" $c.maxDefinitions) (kindIs "int64" $c.maxDefinitions) (kindIs "int" $c.maxDefinitions)) }}{{ fail "controlPlane.maxDefinitions must be a whole number" }}{{ end -}}
+{{- if lt (int $c.maxDefinitions) 1 }}{{ fail (printf "controlPlane.maxDefinitions must be at least 1, got %v" $c.maxDefinitions) }}{{ end -}}
+{{- if and $c.minInterval (not (regexMatch "^([0-9]+(\\.[0-9]+)?(ms|s|m|h))+$" (toString $c.minInterval))) }}{{ fail (printf "controlPlane.minInterval must be a duration with a unit, such as 500ms or 2s (empty: the controller's default), got %v" $c.minInterval) }}{{ end -}}
+{{- if not (kindIs "slice" $c.apiServerPorts) }}{{ fail "controlPlane.apiServerPorts must be a list of port numbers" }}{{ end -}}
+{{- range $x := $c.apiServerPorts }}
+{{- if not (and (or (kindIs "float64" $x) (kindIs "int64" $x) (kindIs "int" $x)) (ge (int $x) 1) (le (int $x) 65535)) }}{{ fail (printf "controlPlane.apiServerPorts entry %v is not a port number" $x) }}{{ end }}
+{{- end }}
+{{- end -}}

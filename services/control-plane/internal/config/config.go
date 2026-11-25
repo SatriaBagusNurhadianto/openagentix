@@ -15,6 +15,7 @@ type Config struct {
 	HealthAddr  string
 	Resync      time.Duration
 	Backoff     time.Duration
+	MinInterval time.Duration
 	LogLevel    string
 }
 
@@ -56,6 +57,9 @@ func Load(getenv func(string) string) (Config, error) {
 		errs = append(errs, err)
 	}
 	if c.Backoff, err = duration("CONTROL_PLANE_BACKOFF", getenv("CONTROL_PLANE_BACKOFF"), 10*time.Second, time.Millisecond); err != nil {
+		errs = append(errs, err)
+	}
+	if c.MinInterval, err = duration("CONTROL_PLANE_MIN_INTERVAL", getenv("CONTROL_PLANE_MIN_INTERVAL"), time.Second, time.Millisecond); err != nil {
 		errs = append(errs, err)
 	}
 	var lv slog.Level

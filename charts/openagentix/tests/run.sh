@@ -1523,6 +1523,285 @@ eq "memory: must be a boolean for an extra caller"      "$([ -n "$(render_err "$
 rm -f "$MX"
 eq "no Secret object with everything on"                "$(count "$(docs "${MON[@]}" "${PALL[@]:0:0}")" '.kind=="Secret"')" 0
 
+echo "# control plane (ADR 0007, slice 1): off by default"
+CPV="$REPO/components/control-plane/demo-values.yaml"
+CP8=(-f "$REPO/components/channels/demo-values.yaml" -f "$REPO/components/schedules/demo-values.yaml" -f "$REPO/components/notify/demo-values.yaml" -f "$REPO/components/observability/demo-values.yaml" -f "$REPO/components/knowledge/graph-demo-values.yaml" -f "$REPO/components/governance/demo-values.yaml" -f "$REPO/components/governance/profiles-demo-values.yaml" -f "$REPO/components/governance/memory-demo-values.yaml")
+CP9=("${CP8[@]}" -f "$CPV")
+CPSVC="$REPO/services/control-plane"
+D=$(docs)
+eq "no control plane objects by default"               "$(count "$D" '.metadata.name|tostring|test("control-plane|agent-builder|agent-viewer|agentdefinitions")')" 0
+H0=$(helm template openagentix "$CHART" -n openagentix-system 2>&1 | shasum -a 256)
+CPX="$(dirname "$0")/.cp-variant.yaml"
+cat > "$CPX" <<'YAML'
+controlPlane:
+  enabled: false
+  namespace: elsewhere
+  sourceHash: abc
+  apiServerCIDRs: [10.0.0.0/24]
+  policy: {maxAgents: 1, allowedModels: ["*"], allowedProfiles: ["*"], allowNotify: true, memory: {allowed: true}}
+YAML
+H1=$(helm template openagentix "$CHART" -n openagentix-system -f "$CPX" 2>&1 | shasum -a 256)
+eq "controlPlane.enabled=false (other controlPlane values set) is byte-identical to the default render" "$H1" "$H0"
+H2=$(helm template openagentix "$CHART" -n openagentix-system -f /dev/stdin <<<'controlPlane: null' 2>&1 | shasum -a 256)
+eq "controlPlane=null is byte-identical to the default render" "$H2" "$H0"
+HD8=$(helm template openagentix "$CHART" -n openagentix-system "${CP8[@]}" 2>&1 | shasum -a 256)
+HD8X=$(helm template openagentix "$CHART" -n openagentix-system "${CP8[@]}" -f "$CPX" 2>&1 | shasum -a 256)
+eq "the eight demo files render byte-identically with the switch off and controlPlane values set" "$HD8X" "$HD8"
+rm -f "$CPX"
+if [ -n "${OA_BASELINE_DEMO8_RENDER:-}" ]; then   # the same render at the previous commit
+  eq "the eight demo files render byte-identically to the baseline (OA_BASELINE_DEMO8_RENDER)" "$HD8" "$(shasum -a 256 < "$OA_BASELINE_DEMO8_RENDER")"
+fi
+eq "the nine demo files render"                        "$([ -z "$(render_err "${CP9[@]}")" ] && echo rendered || echo failed)" rendered
+
+echo "# control plane: the objects"
+D=$(docs "${CP9[@]}")
+CPNS=openagentix-system
+CPD='.[]|select(.kind=="Deployment" and .metadata.name=="openagentix-control-plane")'
+CPP="$CPD|.spec.template.spec"
+CPC="$CPP|.containers[0]"
+eq "the CRD is rendered once"                          "$(count "$D" '.kind=="CustomResourceDefinition" and .metadata.name=="agentdefinitions.openagentix.io"')" 1
+eq "the CRD is kept on helm uninstall"                 "$(q "$D" '.[]|select(.kind=="CustomResourceDefinition" and .metadata.name=="agentdefinitions.openagentix.io")|.metadata.annotations["helm.sh/resource-policy"]')" keep
+eq "the chart's CRD file is byte-identical to the service's"  "$(cmp -s "$CHART/files/agentdefinition-crd.yaml" "$CPSVC/crd/agentdefinition.yaml" && echo identical || echo differs)" identical
+CRDR=$(q "$D" '.[]|select(.kind=="CustomResourceDefinition" and .metadata.name=="agentdefinitions.openagentix.io")|del(.metadata.annotations)|walk(if type=="object" then with_entries(select(.value!=null)) else . end)' | jq -S .)
+CRDS=$(yq -c . "$CPSVC/crd/agentdefinition.yaml" | jq -S 'walk(if type=="object" then with_entries(select(.value!=null)) else . end)')
+eq "the rendered CRD equals the service's CRD (annotations aside)" "$([ "$CRDR" = "$CRDS" ] && echo identical || echo differs)" identical
+eq "catalog ConfigMap"                                 "$(count "$D" '.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog" and .metadata.namespace=="'$CPNS'"')" 1
+eq "policy ConfigMap"                                  "$(count "$D" '.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy" and .metadata.namespace=="'$CPNS'"')" 1
+CAT=$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]')
+POL=$(q "$D" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]')
+eq "catalog.json parses"                               "$(jq -e type <<<"$CAT" 2>/dev/null)" '"object"'
+eq "policy.json parses"                                "$(jq -e type <<<"$POL" 2>/dev/null)" '"object"'
+eq "catalog equals the controller's testdata/catalog.json (demo values, normalised, reservedNames aside)" "$([ "$(jq -S 'del(.reservedNames)' <<<"$CAT")" = "$(jq -S 'del(.reservedNames)' "$CPSVC/testdata/catalog.json")" ] && echo equal || echo differs)" equal
+eq "the chart's reservedNames contain every name of the controller's testdata/catalog.json" "$(jq -n --argjson a "$CAT" --slurpfile b "$CPSVC/testdata/catalog.json" '(($b[0].reservedNames)-($a.reservedNames))|length')" 0
+CPT="$(dirname "$0")/.cp-testdata-policy.yaml"
+jq '{controlPlane: {policy: .}}' "$CPSVC/testdata/policy.json" > "$CPT"
+POLT=$(q "$(docs "${CP9[@]}" -f "$CPT")" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]')
+eq "policy equals the controller's testdata/policy.json when the values say the same (normalised)" "$([ "$(jq -S . <<<"$POLT")" = "$(jq -S . "$CPSVC/testdata/policy.json")" ] && echo equal || echo differs)" equal
+rm -f "$CPT"
+eq "demo policy: one model, one profile, knowledge, no notify, no memory, no egress" "$(jq -c '[.allowedModels,.allowedProfiles,.allowKnowledge,.allowNotify,.memory.allowed,.egress.allowedOrigins,.allowedSkills,.requireToolProfile,.maxAgents]' <<<"$POL")" '[["claude-haiku"],["lookup"],true,false,false,[],[],true,5]'
+eq "demo catalog lists the profile server and its tools" "$(jq -c '.profiles[0]|[.name,.toolServer,.codeMode]' <<<"$CAT")" '["lookup","toolhive-vmcp-lookup",true]'
+eq "no Secret object and no Secret reference in the catalog or policy" "$(printf '%s%s' "$CAT" "$POL" | command grep -ciE 'secretRef|apiKeySecret|virtual-key' || true)" 0
+eq "no secret-shaped value in the catalog or policy"   "$(printf '%s%s' "$CAT" "$POL" | command grep -cE 'vk-[0-9a-f]{16,}|sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[bpa]-[0-9A-Za-z-]{10,}|BEGIN [A-Z ]*PRIVATE KEY|eyJ[A-Za-z0-9_-]{10,}[.]' || true)" 0
+KC='.[]|select(.kind=="ConfigMap" and .metadata.name=="llm-api-keys-control-plane")'
+eq "the controller's key ConfigMap is in the gateway namespace" "$(q "$D" "$KC|.metadata.namespace")" agentgateway-system
+eq "the key ConfigMap carries the gateway's selector label"    "$(q "$D" "$KC|.metadata.labels[\"agentgateway.dev/apikey\"]")" true
+eq "the key ConfigMap has no data key at all"          "$(q "$D" "$KC|[has(\"data\"),has(\"binaryData\")]|any")" false
+eq "the key ConfigMap is kept on helm uninstall"       "$(q "$D" "$KC|.metadata.annotations[\"helm.sh/resource-policy\"]")" keep
+eq "exactly one key ConfigMap of the control plane"    "$(count "$D" '.kind=="ConfigMap" and .metadata.name=="llm-api-keys-control-plane"')" 1
+eq "the installer's key ConfigMap name is not rendered by the chart" "$(count "$D" '.kind=="ConfigMap" and .metadata.name=="llm-api-keys"')" 0
+eq "ServiceAccount"                                    "$(count "$D" '.kind=="ServiceAccount" and .metadata.name=="openagentix-control-plane" and .metadata.namespace=="'$CPNS'"')" 1
+RQ='.[]|select(.kind=="ResourceQuota" and .metadata.name=="openagentix-agentdefinitions")'
+eq "ResourceQuota caps the number of definitions in the agents namespace" "$(q "$D" "$RQ|[.metadata.namespace,(.spec.hard|tojson)]|join(\" \")")" 'kagent {"count/agentdefinitions.openagentix.io":"50"}'
+eq "exactly one ResourceQuota is rendered"             "$(count "$D" '.kind=="ResourceQuota"')" 1
+eq "controlPlane.maxDefinitions sets the cap"          "$(q "$(docs "${CP9[@]}" --set controlPlane.maxDefinitions=7)" "$RQ|.spec.hard[\"count/agentdefinitions.openagentix.io\"]")" 7
+eq "the quota is namespaced like the agents (kagent.namespace)" "$(q "$(docs --set controlPlane.enabled=true --set kagent.namespace=ag2)" "$RQ|.metadata.namespace")" ag2
+eq "the cap is documented next to policy.maxAgents in values.yaml" "$(command grep -c 'refused drafts count' "$CHART/values.yaml")" 1
+
+echo "# control plane: permissions (namespaced Roles only)"
+RA='.[]|select(.kind=="Role" and .metadata.name=="openagentix-control-plane" and .metadata.namespace=="kagent")'
+RG='.[]|select(.kind=="Role" and .metadata.name=="openagentix-control-plane" and .metadata.namespace=="agentgateway-system")'
+eq "no ClusterRole or ClusterRoleBinding comes from the control plane" "$(count "$D" '(.kind=="ClusterRole" or .kind=="ClusterRoleBinding") and (.metadata.name|test("control-plane|agent-builder|agent-viewer"))')" 0
+eq "Role in the kagent namespace"                      "$(count "$D" '.kind=="Role" and .metadata.name=="openagentix-control-plane" and .metadata.namespace=="kagent"')" 1
+eq "Role in the gateway namespace"                     "$(count "$D" '.kind=="Role" and .metadata.name=="openagentix-control-plane" and .metadata.namespace=="agentgateway-system"')" 1
+eq "RoleBindings bind the ServiceAccount, one per Role" "$(q "$D" '[.[]|select(.kind=="RoleBinding" and .metadata.name=="openagentix-control-plane")|[.metadata.namespace,.roleRef.kind,.roleRef.name,.subjects[0].kind,.subjects[0].name,.subjects[0].namespace]|join("/")]|sort|join(" ")')" "agentgateway-system/Role/openagentix-control-plane/ServiceAccount/openagentix-control-plane/$CPNS kagent/Role/openagentix-control-plane/ServiceAccount/openagentix-control-plane/$CPNS"
+eq "Secrets: exactly create and delete, one rule"      "$(q "$D" "$RA|[.rules[]|select(.resources|index(\"secrets\"))]|map(.verbs|sort|join(\",\"))|join(\";\")")" create,delete
+eq "Secrets rule has no resourceNames (create cannot have them)" "$(q "$D" "$RA|[.rules[]|select(.resources|index(\"secrets\"))|has(\"resourceNames\")]|any")" false
+eq "definitions: get, list, watch, update"             "$(q "$D" "$RA|.rules[]|select(.resources==[\"agentdefinitions\"])|.verbs|sort|join(\",\")")" get,list,update,watch
+eq "definitions/status: patch"                         "$(q "$D" "$RA|.rules[]|select(.resources==[\"agentdefinitions/status\"])|.verbs|join(\",\")")" patch
+eq "kagent kinds: get, list, watch, create, patch, delete" "$(q "$D" "$RA|.rules[]|select(.apiGroups==[\"api.kagent.dev\"])|[(.resources|sort|join(\",\")),(.verbs|sort|join(\",\"))]|join(\" \")")" "agents,agenttemplates,egresspolicies,harnesses,modelconfigs create,delete,get,list,patch,watch"
+eq "the kagent Role has exactly four rules"            "$(q "$D" "$RA|.rules|length")" 4
+eq "gateway Role: one rule, ConfigMaps"                "$(q "$D" "$RG|.rules|length")" 1
+eq "gateway Role: only llm-api-keys-control-plane"     "$(q "$D" "$RG|.rules[0]|[(.resources|join(\",\")),(.resourceNames|join(\",\")),(.verbs|sort|join(\",\"))]|join(\" \")")" "configmaps llm-api-keys-control-plane get,patch"
+eq "no wildcard in any rule of the block"              "$(q "$D" '[.[]|select((.kind=="Role" or .kind=="ClusterRole") and (.metadata.name|test("control-plane|agent-builder|agent-viewer")))|.rules[]|(.verbs+.resources+.apiGroups+(.resourceNames//[]))[]|select(.=="*")]|length')" 0
+eq "builder Role is rendered, in the kagent namespace" "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-builder")|.metadata.namespace')" kagent
+eq "builder writes agentdefinitions and nothing else" "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-builder")|[.rules[]|[(.apiGroups|join(",")),(.resources|join(","))]|join(" ")]|unique|join(";")')" "openagentix.io agentdefinitions;openagentix.io agentdefinitions/status"
+eq "builder has no verb on Secrets, kagent kinds or pods/exec" "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-builder")|[.rules[].resources[]|select(test("secrets|exec|api.kagent|agents$|harnesses"))]|length')" 0
+eq "builder may create, update and delete"             "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-builder")|[.rules[].verbs[]]|unique|join(",")')" create,delete,get,list,patch,update,watch
+eq "viewer Role reads definitions only"                "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-viewer")|[.rules[].verbs[]]|unique|join(",")')" get,list,watch
+eq "viewer Role names agentdefinitions"                "$(q "$D" '.[]|select(.kind=="Role" and .metadata.name=="openagentix-agent-viewer")|[.rules[].resources[]]|unique|join(",")')" agentdefinitions,agentdefinitions/status
+eq "builder and viewer are rendered WITHOUT bindings"  "$(count "$D" '(.kind=="RoleBinding" or .kind=="ClusterRoleBinding") and (.roleRef.name|test("agent-builder|agent-viewer"))')" 0
+
+echo "# control plane: the output guard (ValidatingAdmissionPolicy)"
+VP='.[]|select(.kind=="ValidatingAdmissionPolicy" and .metadata.name=="openagentix-control-plane-output-guard")'
+VB='.[]|select(.kind=="ValidatingAdmissionPolicyBinding" and .metadata.name=="openagentix-control-plane-output-guard")'
+SAU="system:serviceaccount:$CPNS:openagentix-control-plane"
+eq "policy and binding exist"                          "$(count "$D" '(.kind=="ValidatingAdmissionPolicy" or .kind=="ValidatingAdmissionPolicyBinding") and .metadata.name=="openagentix-control-plane-output-guard"')" 2
+eq "binding refers to the policy and denies"           "$(q "$D" "$VB|[.spec.policyName,(.spec.validationActions|join(\",\"))]|join(\" \")")" "openagentix-control-plane-output-guard Deny"
+eq "policy fails closed"                               "$(q "$D" "$VP|.spec.failurePolicy")" Fail
+eq "policy applies to the controller's ServiceAccount only (matchCondition names the username)" "$(q "$D" "$VP|.spec.matchConditions|map(.expression)|join(\" \")|contains(\"$SAU\")")" true
+eq "policy matches secrets, configmaps and all five kagent kinds, not definitions" "$(q "$D" "$VP|[.spec.matchConstraints.resourceRules[].resources[]]|sort|join(\",\")")" "agents,agenttemplates,configmaps,egresspolicies,harnesses,modelconfigs,secrets"
+eq "the kagent kinds are matched for CREATE, UPDATE and DELETE" "$(q "$D" "$VP|.spec.matchConstraints.resourceRules[]|select(.apiGroups==[\"api.kagent.dev\"])|.operations|sort|join(\",\")")" CREATE,DELETE,UPDATE
+eq "Secrets are matched for UPDATE too (so that an UPDATE can be refused)" "$(q "$D" "$VP|.spec.matchConstraints.resourceRules[]|select(.resources|index(\"secrets\"))|.operations|sort|join(\",\")")" CREATE,DELETE,UPDATE
+eq "no wildcard operation in the policy's match rules" "$(q "$D" "$VP|[.spec.matchConstraints.resourceRules[].operations[]]|unique|join(\",\")")" CREATE,DELETE,UPDATE
+GEXPR=$(q "$D" "$VP|(.spec.variables+.spec.validations)|map(.expression)|join(\"\\n\")")
+gcount() { printf '%s' "$GEXPR" | command grep -c -F -- "$1"; }
+eq "guard: secret names must match <name>-virtual-key-<8 hex> (create and delete)" "$(gcount '^[a-z]([-a-z0-9]*[a-z0-9])?-virtual-key-[0-9a-f]{8}$')" 2
+eq "guard: the agent label must be the name's prefix before -virtual-key-" "$(gcount "name.substring(0, size(variables.subject.metadata.name) - 21)")" 1
+eq "guard: both labels are checked on create, delete and in the ownership variables" "$([ "$(gcount "'openagentix.io/agent-definition' in")" -ge 4 ] && [ "$(gcount "'app.kubernetes.io/managed-by' in")" -ge 4 ] && echo yes || echo no)" yes
+eq "guard: the owner reference is an AgentDefinition with controller true" "$([ "$(gcount "r.kind == 'AgentDefinition'")" -ge 2 ] && [ "$(gcount "r.controller == true")" -ge 2 ] && echo yes || echo no)" yes
+eq "guard: a Secret has exactly one owner reference"   "$([ "$(gcount "size(object.metadata.ownerReferences) == 1")" -ge 1 ] && echo yes || echo no)" yes
+eq "guard: a Secret is immutable, Opaque and has the one data key" "$(gcount "object.immutable == true")+$(gcount "object.type == 'Opaque'")+$(gcount "'OPENAI_API_KEY' in object.data")+$(gcount "size(object.data) == 1")+$(gcount "!has(object.stringData)")" 1+1+1+1+1
+eq "guard: a Secret DELETE reads oldObject, name and labels" "$(gcount "oldObject.metadata.name.matches(")" 1
+eq "guard: the kagent kinds need ownership in the new object and in the old one" "$([ "$(gcount "variables.ownedNew &&")" -ge 1 ] && [ "$(gcount "variables.ownedOld")" -ge 1 ] && echo yes || echo no)" yes
+eq "guard: ownedNew and ownedOld are variables"        "$(q "$D" "$VP|[.spec.variables[].name]|sort|join(\",\")")" "agent,del,ownedNew,ownedOld,res,secretAgent,subject"
+eq "guard: the only ConfigMap name, UPDATE only"       "$(gcount "request.operation == 'UPDATE' && request.namespace == \"agentgateway-system\" && request.name == \"llm-api-keys-control-plane\"")" 1
+eq "guard: the profile tool server is the only server" "$(gcount "toolhive-vmcp-lookup")" 1
+eq "guard: a tool server must be of kind RemoteMCPServer, always present" "$(gcount "t.mcp.server.kind == 'RemoteMCPServer'")" 1
+eq "guard: skills are the catalog's digest refs"       "$(gcount "registry.invalid:5000/skills/openagentix-canary@sha256:")" 1
+eq "guard: the template's modelConfig is gateway-<agent>" "$(gcount "object.spec.modelConfig.name == 'gateway-' + variables.agent")" 1
+eq "guard: gateway URL pinned"                         "$(gcount "http://model-gateway.agentgateway-system.svc.cluster.local/v1")" 1
+eq "guard: the ModelConfig key Secret is <agent>-virtual-key-<8 hex>" "$(gcount "object.spec.apiKeySecret.startsWith(variables.agent + '-virtual-key-')")+$(gcount "matches('^[0-9a-f]{8}$')")" 1+1
+eq "guard: the catalog harness image is pinned"        "$(gcount "ghcr.io/kagent-dev/kagent/golang-adk@sha256:")" 1
+eq "guard: worker pool and snapshot location are the catalog's" "$(gcount "workerPoolRef.name == \"kagent-default\"")+$(gcount "snapshotPolicy.location == \"s3://ate-snapshots/kagent/\"")" 1+1
+eq "guard: the memory ModelConfig is the catalog's"    "$(gcount "gateway-embed-memory")" 1
+eq "guard: the harness env is the catalog's list"      "$(gcount "e in []")" 1
+eq "guard: the Agent refs derive from its own name"    "$(gcount "object.spec.template.ref.name == variables.agent + '-template'")+$(gcount "object.spec.harnessRef.name == variables.agent + '-harness'")+$(gcount "r.name == variables.agent + '-egress'")" 1+1+1
+eq "guard: egress hosts: no .svc, .cluster.local, namespace, single label, IP" "$(gcount "h.endsWith('.svc')")+$(gcount "h.endsWith('.cluster.local')")+$(gcount "[\"kagent\", \"agentgateway-system\", \"mcp-tools\"]")+$(gcount "h.contains('.')")+$(gcount "'^[0-9.]+\$'")" 1+1+1+1+1
+eq "guard: every validation has a message"             "$(q "$D" "$VP|[.spec.validations[]|(.message//\"\")==\"\"]|any")" false
+eq "guard: 12 validations"                             "$(q "$D" "$VP|.spec.validations|length")" 12
+DKS=$(docs --set controlPlane.enabled=true --set kagent.namespace=ag2)
+eq "guard: the kagent namespace follows into the Secret rule" "$(q "$DKS" "$VP|(.spec.validations|map(.expression)|join(\"\\n\"))|contains(\"request.namespace == \\\"ag2\\\"\")")" true
+
+echo "# control plane: the Deployment"
+eq "Deployment in the control plane namespace"         "$(q "$D" "$CPD|.metadata.namespace")" "$CPNS"
+eq "one replica"                                       "$(q "$D" "$CPD|.spec.replicas")" 1
+eq "strategy Recreate"                                 "$(q "$D" "$CPD|.spec.strategy.type")" Recreate
+eq "image"                                             "$(q "$D" "$CPC|.image")" openagentix/control-plane:dev
+eq "ServiceAccount"                                    "$(q "$D" "$CPP|.serviceAccountName")" openagentix-control-plane
+eq "runs as non-root 65532"                            "$(q "$D" "$CPP|.securityContext|[.runAsNonRoot,.runAsUser,.runAsGroup]|map(tostring)|join(\",\")")" true,65532,65532
+eq "fsGroup 65532"                                     "$(q "$D" "$CPP|.securityContext.fsGroup")" 65532
+eq "seccomp RuntimeDefault"                            "$(q "$D" "$CPP|.securityContext.seccompProfile.type")" RuntimeDefault
+eq "read-only root filesystem"                         "$(q "$D" "$CPC|.securityContext.readOnlyRootFilesystem")" true
+eq "no privilege escalation"                           "$(q "$D" "$CPC|.securityContext.allowPrivilegeEscalation")" false
+eq "drops ALL capabilities"                            "$(q "$D" "$CPC|.securityContext.capabilities.drop|join(\",\")")" ALL
+eq "the catalog and the policy are mounted as files"   "$(q "$D" "$CPC|.volumeMounts|map(.name+\":\"+.mountPath+\":\"+(.readOnly|tostring))|sort|join(\" \")")" "catalog:/etc/control-plane/catalog:true policy:/etc/control-plane/policy:true"
+eq "the file paths are passed by env"                  "$(q "$D" "$CPC|.env|map(select(.name|test(\"FILE\"))|.name+\"=\"+.value)|sort|join(\" \")")" "CONTROL_PLANE_CATALOG_FILE=/etc/control-plane/catalog/catalog.json CONTROL_PLANE_POLICY_FILE=/etc/control-plane/policy/policy.json"
+eq "CONTROL_PLANE_MIN_INTERVAL is not set by default"  "$(q "$D" "$CPC|[.env[]|select(.name==\"CONTROL_PLANE_MIN_INTERVAL\")]|length")" 0
+eq "controlPlane.minInterval sets CONTROL_PLANE_MIN_INTERVAL" "$(q "$(docs "${CP9[@]}" --set controlPlane.minInterval=2s)" "$CPC|.env[]|select(.name==\"CONTROL_PLANE_MIN_INTERVAL\")|.value")" 2s
+eq "no env var has a secretKeyRef or a literal secret" "$(q "$D" "$CPC|[.env[]|select(has(\"valueFrom\"))]|length")" 0
+eq "volumes are the two ConfigMaps"                    "$(q "$D" "$CPP|.volumes|map(.name+\":\"+.configMap.name)|sort|join(\" \")")" "catalog:openagentix-control-plane-catalog policy:openagentix-control-plane-policy"
+eq "probes on the health port"                         "$(q "$D" "$CPC|[.livenessProbe.httpGet.path,.readinessProbe.httpGet.path,.livenessProbe.httpGet.port]|map(tostring)|join(\" \")")" "/healthz /readyz health"
+eq "health container port"                             "$(q "$D" "$CPC|.ports|map(.name+\":\"+(.containerPort|tostring))|join(\",\")")" health:8081
+eq "resources are set"                                 "$(q "$D" "$CPC|.resources|has(\"limits\") and has(\"requests\")")" true
+eq "the pod does not get a Service"                    "$(count "$D" '.kind=="Service" and .metadata.name=="openagentix-control-plane"')" 0
+eq "checksum of the catalog is set"                    "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]|test(\"^[0-9a-f]{64}\$\")")" true
+eq "checksum of the policy is set"                     "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]|test(\"^[0-9a-f]{64}\$\")")" true
+eq "no source hash annotation without install.sh"      "$(q "$D" "$CPD|.spec.template.metadata.annotations|has(\"openagentix.io/source-hash\")")" false
+DH=$(docs "${CP9[@]}" --set-string controlPlane.sourceHash=0123456789abcdef)
+eq "sourceHash becomes the pod annotation"             "$(q "$DH" "$CPD|.spec.template.metadata.annotations[\"openagentix.io/source-hash\"]")" 0123456789abcdef
+DP=$(docs "${CP9[@]}" --set controlPlane.policy.maxAgents=3)
+eq "maxAgents change reaches the policy"               "$(jq -r '.maxAgents' <<<"$(q "$DP" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]')")" 3
+eq "a policy change rolls the pod (checksum differs)"  "$([ "$(q "$DP" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" != "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" ] && echo differs || echo same)" differs
+eq "a policy change leaves the catalog checksum alone" "$([ "$(q "$DP" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" = "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" ] && echo same || echo differs)" same
+DC=$(docs "${CP9[@]}" --set kagent.workerPool=other-pool)
+eq "a catalog change rolls the pod (checksum differs)" "$([ "$(q "$DC" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" != "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" ] && echo differs || echo same)" differs
+DN=$(docs "${CP9[@]}" --set controlPlane.namespace=cp-ns)
+eq "controlPlane.namespace moves the controller"       "$(q "$DN" "$CPD|.metadata.namespace")" cp-ns
+eq "...and the guard names the ServiceAccount there"   "$(q "$DN" "$VP|.spec.matchConditions[0].expression|contains(\"system:serviceaccount:cp-ns:openagentix-control-plane\")")" true
+
+echo "# control plane: the NetworkPolicy"
+NP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-control-plane")'
+eq "NetworkPolicy selects the controller pod"          "$(q "$D" "$NP|.spec.podSelector.matchLabels.app")" control-plane
+eq "no ingress at all"                                 "$(q "$D" "$NP|[(.spec.policyTypes|sort|join(\",\")), (.spec.ingress//[]|length|tostring)]|join(\" \")")" "Egress,Ingress 0"
+eq "egress: DNS first"                                 "$(q "$D" "$NP|.spec.egress[0]|[.to[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.to[0].podSelector.matchLabels[\"k8s-app\"],(.ports|map(.protocol+(.port|tostring))|sort|join(\",\"))]|join(\" \")")" "kube-system kube-dns TCP53,UDP53"
+eq "egress: two rules without CIDRs"                   "$(q "$D" "$NP|.spec.egress|length")" 2
+eq "egress without CIDRs: the API server ports towards any address (documented fallback)" "$(q "$D" "$NP|.spec.egress[1]|[(.to//[]|length|tostring),(.ports|map(.port|tostring)|join(\",\"))]|join(\" \")")" "0 443,6443"
+DA=$(docs "${CP9[@]}" --set 'controlPlane.apiServerCIDRs={172.18.0.0/24,10.1.2.3/32}')
+eq "egress with CIDRs: only those, on the API server ports" "$(q "$DA" "$NP|.spec.egress[1]|[(.to|map(.ipBlock.cidr)|join(\",\")),(.ports|map(.port|tostring)|join(\",\"))]|join(\" \")")" "172.18.0.0/24,10.1.2.3/32 443,6443"
+DT=$(docs "${CP9[@]}" --set networkPolicy.enabled=false)
+eq "networkPolicy.enabled=false renders no NetworkPolicy for the controller" "$(count "$DT" '.kind=="NetworkPolicy" and .metadata.name=="openagentix-control-plane"')" 0
+
+echo "# control plane: the catalog follows the chart values"
+eq "catalog: models are the gateway models"            "$(jq -c .models <<<"$CAT")" '["claude-haiku"]'
+eq "catalog: gateway URL is the one agents use"        "$(jq -r .gatewayBaseUrl <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="ModelConfig" and .metadata.name=="gateway-profile-demo")|.spec.openAI.baseUrl')"
+eq "catalog: the harness image is the one agents use"  "$(jq -r .harnessImage <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="profile-demo-harness")|.spec.workload.image')"
+eq "catalog: the profile's tools are the ones the chart validates agents against" "$(jq -c '.profiles[0].tools' <<<"$CAT")" '["knowledge_kb_search","osv_query_vulnerability","osv_get_vulnerability","execute_tool_script"]'
+eq "catalog: the profile server is the RemoteMCPServer name agents use" "$(jq -r '.profiles[0].toolServer' <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="AgentTemplate" and .metadata.name=="profile-demo-template")|.spec.tools[0].mcp.server.name')"
+eq "catalog: reserved names are the chart agents, the platform's names, the key Secret bases, the non-default ModelConfig suffixes and every gateway user" "$(jq -c '.reservedNames' <<<"$CAT")" '["assistant","profile-demo","kb","kb-extract","memory","claude-haiku","embed-memory"]'
+eq "catalog: the gate URL (gate on)"                   "$(jq -r .gateUrl <<<"$CAT")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080
+GWU=$(q "$D" '[(.[]|select(.kind=="ModelConfig")|.metadata.annotations["openagentix.io/agent"]),(.[]|select(.kind=="Deployment")|(.metadata.annotations//{})|to_entries[]|select(.key|test("^openagentix.io/gateway-user(-.+)?$"))|.value)]|map(select(.!=null and .!=""))|unique|join(",")')
+eq "catalog: every gateway user id the installer registers is reserved (derived from the render)" "$(jq -r --arg u "$GWU" '($u|split(","))-.reservedNames|length' <<<"$CAT")" 0
+eq "catalog: the users are agents, kb, kb-extract and memory" "$GWU" assistant,kb,kb-extract,memory,profile-demo
+CPO="$(dirname "$0")/.cp-override.yaml"
+cat > "$CPO" <<'YAML'
+controlPlane: {enabled: true}
+agents:
+  - name: bar
+    model: claude-haiku
+    modelConfigName: gateway-baz-model
+    virtualKeySecret: foo-virtual-key
+    systemPrompt: hi
+  - name: qux
+    model: claude-haiku
+    virtualKeySecret: odd-key
+    systemPrompt: hi
+  - name: plain
+    model: claude-haiku
+    modelConfigName: gateway-plain
+    virtualKeySecret: plain-virtual-key
+    systemPrompt: hi
+YAML
+RES=$(q "$(docs -f "$CPO")" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]|fromjson|.reservedNames|join(",")')
+eq "catalog: a virtualKeySecret override reserves its base name, a non-default modelConfigName its suffix, a default one nothing extra" "$RES" "bar,qux,plain,kb,kb-extract,memory,foo,odd-key,baz-model"
+rm -f "$CPO"
+eq "catalog: an overridden memory key Secret reserves its base too" "$(q "$(docs --set controlPlane.enabled=true --set memory.modelConfig.virtualKeySecret=mem2-virtual-key)" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]|fromjson|.reservedNames|index("mem2")!=null')" true
+DOFF=$(docs --set controlPlane.enabled=true)
+CATOFF=$(q "$DOFF" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]')
+eq "catalog without the other demos: no profiles, no gate, no notify; knowledge and memory follow the chart defaults" "$(jq -c '[.profiles,.gateUrl,.knowledge.available,.notify.available,.memory.available]' <<<"$CATOFF")" '[[],"",true,false,true]'
+eq "catalog: the chart's default agent has memory, so the memory stack is present" "$(jq -r .memory.available <<<"$CATOFF")" true
+CPM="$(dirname "$0")/.cp-nomem.yaml"
+yq -y '{agents: (.agents|map(del(.memory)))}' "$CHART/values.yaml" > "$CPM"
+DNM=$(docs --set controlPlane.enabled=true -f "$CPM")
+eq "catalog: memory.available follows the chart's own memory switch" "$(q "$DNM" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]|fromjson|.memory.available')" false
+
+echo "# control plane: the controller accepts the rendered files"
+if command -v go >/dev/null 2>&1 && [ -d "$CPSVC/cmd/control-plane" ]; then
+  CPW="$(mktemp -d)"
+  if (cd "$CPSVC" && go build -o "$CPW/control-plane" ./cmd/control-plane) 2>/dev/null; then
+    printf '%s' "$CAT" > "$CPW/catalog.json"; printf '%s' "$POL" > "$CPW/policy.json"
+    # No --validate flag exists: the controller loads both files first and only then asks for the in-cluster client, so an error that
+    # names neither file (it asks for the ServiceAccount) means both were accepted. Unknown fields are refused by the loader.
+    E=$(CONTROL_PLANE_CATALOG_FILE="$CPW/catalog.json" CONTROL_PLANE_POLICY_FILE="$CPW/policy.json" "$CPW/control-plane" 2>&1 | head -3)
+    eq "the controller loads the rendered catalog and policy (stops only at the in-cluster client)" "$(printf '%s' "$E" | command grep -cE 'catalog:|policy:|invalid configuration')" 0
+    eq "...and it really got that far (the in-cluster client was asked for)" "$(printf '%s' "$E" | command grep -ciE 'service|token|KUBERNETES|in-cluster|in cluster')" 1
+    jq '.surprise=1' <<<"$CAT" > "$CPW/bad.json"
+    E=$(CONTROL_PLANE_CATALOG_FILE="$CPW/bad.json" CONTROL_PLANE_POLICY_FILE="$CPW/policy.json" "$CPW/control-plane" 2>&1 | head -3)
+    eq "negative control: an unknown field in the catalog is refused by the controller" "$(printf '%s' "$E" | command grep -c 'catalog:')" 1
+  else
+    echo "  skip the controller could not be built here"
+  fi
+  rm -rf "$CPW"
+else
+  echo "  skip no go toolchain: the check that the controller accepts the rendered files did not run"
+fi
+
+echo "# control plane: render-time failures"
+cpfail() { local d=$1; shift; eq "$d" "$([ -n "$(render_err "${CP9[@]}" "$@")" ] && echo failed || echo rendered)" failed; }
+cpfail "enabled must be a boolean"                     --set controlPlane.enabled=yes
+cpfail "kagent.enabled=false fails the render"         --set kagent.enabled=false
+cpfail "gateway.enabled=false fails the render"        --set gateway.enabled=false
+cpfail "an allowed model that the gateway does not have fails" --set 'controlPlane.policy.allowedModels={ghost}'
+cpfail "an allowed profile that does not exist fails"  --set 'controlPlane.policy.allowedProfiles={ghost}'
+cpfail "an allowed skill that does not exist fails"    --set 'controlPlane.policy.allowedSkills={ghost}'
+cpfail "allowNotify with notify.enabled=false fails"   --set controlPlane.policy.allowNotify=true --set notify.enabled=false
+cpfail "negative maxAgents fails"                      --set controlPlane.policy.maxAgents=-1
+cpfail "memory allowed with maxTtlDays 0 fails"        --set controlPlane.policy.memory.allowed=true --set controlPlane.policy.memory.maxTtlDays=0
+cpfail "memory allowed while the expiry job is off (requireExpiry) fails" --set controlPlane.policy.memory.allowed=true --set memory.expiry.enabled=false
+cpfail "an egress origin that is not an origin fails"  --set 'controlPlane.policy.egress.allowedOrigins={http://x/y}'
+cpfail "an egress origin inside the tools namespace fails" --set 'controlPlane.policy.egress.allowedOrigins={https://vmcp.mcp-tools.svc}'
+cpfail "an allow list that is not a list fails"        --set controlPlane.policy.allowedModels=claude-haiku
+cpfail "a bad API server CIDR fails"                   --set 'controlPlane.apiServerCIDRs={not-a-cidr}'
+cpfail "memoryDefaultTtlDays below 1 fails"            --set controlPlane.memoryDefaultTtlDays=0
+cpfail "maxDefinitions below 1 fails"                  --set controlPlane.maxDefinitions=0
+cpfail "maxDefinitions that is not a number fails"     --set controlPlane.maxDefinitions=many
+cpfail "minInterval that is not a duration fails"      --set controlPlane.minInterval=fast
+cpfail "minInterval without a unit fails"              --set controlPlane.minInterval=5
+eq "memory allowed without the memory stack fails, and the message says why" "$(render_err --set controlPlane.enabled=true -f "$CPM" --set controlPlane.policy.memory.allowed=true | command grep -c 'memory stack')" 1
+rm -f "$CPM"
+eq "wildcard entries are accepted in every allow list" "$([ -z "$(render_err "${CP9[@]}" --set 'controlPlane.policy.allowedModels={*}' --set 'controlPlane.policy.allowedProfiles={*}' --set 'controlPlane.policy.allowedSkills={*}')" ] && echo rendered || echo failed)" rendered
+eq "the closed chart defaults render (nothing allowed)" "$([ -z "$(render_err --set controlPlane.enabled=true)" ] && echo rendered || echo failed)" rendered
+eq "...and render empty allow lists"                   "$(q "$(docs --set controlPlane.enabled=true)" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]|fromjson|[.allowedModels,.allowedProfiles,.allowedSkills,.egress.allowedOrigins]|tojson')" '[[],[],[],[]]'
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0

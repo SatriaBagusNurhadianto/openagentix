@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -23,6 +24,12 @@ import (
 const FieldManager = "openagentix-control-plane"
 
 const requestTimeout = 30 * time.Second
+
+// ListPageSize is the limit of every list request; a list follows the continue token until the server has no more.
+var ListPageSize = 100
+
+// MaxListItems bounds one List call: more items than this is an error, never an unbounded read.
+const MaxListItems = 10000
 
 // Object is an unstructured Kubernetes object.
 type Object = map[string]any
@@ -84,6 +91,9 @@ func code(err error) int {
 
 func IsNotFound(err error) bool { return code(err) == http.StatusNotFound }
 func IsConflict(err error) bool { return code(err) == http.StatusConflict }
+
+// IsInvalid is a 422: the object or patch is not valid, and sending it again will not change that.
+func IsInvalid(err error) bool { return code(err) == http.StatusUnprocessableEntity }
 
 // Client talks to one API server.
 type Client struct {
@@ -206,25 +216,42 @@ func (c *Client) Get(ctx context.Context, r Resource, ns, name string) (Object, 
 	return c.do(ctx, opName("get", r, name), http.MethodGet, r.path(ns, name, ""), nil, "", nil)
 }
 
-// List reads a collection and returns the list's resourceVersion for a watch to resume from.
+// List reads a collection page by page (limit ListPageSize, following the continue token, at most MaxListItems items)
+// and returns the list's resourceVersion for a watch to resume from. Each page is read with a bounded body.
 func (c *Client) List(ctx context.Context, r Resource, ns, selector string) ([]Object, string, error) {
-	q := url.Values{}
-	if selector != "" {
-		q.Set("labelSelector", selector)
-	}
-	out, err := c.do(ctx, opName("list", r, ""), http.MethodGet, r.path(ns, "", ""), q, "", nil)
-	if err != nil {
-		return nil, "", err
-	}
 	var items []Object
-	if l, ok := out["items"].([]any); ok {
-		for _, it := range l {
-			if m, ok := it.(map[string]any); ok {
-				items = append(items, m)
+	cont, rv := "", ""
+	for {
+		q := url.Values{}
+		if selector != "" {
+			q.Set("labelSelector", selector)
+		}
+		if ListPageSize > 0 {
+			q.Set("limit", strconv.Itoa(ListPageSize))
+		}
+		if cont != "" {
+			q.Set("continue", cont)
+		}
+		out, err := c.do(ctx, opName("list", r, ""), http.MethodGet, r.path(ns, "", ""), q, "", nil)
+		if err != nil {
+			return nil, "", err
+		}
+		if l, ok := out["items"].([]any); ok {
+			for _, it := range l {
+				if m, ok := it.(map[string]any); ok {
+					items = append(items, m)
+				}
 			}
 		}
+		if len(items) > MaxListItems {
+			return nil, "", fmt.Errorf("kubernetes API: list %s: more than %d items", r.Plural, MaxListItems)
+		}
+		md := Meta(out)
+		rv = md.String("resourceVersion")
+		if cont = md.String("continue"); cont == "" {
+			return items, rv, nil
+		}
 	}
-	return items, Meta(out).String("resourceVersion"), nil
 }
 
 // Apply writes obj with server-side apply, forcing conflicts: the controller owns the fields it sends.

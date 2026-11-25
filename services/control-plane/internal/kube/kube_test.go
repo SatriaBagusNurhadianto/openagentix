@@ -245,3 +245,66 @@ func TestUnreachableServerErrorHasNoURLQuery(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+func TestListPagesWithLimitAndContinue(t *testing.T) {
+	s := kubetest.New()
+	defer s.Close()
+	for _, n := range []string{"a", "b", "c", "d", "e"} {
+		s.Seed("agentdefinitions", def(n))
+	}
+	old := kube.ListPageSize
+	kube.ListPageSize = 2
+	defer func() { kube.ListPageSize = old }()
+	items, rv, err := newClient(t, s).List(context.Background(), defs, "kagent", "")
+	if err != nil || len(items) != 5 || rv == "" {
+		t.Fatalf("%d items, rv %q, err %v", len(items), rv, err)
+	}
+	reqs := s.Matching("GET", "/agentdefinitions")
+	if len(reqs) != 3 {
+		t.Fatalf("want 3 pages, got %d requests", len(reqs))
+	}
+	for _, r := range reqs {
+		if !strings.Contains(r.Query, "limit=2") {
+			t.Fatalf("every page must carry the limit: %q", r.Query)
+		}
+	}
+	if !strings.Contains(reqs[1].Query, "continue=") {
+		t.Fatalf("second page must continue: %q", reqs[1].Query)
+	}
+}
+
+func TestListRefusesMoreThanTheCap(t *testing.T) {
+	s := kubetest.New()
+	defer s.Close()
+	s.Intercept = func(r kubetest.Request) (int, any, bool) {
+		items := make([]any, 5000)
+		for i := range items {
+			items[i] = map[string]any{"metadata": map[string]any{"name": "x"}}
+		}
+		return 200, map[string]any{"items": items, "metadata": map[string]any{"continue": "more", "resourceVersion": "1"}}, true
+	}
+	if _, _, err := newClient(t, s).List(context.Background(), defs, "kagent", ""); err == nil {
+		t.Fatal("an endless list must end in an error")
+	}
+}
+
+func TestFakeServerSideApplyRemovesFieldsNoLongerSent(t *testing.T) {
+	s := kubetest.New()
+	defer s.Close()
+	c := newClient(t, s)
+	res := kube.Resource{Group: "g", Version: "v1", Plural: "things", Namespaced: true}
+	mk := func(spec kubetest.Object) kubetest.Object {
+		return kubetest.Object{"apiVersion": "g/v1", "kind": "Thing", "metadata": kubetest.Object{"name": "t", "namespace": "kagent"}, "spec": spec}
+	}
+	ctx := context.Background()
+	_ = c.Apply(ctx, res, "kagent", "t", mk(kubetest.Object{"a": "1", "nested": kubetest.Object{"x": "1", "y": "2"}}))
+	_ = c.Apply(ctx, res, "kagent", "t", mk(kubetest.Object{"nested": kubetest.Object{"x": "1"}}))
+	o, _ := s.Get("things", "kagent", "t")
+	spec := o["spec"].(map[string]any)
+	if _, ok := spec["a"]; ok {
+		t.Fatalf("a field no longer sent must be removed: %v", spec)
+	}
+	if _, ok := spec["nested"].(map[string]any)["y"]; ok {
+		t.Fatalf("a nested field no longer sent must be removed: %v", spec)
+	}
+}

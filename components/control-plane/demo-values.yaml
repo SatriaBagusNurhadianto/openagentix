@@ -1,0 +1,19 @@
+# Demo for the local kind cluster: the control plane ON (ADR 0007, slice 1). Combine it with the other demo files; it can come last, it does not
+# restate `agents` (a later file would REPLACE the list):
+#   VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml components/knowledge/graph-demo-values.yaml components/governance/demo-values.yaml components/governance/profiles-demo-values.yaml components/governance/memory-demo-values.yaml components/control-plane/demo-values.yaml" ./install.sh
+# It needs the tool profile `lookup` of components/governance/profiles-demo-values.yaml (the render fails without it: a policy may only
+# name profiles that exist). The controller is one small pod; an AgentDefinition (components/control-plane/researcher.yaml) becomes an agent,
+# which on the 6 CPU / 8 GB demo node costs the same as a chart agent (one golden snapshot build).
+# The policy below opens exactly one model and one profile, and does not forbid `knowledge: true`. Nothing else is allowed: no notify, no memory, no
+# skills, no egress. NOTE: the profile `lookup` offers only the tool knowledge_kb_search, and a definition with `knowledge: true` needs a profile that
+# offers ALL the knowledge tools (the controller adds them all), so on this demo such a definition is refused: list the tools you want in `tools:`
+# instead, as components/control-plane/researcher.yaml does. Without the A2A gate caller rule an operator adds, nobody may call the built agent from
+# outside (the controller writes no gate rules). The control plane's ResourceQuota (controlPlane.maxDefinitions, default 50) caps definition objects.
+controlPlane:
+  enabled: true
+  policy:
+    maxAgents: 5
+    allowedModels: [claude-haiku]
+    allowedProfiles: [lookup]
+    allowKnowledge: true
+    allowNotify: false

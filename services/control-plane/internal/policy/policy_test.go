@@ -290,8 +290,8 @@ func TestInstructionsWithSecretShapes(t *testing.T) {
 	}
 }
 
-func TestSecretPatternNamesAreTheTenOfTheMemoryScan(t *testing.T) {
-	want := []string{"aws_access_key_id", "bearer_token", "github_token", "google_api_key", "jwt", "private_key_header", "provider_secret_key", "slack_token", "stripe_secret_key", "telegram_bot_token"}
+func TestSecretPatternNamesAreTheTenOfTheMemoryScanAndThePlatformKey(t *testing.T) {
+	want := []string{"aws_access_key_id", "bearer_token", "github_token", "google_api_key", "jwt", "private_key_header", "provider_secret_key", "slack_token", "stripe_secret_key", "telegram_bot_token", "platform_virtual_key"}
 	got := PatternNames()
 	if !slices.Equal(got, want) {
 		t.Fatalf("got %v", got)

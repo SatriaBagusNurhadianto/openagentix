@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -130,5 +132,77 @@ func TestRunRefusesBadSetup(t *testing.T) {
 				t.Fatalf("want %q, got %v", tc.want, err)
 			}
 		})
+	}
+}
+
+// The canary, with the real adapters and several passes: a planted key value appears in exactly one request body (the
+// Secret create), nowhere else, and the controller mints and POSTs once however many passes run.
+func TestCanaryAndOneMintAcrossSeveralPassesWithTheRealAdapters(t *testing.T) {
+	const canary = "vk-CANARY1234567890canary1234567890"
+	b64 := base64.StdEncoding.EncodeToString([]byte(canary))
+	srv := kubetest.New()
+	defer srv.Close()
+	srv.Seed("configmaps", kubetest.Object{"apiVersion": "v1", "kind": "ConfigMap", "metadata": kubetest.Object{"name": "llm-api-keys-control-plane", "namespace": "agentgateway-system"}})
+	srv.Seed("agentdefinitions", kubetest.Object{"apiVersion": "openagentix.io/v1alpha1", "kind": "AgentDefinition",
+		"metadata": kubetest.Object{"name": "researcher", "namespace": "kagent", "creationTimestamp": "2026-11-25T10:00:00Z"},
+		"spec":     kubetest.Object{"model": "claude-haiku", "instructions": "Be brief.", "toolProfile": "lookup", "tools": []any{"osv_query_vulnerability"}}})
+	logs := &lockedBuf{}
+	mints := 0
+	addr := make(chan string, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	env := baseEnv()
+	env["CONTROL_PLANE_MIN_INTERVAL"] = "10ms"
+	go func() {
+		done <- run(ctx, getenv(env), deps{
+			Log:      slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			Kube:     kube.New(srv.URL, srv.Client(), func() (string, error) { return "t", nil }),
+			OnListen: func(a string) { addr <- a },
+			Mint:     func() (string, error) { mints++; return canary, nil },
+		})
+	}()
+	base := "http://" + <-addr
+	for get(t, base+"/readyz") != 200 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	for i := 0; i < 2; i++ { // two more passes by spec changes, one by the resync timer
+		time.Sleep(300 * time.Millisecond)
+		srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) {
+			m := kube.Meta(o)
+			g, _ := m["generation"].(float64)
+			m["generation"] = g + 1
+			o["spec"].(map[string]any)["description"] = fmt.Sprintf("edit %d", i)
+		})
+	}
+	time.Sleep(1500 * time.Millisecond)
+	cancel()
+	<-done
+
+	if mints != 1 {
+		t.Fatalf("%d keys minted, want 1", mints)
+	}
+	posts := 0
+	for _, r := range srv.Requests() {
+		if r.Method == "POST" && strings.HasSuffix(r.Path, "/secrets") {
+			posts++
+			continue
+		}
+		if strings.Contains(string(r.Body), canary) || strings.Contains(string(r.Body), b64) || strings.Contains(r.Query, canary) {
+			t.Fatalf("the key is in the request %s %s", r.Method, r.Path)
+		}
+	}
+	if posts != 1 {
+		t.Fatalf("%d Secret creates, want 1", posts)
+	}
+	if strings.Contains(logs.String(), canary) || strings.Contains(logs.String(), b64) {
+		t.Fatal("the key is in the log")
+	}
+	for _, st := range [][2]string{{"agentdefinitions", "kagent"}, {"configmaps", "agentgateway-system"}, {"agents", "kagent"}, {"harnesses", "kagent"}, {"modelconfigs", "kagent"}} {
+		for _, o := range srv.List(st[0], st[1]) {
+			raw, _ := json.Marshal(o)
+			if strings.Contains(string(raw), canary) || strings.Contains(string(raw), b64) {
+				t.Fatalf("the key is in a stored %s", st[0])
+			}
+		}
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os/exec"
 	"testing"
+
+	"github.com/openagentix/openagentix/services/control-plane/internal/api"
 )
 
 // The CRD is YAML and the module has no YAML parser, so the test converts it with yq (a dependency of the repo's other
@@ -97,5 +99,22 @@ func TestSpecHasNoBackdoorFields(t *testing.T) {
 		if _, ok := props[f]; ok {
 			t.Fatalf("spec must not have %q", f)
 		}
+	}
+}
+
+// Every field the controller writes to status must be in the schema: the API server prunes the rest, and the controller
+// would then think it had written something it had not.
+func TestEveryStatusFieldTheControllerWritesIsInTheSchema(t *testing.T) {
+	c := load(t)
+	v := dig(t, c, "spec", "versions").([]any)[0]
+	props := dig(t, v, "schema", "openAPIV3Schema", "properties", "status", "properties").(map[string]any)
+	written := api.Status{}.Patch()["status"].(map[string]any)
+	for k := range written {
+		if _, ok := props[k]; !ok {
+			t.Errorf("status.%s is written by the controller but missing in the CRD", k)
+		}
+	}
+	if dig(t, props, "appliedSpec", "type") != "string" || dig(t, props, "appliedGeneration", "type") != "integer" {
+		t.Fatal("appliedSpec is a string (a merge patch replaces it whole), appliedGeneration an integer")
 	}
 }

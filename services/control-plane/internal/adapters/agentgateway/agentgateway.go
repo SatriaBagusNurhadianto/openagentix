@@ -63,13 +63,21 @@ func (a *Adapter) Unregister(ctx context.Context, user string) error {
 	return nil
 }
 
-// Registered reports whether the gateway has an entry for user.
-func (a *Adapter) Registered(ctx context.Context, user string) (bool, error) {
+// Entries returns the hash of every user that has an entry ("" for an entry that is not in the installer's format).
+func (a *Adapter) Entries(ctx context.Context) (map[string]string, error) {
 	o, err := a.api.Get(ctx, cm, a.ns, ConfigMapName)
 	if err != nil {
-		return false, fmt.Errorf("read key ConfigMap: %w", err)
+		return nil, fmt.Errorf("read key ConfigMap: %w", err)
 	}
 	data, _ := o["data"].(map[string]any)
-	v, ok := data[user].(string)
-	return ok && v != "", nil
+	out := make(map[string]string, len(data))
+	for user, v := range data {
+		s, _ := v.(string)
+		var e struct {
+			KeyHash string `json:"keyHash"`
+		}
+		_ = json.Unmarshal([]byte(s), &e)
+		out[user] = e.KeyHash
+	}
+	return out, nil
 }

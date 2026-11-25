@@ -7,9 +7,11 @@ package kagent
 import (
 	"context"
 	"fmt"
+	"unicode/utf8"
 
 	"github.com/openagentix/openagentix/services/control-plane/internal/api"
 	"github.com/openagentix/openagentix/services/control-plane/internal/catalog"
+	"github.com/openagentix/openagentix/services/control-plane/internal/keys"
 	"github.com/openagentix/openagentix/services/control-plane/internal/kube"
 	"github.com/openagentix/openagentix/services/control-plane/internal/plan"
 )
@@ -92,7 +94,9 @@ func (a *Adapter) Desired(p plan.Plan) ([]kube.Manifest, error) {
 		}
 		hspec["env"] = env
 	}
-	out = append(out, kube.Manifest{Resource: harnesses, Object: obj("Harness", ns, p.Name+"-harness", hspec)})
+	hobj := obj("Harness", ns, p.Name+"-harness", hspec)
+	annotateKey(hobj, p)
+	out = append(out, kube.Manifest{Resource: harnesses, Object: hobj})
 
 	tspec := kube.Object{"modelConfig": kube.Object{"name": p.ModelConfigName}, "systemPrompt": p.Prompt}
 	if p.Description != "" {
@@ -122,8 +126,20 @@ func (a *Adapter) Desired(p plan.Plan) ([]kube.Manifest, error) {
 		out = append(out, kube.Manifest{Resource: egressPolicies, Object: obj("EgressPolicy", ns, p.Name+"-egress", kube.Object{"destinations": d})})
 		aspec["egressPolicyRefs"] = []any{kube.Object{"name": p.Name + "-egress"}}
 	}
-	out = append(out, kube.Manifest{Resource: agents, Object: obj("Agent", ns, p.Name, aspec)})
+	aobj := obj("Agent", ns, p.Name, aspec)
+	annotateKey(aobj, p)
+	out = append(out, kube.Manifest{Resource: agents, Object: aobj})
 	return out, nil
+}
+
+// annotateKey records the fingerprint of the registered key on an object, so that replacing the key changes the object.
+// Whether kagent recreates the agent's pod on a changed annotation of the Harness or the Agent is not verified on a
+// live cluster; a spec field (a harness env entry) would be the next thing to try.
+func annotateKey(o kube.Object, p plan.Plan) {
+	if p.KeyFingerprint == "" {
+		return
+	}
+	o["metadata"].(kube.Object)["annotations"] = kube.Object{keys.AnnotationFingerprint: p.KeyFingerprint}
 }
 
 // Ref is the generic reference status carries.
@@ -167,12 +183,17 @@ func (a *Adapter) Readiness(ctx context.Context, p plan.Plan) (plan.Readiness, e
 	}
 	msg := func(m map[string]any) string {
 		s, _ := m["message"].(string)
-		if len(s) > 200 {
-			s = s[:200]
-		}
-		return s
+		return truncateRunes(s, 200)
+	}
+	// A status the runtime wrote for an older spec says nothing about this one.
+	gen, _ := metaGeneration(o)
+	if og, ok := st["observedGeneration"].(float64); ok && gen > 0 && og < gen {
+		return plan.Readiness{Reason: "AgentStale", Message: "the runtime has not observed the latest spec of the agent yet"}, nil
 	}
 	if r := find("Ready"); r != nil {
+		if og, ok := r["observedGeneration"].(float64); ok && gen > 0 && og < gen {
+			return plan.Readiness{Reason: "AgentStale", Message: "the runtime's Ready condition is for an older spec"}, nil
+		}
 		if r["status"] == "True" {
 			return plan.Readiness{Ready: true, Reason: "Ready"}, nil
 		}
@@ -182,4 +203,17 @@ func (a *Adapter) Readiness(ctx context.Context, p plan.Plan) (plan.Readiness, e
 		return plan.Readiness{Reason: word(ac, "NotAccepted"), Message: msg(ac)}, nil
 	}
 	return plan.Readiness{Reason: "AgentPending", Message: "the runtime reports no Ready condition yet"}, nil
+}
+
+func metaGeneration(o kube.Object) (float64, bool) {
+	g, ok := kube.Meta(o)["generation"].(float64)
+	return g, ok
+}
+
+// truncateRunes cuts s to at most n characters, never in the middle of one.
+func truncateRunes(s string, n int) string {
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	return string([]rune(s)[:n])
 }

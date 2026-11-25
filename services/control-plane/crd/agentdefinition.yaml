@@ -108,7 +108,7 @@ spec:
                 observedGeneration: {type: integer, format: int64}
                 conditions:
                   type: array
-                  maxItems: 8
+                  maxItems: 8 # Accepted, KeyReady, Applied, Ready, and Synced (present only after a pass could not read something)
                   x-kubernetes-list-type: map
                   x-kubernetes-list-map-keys: [type]
                   items:
@@ -139,3 +139,8 @@ spec:
                 violations:
                   type: array
                   items: {type: string}
+                # What the controller remembers between passes (none of it secret). Added after the first version; additive.
+                keySecret: {type: string, description: "Name of the key Secret in use: <name>-virtual-key-<first 8 hex of the UID>."}
+                keyFingerprint: {type: string, maxLength: 64, description: "Head of the registered key's hash; the same value is the annotation openagentix.io/key-fingerprint on the Secret and on the runtime objects."}
+                appliedGeneration: {type: integer, format: int64, description: "Generation of the spec whose objects exist; 0 when nothing runs."}
+                appliedSpec: {type: string, maxLength: 200000, description: "The spec that was applied, as JSON text. Lets the controller decide what to do when a later spec is refused."}

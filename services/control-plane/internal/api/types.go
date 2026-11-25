@@ -25,6 +25,9 @@ const (
 	CondKeyReady = "KeyReady"
 	CondApplied  = "Applied"
 	CondReady    = "Ready"
+	// CondSynced is present only after a pass could not read something it needed (the API server hiccuped). False with
+	// reason TransientError means: the other conditions are the last known state, not a new verdict.
+	CondSynced = "Synced"
 )
 
 // Condition types in the order status shows them.
@@ -92,6 +95,12 @@ type Status struct {
 	EffectiveEgress    []string    `json:"effectiveEgress"`
 	A2AURL             string      `json:"a2aUrl"`
 	Violations         []string    `json:"violations"`
+
+	// What the controller itself needs to remember between passes; none of it is secret.
+	KeySecret         string `json:"keySecret"`         // name of the key Secret in use
+	KeyFingerprint    string `json:"keyFingerprint"`    // head of the registered key's hash (keys.Fingerprint)
+	AppliedGeneration int64  `json:"appliedGeneration"` // generation of the spec whose objects exist (0: none)
+	AppliedSpec       string `json:"appliedSpec"`       // that spec as JSON; a string so a merge patch replaces it whole
 }
 
 type AgentDefinition struct {

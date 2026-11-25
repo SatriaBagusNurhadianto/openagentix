@@ -1,0 +1,23 @@
+# An example AgentDefinition (ADR 0007): a small research agent on the tool profile `lookup` with ONE tool.
+# Apply it after install.sh ran with components/control-plane/demo-values.yaml (and components/governance/profiles-demo-values.yaml):
+#   kubectl apply -f components/control-plane/researcher.yaml
+#   kubectl wait agentdefinition/researcher -n kagent --for=condition=Ready --timeout=900s
+# `osv_query_vulnerability` is one of the tools the profile offers (components/governance/profiles-demo-values.yaml: osv query_vulnerability).
+# The definition has no field for a model config, image, tool server, egress policy or gateway user: those come from the platform.
+# The controller names its objects after the definition (researcher-harness, researcher-template, gateway-researcher, researcher) and the key Secret
+# researcher-virtual-key-<first 8 hex of the definition's UID>; `researcher` must not be a name the chart reserves (catalog reservedNames).
+# No `egress` and no `knowledge`: egress hosts are checked against the policy and may never be inside the cluster (.svc, .cluster.local, a single-label
+# name, an IP address); `knowledge: true` needs a profile that offers all the knowledge tools.
+apiVersion: openagentix.io/v1alpha1
+kind: AgentDefinition
+metadata:
+  name: researcher
+  namespace: kagent
+spec:
+  description: Looks up known vulnerabilities of a package
+  model: claude-haiku
+  instructions: |
+    You look up known vulnerabilities of software packages with the tool you have.
+    Answer in two sentences. Say which tool you used. If the tool returns nothing, say so instead of guessing.
+  toolProfile: lookup
+  tools: [osv_query_vulnerability]

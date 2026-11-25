@@ -478,6 +478,56 @@ governance:
       requests: {cpu: 10m, memory: 24Mi}
       limits: {cpu: 250m, memory: 64Mi}
 
+# ---- Control plane: AgentDefinition resources and their controller (ADR 0007, slice 1) ------------------------
+# OFF by default: with `enabled: false` the chart renders nothing below and the output is byte-identical to a chart without it.
+# When on, it renders the CRD `agentdefinitions.openagentix.io` (kept on uninstall), the controller (services/control-plane) with its
+# catalog and policy ConfigMaps, its own key ConfigMap for the model gateway, namespaced Roles (no ClusterRole), a ValidatingAdmissionPolicy that
+# limits what even a compromised controller can write, a closed NetworkPolicy, and two Roles for people (`openagentix-agent-builder`,
+# `openagentix-agent-viewer`) that nothing binds. The catalog is derived from the SAME values that render the chart agents (models, tool
+# profiles, knowledge, notify, memory, skills, harness, gate). No Secret value is ever rendered.
+controlPlane:
+  enabled: false
+  namespace: ""                       # where the controller runs; empty = the release namespace
+  image: {repository: openagentix/control-plane, tag: dev, pullPolicy: IfNotPresent}   # built from services/control-plane and loaded into kind by install.sh
+  sourceHash: ""                      # install.sh sets it to a hash of services/control-plane (the tag stays "dev")
+  # The API server addresses the controller may reach (NetworkPolicy egress). install.sh sets them the way it does for Agent Kourier
+  # (components/channels/apiserver-cidrs.sh). Empty: the policy falls back to the API server ports (below) towards ANY address,
+  # because a closed policy would stop the controller; set the CIDRs on a real cluster.
+  apiServerCIDRs: []
+  # How many AgentDefinition objects may exist in the agents namespace (a ResourceQuota on count/agentdefinitions.openagentix.io). It is the hard
+  # stop in front of the controller: refused drafts count here too (a definition the controller refuses still exists as an object), whereas
+  # policy.maxAgents below limits only the ACCEPTED definitions. Keep it above maxAgents or drafts crowd out new definitions.
+  maxDefinitions: 50
+  # The least time between two passes of the controller (a Go duration, e.g. 500ms, 2s). Empty: the controller's own default (1s).
+  # Sets CONTROL_PLANE_MIN_INTERVAL only when given.
+  minInterval: ""
+  apiServerPorts: [443, 6443]         # 443 is the Service port, 6443 the endpoint port of kind and kubeadm clusters (policies may see either)
+  # What kagent uses as the lifetime of a saved memory when a definition sets none (kagent default 15). The controller needs it to check
+  # `ttlDays` against policy.memory.maxTtlDays.
+  memoryDefaultTtlDays: 15
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 250m, memory: 128Mi}
+  # What an AgentDefinition may use. Lists: an empty list allows NOTHING; the single entry "*" allows everything the catalog has.
+  # The defaults are closed on purpose: no model, no profile, no skill, no notify, no memory and no egress until the operator opens them,
+  # so a fresh install accepts no definition. components/control-plane/demo-values.yaml opens one model and one profile.
+  # Names are checked against the catalog at render time (a typo fails the render instead of silently allowing nothing).
+  policy:
+    maxAgents: 5                      # definitions in total; the oldest keep their place
+    allowedModels: []                 # gateway.models names
+    requireToolProfile: true          # every definition names a tool profile (the shared vMCP filters on the client side only, ADR 0006)
+    allowedProfiles: []               # mcp.profiles names
+    allowKnowledge: true              # `knowledge: true` is allowed (it still needs knowledge.enabled and a profile that offers the tools)
+    allowNotify: false                # `notify: true` is allowed; needs notify.enabled. Creating a way to message a person stays an opt-in
+    allowedSkills: []                 # names of the top-level `skills`
+    memory:
+      allowed: false                  # needs the memory stack (a chart agent with memory.enabled) and, with requireExpiry, memory.expiry.enabled
+      maxTtlDays: 30
+      requireExpiry: true             # refuse memory while the expiry job is off (the time limit would not be enforced)
+    egress:
+      allowedOrigins: []              # https://host[:port]; a leading "*." stands for exactly one label. Empty: no egress
+    reservedNames: []                 # more names a definition may not use (the chart agents and kb, kb-extract, memory are always reserved)
+
 # ---- Long-term memory (kagent memory + pgvector + local embedding model) ---------------------------------
 # Shared pieces for agents that opt in with `agents[].memory.enabled: true`. Rendered only when at least one agent
 # does. kagent stores every memory as a vector(768) row in its own PostgreSQL (install.sh / components/runtime turn pgvector

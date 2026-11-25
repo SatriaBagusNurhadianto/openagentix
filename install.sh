@@ -26,6 +26,9 @@
 #   SKIP_KB_INGEST=1     do not ingest components/knowledge/sample into collection "openagentix"
 #   SKIP_NOTIFY_IMAGE=1  do not build/load the notify image (services/notify); it is only built when notify.enabled is true
 #   SKIP_A2A_GATE_IMAGE=1  do not build/load the A2A gate image (services/a2a-gate); it is only built when governance.a2a.enabled is true
+#   SKIP_CONTROL_PLANE_IMAGE=1  do not build/load the control plane image (services/control-plane); it is only built when controlPlane.enabled is true
+#   CONTROL_PLANE_APISERVER_CIDRS="10.0.0.0/24 ..."  the API server addresses the control plane's NetworkPolicy allows (comma or space separated);
+#                        default: derived like Agent Kourier's (components/channels/apiserver-cidrs.sh), unless controlPlane.apiServerCIDRs is set in a values file
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart, space-separated, applied in order (maps are merged, lists
 #                        such as agents[] or schedules[] are REPLACED by the later file) (e.g. more agents, schedules, networkPolicy.extraA2ACallers for a
 #                        chat gateway of your own). Helm replaces rather than merges the release values, so pass the
@@ -48,6 +51,11 @@
 # When the chart renders the gate, this script builds and loads its image, creates one static key per Kourier binding (Secret a2a-key-<binding> in the
 # channels namespace, only when absent, random, never printed) and writes the SHA-256 of each key into the gate's hash Secret (a2a-gate-keys), all
 # BEFORE the single helm upgrade that also moves the callers to the gate, so no caller is ever cut off.
+# The control plane (ADR 0007, slice 1) is opt-in too: the ONE switch is the chart value controlPlane.enabled (components/control-plane/demo-values.yaml,
+# which needs components/governance/profiles-demo-values.yaml). When the chart renders the controller, this script builds and loads its image, passes
+# the hash of its source and the API server addresses to the chart, and waits for the Deployment. It does nothing per agent: an AgentDefinition
+# (components/control-plane/researcher.yaml) is applied by you, and the controller makes its key, its objects and its registration. The installer never touches
+# the controller's key ConfigMap (llm-api-keys-control-plane) nor the Secrets of built agents; the CRD stays when the release is uninstalled.
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
 # The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
@@ -136,6 +144,7 @@ KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDE
 # Consumers other than agents that need their own gateway virtual key (the kb, for embeddings): "user<TAB>secret<TAB>ns"
 NOTIFY_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="notify")' <<<"$RENDERED")   # empty when notify.enabled=false
 A2A_GATE_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="a2a-gate")' <<<"$RENDERED")   # empty when governance.a2a.enabled=false
+CP_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="openagentix-control-plane")' <<<"$RENDERED")   # empty when controlPlane.enabled=false
 # A Deployment asks for one key per annotation SET: openagentix.io/gateway-user<sfx> (the user id), gateway-key-secret<sfx> (the Secret) and,
 # optionally, gateway-key-name<sfx> (the Secret key, default OPENAI_API_KEY); <sfx> is empty for the first set, "-extract" for the kb's
 # extraction key. Annotation names are unique per object, so a second key on one Deployment needs a second suffix: the earlier one-pair lookup
@@ -404,6 +413,12 @@ if [ "${SKIP_A2A_GATE_IMAGE:-0}" != 1 ] && [[ "$A2A_GATE_IMAGE" == openagentix/a
   docker build -q -t "$A2A_GATE_IMAGE" services/a2a-gate >/dev/null
   kind load docker-image "$A2A_GATE_IMAGE" --name "$CLUSTER"
 fi
+CP_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${CP_DEP:-null}" 2>/dev/null || true)
+if [ "${SKIP_CONTROL_PLANE_IMAGE:-0}" != 1 ] && [[ "$CP_IMAGE" == openagentix/control-plane:* ]]; then
+  log "control-plane image $CP_IMAGE"
+  docker build -q -t "$CP_IMAGE" services/control-plane >/dev/null
+  kind load docker-image "$CP_IMAGE" --name "$CLUSTER"
+fi
 if [ -n "$BRIDGE_IMAGE" ]; then
   # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
   BRIDGE_HASH=$(cd bridges/telegram && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
@@ -430,6 +445,25 @@ if [ -n "$A2A_GATE_DEP" ]; then
   # Same for the gate: a hash of services/a2a-gate rolls the pod on a code change although the tag stays "dev".
   A2A_GATE_HASH=$(cd services/a2a-gate && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name '*_test.go' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
   SET+=(--set-string "governance.a2a.sourceHash=$A2A_GATE_HASH")
+fi
+if [ -n "$CP_DEP" ]; then
+  # Same for the control plane: a hash of services/control-plane rolls the pod on a code change although the tag stays "dev".
+  CP_HASH=$(cd services/control-plane && find . -type f ! -path './bin/*' ! -name '*.md' ! -name '*.test' ! -name '*_test.go' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "controlPlane.sourceHash=$CP_HASH")
+  # The API server addresses its NetworkPolicy lets it reach: found the way Agent Kourier's are. A values file that sets them (a real cluster) wins;
+  # with the policy off there is nothing to set.
+  if jq -e -s 'any(.[]; .kind=="NetworkPolicy" and .metadata.name=="openagentix-control-plane" and ([.spec.egress[]?.to[]?|select(has("ipBlock"))]|length)==0)' <<<"$RENDERED" >/dev/null; then
+    # shellcheck source=components/channels/apiserver-cidrs.sh
+    . components/channels/apiserver-cidrs.sh
+    CP_EPS=""; CP_NODES=""
+    if [ -z "$(printf '%s' "${CONTROL_PLANE_APISERVER_CIDRS:-}" | tr -d '[:space:],')" ]; then
+      CP_EPS=$($K get endpointslices.discovery.k8s.io -n default -l kubernetes.io/service-name=kubernetes -o json)
+      CP_NODES=$($K get nodes -o json 2>/dev/null || echo '{"items":[]}')   # only used to recognise kind
+    fi
+    CP_CIDRS=$(kourier_apiserver_cidrs "${CONTROL_PLANE_APISERVER_CIDRS:-}" "$CP_EPS" "$CP_NODES") || die "could not find the API server address for the control plane's NetworkPolicy; set CONTROL_PLANE_APISERVER_CIDRS"
+    echo "control plane: its NetworkPolicy lets it reach the API server at $CP_CIDRS"
+    SET+=(--set-json "controlPlane.apiServerCIDRs=$CP_CIDRS")
+  fi
 fi
 if [ "${SKIP_SKILL:-0}" != 1 ] && jq -e 'select(.kind=="AgentTemplate")|.spec.skills[]?|select(.source.oci|test("/skills/openagentix-canary@"))' <<<"$RENDERED" >/dev/null; then
   log "example skill openagentix-canary"
@@ -471,6 +505,14 @@ while IFS=$'\t' read -r res name ns; do
   $K annotate "$res" "$name" -n "$ns" meta.helm.sh/release-name=$RELEASE meta.helm.sh/release-namespace="$RELEASE_NS" --overwrite >/dev/null
   echo "adopted $res/$name ($ns)"; adopted=$((adopted+1))
 done < <(jq -r 'select(.metadata.namespace!=null)|[((.kind|ascii_downcase)+(if (.apiVersion|contains("/")) then "."+(.apiVersion|split("/")[0]) else "" end)),.metadata.name,.metadata.namespace]|@tsv' <<<"$RENDERED")
+# The one cluster-scoped object the chart keeps on uninstall: the CRD of the control plane (helm.sh/resource-policy: keep). A later install finds it
+# without Helm's ownership marks and would refuse it as foreign, so it is adopted like the namespaced objects above.
+if [ -n "$CP_DEP" ] && $K get crd agentdefinitions.openagentix.io >/dev/null 2>&1 \
+   && [ "$($K get crd agentdefinitions.openagentix.io -o jsonpath='{.metadata.annotations.meta\.helm\.sh/release-name}')" != "$RELEASE" ]; then
+  $K label crd agentdefinitions.openagentix.io app.kubernetes.io/managed-by=Helm --overwrite >/dev/null
+  $K annotate crd agentdefinitions.openagentix.io meta.helm.sh/release-name=$RELEASE meta.helm.sh/release-namespace="$RELEASE_NS" --overwrite >/dev/null
+  echo "adopted crd/agentdefinitions.openagentix.io"; adopted=$((adopted+1))
+fi
 
 # --- 6. the chart ---------------------------------------------------------------------------------------------
 log "helm upgrade --install $RELEASE"  # (adoption happens just above)
@@ -506,6 +548,12 @@ fi
 if [ -n "$A2A_GATE_DEP" ]; then
   log "A2A gate"
   $K rollout status deployment/a2a-gate -n "$GATE_NS" --timeout=180s
+fi
+
+if [ -n "$CP_DEP" ]; then
+  log "control plane"
+  $K rollout status deployment/openagentix-control-plane -n "$(jq -r '.metadata.namespace' <<<"$CP_DEP")" --timeout=180s
+  echo "AgentDefinitions: kubectl apply -f components/control-plane/researcher.yaml (the controller does the rest); $K get agentdefinitions -n $KAGENT_NS"
 fi
 
 # Tool profiles (mcp.profiles, ADR 0006 round 2): each is one more vMCP pod; an agent on a profile finds no tools until its vMCP is Ready.

@@ -31,6 +31,7 @@ var (
 
 type fakeRuntime struct {
 	ready     plan.Readiness
+	readyErr  error
 	inDesired atomic.Int32
 	maxSeen   atomic.Int32
 	delay     time.Duration
@@ -45,7 +46,7 @@ func (f *fakeRuntime) CallEndpoint(p plan.Plan) string {
 	return "http://gate/agents/" + p.Namespace + "/" + p.Name
 }
 func (f *fakeRuntime) Readiness(context.Context, plan.Plan) (plan.Readiness, error) {
-	return f.ready, nil
+	return f.ready, f.readyErr
 }
 func (f *fakeRuntime) Desired(p plan.Plan) ([]kube.Manifest, error) {
 	n := f.inDesired.Add(1)
@@ -58,21 +59,23 @@ func (f *fakeRuntime) Desired(p plan.Plan) ([]kube.Manifest, error) {
 	time.Sleep(f.delay)
 	f.inDesired.Add(-1)
 	mk := func(kind, name string) kube.Object {
-		return kube.Object{"apiVersion": "example.dev/v1", "kind": kind, "metadata": kube.Object{"name": name, "namespace": p.Namespace}, "spec": kube.Object{"model": p.Model, "prompt": p.Prompt, "key": p.KeySecret}}
+		return kube.Object{"apiVersion": "example.dev/v1", "kind": kind, "metadata": kube.Object{"name": name, "namespace": p.Namespace}, "spec": kube.Object{"model": p.Model, "prompt": p.Prompt, "key": p.KeySecret, "fp": p.KeyFingerprint}}
 	}
 	return []kube.Manifest{{Resource: widgets, Object: mk("Widget", p.Name+"-w")}, {Resource: gadgets, Object: mk("Gadget", p.Name+"-g")}}, nil
 }
 
 type fakeGateway struct {
-	mu      sync.Mutex
-	entries map[string]string
-	failReg error
+	mu       sync.Mutex
+	entries  map[string]string
+	failReg  error
+	regCalls int
 }
 
 func (g *fakeGateway) Name() string { return "fake" }
 func (g *fakeGateway) Register(_ context.Context, user, hash string) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.regCalls++
 	if g.failReg != nil {
 		return g.failReg
 	}
@@ -90,6 +93,16 @@ func (g *fakeGateway) Registered(_ context.Context, user string) (bool, error) {
 	defer g.mu.Unlock()
 	_, ok := g.entries[user]
 	return ok, nil
+}
+
+func (g *fakeGateway) Entries(context.Context) (map[string]string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := map[string]string{}
+	for k, v := range g.entries {
+		out[k] = v
+	}
+	return out, nil
 }
 
 type fakeTools struct{ c *catalog.Catalog }
@@ -142,7 +155,7 @@ func newEnv(t *testing.T) (*env, *syncBuf) {
 		Log:    slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Now:    func() time.Time { return time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC) },
 		Mint:   func() (string, error) { return e.mint, nil },
-		Resync: 50 * time.Millisecond, Backoff: 10 * time.Millisecond,
+		Resync: 50 * time.Millisecond, Backoff: 10 * time.Millisecond, MinInterval: 5 * time.Millisecond,
 	})
 	return e, buf
 }
@@ -218,7 +231,7 @@ func TestReconcileBuildsEverythingAndReportsReady(t *testing.T) {
 	}
 
 	// the key: one Secret, immutable, owned, and its hash registered
-	sec, ok := e.srv.Get("secrets", "kagent", "researcher-virtual-key")
+	sec, ok := e.srv.Get("secrets", "kagent", "researcher-virtual-key-"+uid8(e.raw("researcher")))
 	if !ok || sec["immutable"] != true {
 		t.Fatalf("secret: %v", sec)
 	}
@@ -316,6 +329,7 @@ func TestNameConflictWritesNothing(t *testing.T) {
 		"foreign object":                    nil,
 		"owned by another definition":       {"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "other"},
 		"our label but no definition label": {"app.kubernetes.io/managed-by": "openagentix-control-plane"},
+		"both labels, no owner reference":   {"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "researcher"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			e, _ := newEnv(t)
@@ -350,22 +364,37 @@ func TestNameConflictWritesNothing(t *testing.T) {
 
 func TestPrunesOwnedObjectsNoLongerDesiredAndOnlyThose(t *testing.T) {
 	e, _ := newEnv(t)
-	e.seed("researcher", nil)
+	def := e.srv.Seed("agentdefinitions", defObj("researcher", nil))
+	uid := kube.Meta(def).String("uid")
 	owned := kubetest.Object{"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "researcher"}
-	e.srv.Seed("gadgets", kubetest.Object{"apiVersion": "example.dev/v1", "kind": "Gadget", "metadata": kubetest.Object{"name": "researcher-old", "namespace": "kagent", "labels": owned}})
-	e.srv.Seed("widgets", kubetest.Object{"apiVersion": "example.dev/v1", "kind": "Widget", "metadata": kubetest.Object{"name": "researcher-oldw", "namespace": "kagent", "labels": owned}})
-	e.srv.Seed("gadgets", kubetest.Object{"apiVersion": "example.dev/v1", "kind": "Gadget", "metadata": kubetest.Object{"name": "stranger", "namespace": "kagent"}})
-	e.srv.Seed("gadgets", kubetest.Object{"apiVersion": "example.dev/v1", "kind": "Gadget", "metadata": kubetest.Object{"name": "other-g", "namespace": "kagent",
-		"labels": kubetest.Object{"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "other"}}})
+	ownerRef := func(u string) []any {
+		return []any{kubetest.Object{"apiVersion": "openagentix.io/v1alpha1", "kind": "AgentDefinition", "name": "researcher", "uid": u, "controller": true}}
+	}
+	seed := func(plural, kind, name string, labels kubetest.Object, refs []any) {
+		m := kubetest.Object{"name": name, "namespace": "kagent"}
+		if labels != nil {
+			m["labels"] = labels
+		}
+		if refs != nil {
+			m["ownerReferences"] = refs
+		}
+		e.srv.Seed(plural, kubetest.Object{"apiVersion": "example.dev/v1", "kind": kind, "metadata": m})
+	}
+	seed("gadgets", "Gadget", "researcher-old", owned, ownerRef(uid))
+	seed("widgets", "Widget", "researcher-oldw", owned, ownerRef(uid))
+	seed("gadgets", "Gadget", "stranger", nil, nil)
+	seed("gadgets", "Gadget", "labels-only", owned, nil)                                            // our labels, no owner reference
+	seed("gadgets", "Gadget", "other-uid", owned, ownerRef("00000000-1111-4222-8333-444444444444")) // owned by an earlier incarnation
+	seed("gadgets", "Gadget", "other-g", kubetest.Object{"app.kubernetes.io/managed-by": "openagentix-control-plane", "openagentix.io/agent-definition": "other"}, nil)
 	e.pass(t)
 	for _, gone := range [][2]string{{"gadgets", "researcher-old"}, {"widgets", "researcher-oldw"}} {
 		if _, ok := e.srv.Get(gone[0], "kagent", gone[1]); ok {
 			t.Fatalf("%s/%s should be pruned", gone[0], gone[1])
 		}
 	}
-	for _, kept := range [][2]string{{"gadgets", "researcher-g"}, {"widgets", "researcher-w"}, {"gadgets", "stranger"}, {"gadgets", "other-g"}} {
+	for _, kept := range [][2]string{{"gadgets", "researcher-g"}, {"widgets", "researcher-w"}, {"gadgets", "stranger"}, {"gadgets", "other-g"}, {"gadgets", "labels-only"}, {"gadgets", "other-uid"}} {
 		if _, ok := e.srv.Get(kept[0], "kagent", kept[1]); !ok {
-			t.Fatalf("%s/%s must stay", kept[0], kept[1])
+			t.Fatalf("%s/%s must stay (labels alone are not ownership)", kept[0], kept[1])
 		}
 	}
 }
@@ -569,7 +598,7 @@ func TestStatusAndFinalizerWritesDoNotRetriggerTheLoop(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 	n := len(e.srv.Matching("PATCH", "/widgets/one-w"))
 	time.Sleep(150 * time.Millisecond)
-	if m := len(e.srv.Matching("PATCH", "/widgets/one-w")); m != n || n > 2 {
+	if m := len(e.srv.Matching("PATCH", "/widgets/one-w")); m != n || n != 1 {
 		t.Fatalf("the controller keeps reconciling its own writes: %d then %d applies", n, m)
 	}
 }
@@ -608,10 +637,7 @@ func TestCanaryKeyAppearsOnlyInTheOneSecretCreate(t *testing.T) {
 				e.seed("c", nil)
 			}
 			var errText []string
-			if err := e.c.ReconcileAll(context.Background()); err != nil {
-				errText = append(errText, err.Error())
-			}
-			if name == "gateway fails" {
+			for range 4 { // several passes: a key that is minted and sent once must stay out of every later one
 				if err := e.c.ReconcileAll(context.Background()); err != nil {
 					errText = append(errText, err.Error())
 				}

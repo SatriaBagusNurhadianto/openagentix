@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/openagentix/openagentix/services/control-plane/internal/api"
 	"github.com/openagentix/openagentix/services/control-plane/internal/catalog"
@@ -16,6 +17,13 @@ import (
 )
 
 type tools struct{ c *catalog.Catalog }
+
+func must(p plan.Plan, err error) plan.Plan {
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
 
 func (f tools) Profile(n string) (catalog.Profile, bool) { return f.c.Profile(n) }
 func (f tools) Profiles() []string                       { return f.c.ProfileNames() }
@@ -114,7 +122,7 @@ func orMissing(m map[string]string, k string) string {
 
 // definition equal to the chart agent profile-demo (components/governance/profiles-demo-values.yaml).
 func profileDemo() *api.AgentDefinition {
-	return &api.AgentDefinition{Metadata: api.ObjectMeta{Name: "profile-demo", Namespace: "kagent"}, Spec: api.Spec{
+	return &api.AgentDefinition{Metadata: api.ObjectMeta{Name: "profile-demo", Namespace: "kagent", UID: "0a1b2c3d-1111-4222-8333-444444444444"}, Spec: api.Spec{
 		Description: `Narrow demo agent on the tool profile "lookup"`,
 		Model:       "claude-haiku",
 		Instructions: "You answer questions about software vulnerabilities and the platform's own documents. Keep answers to two sentences.\n" +
@@ -127,7 +135,8 @@ func profileDemo() *api.AgentDefinition {
 
 func TestParityWithHelmProfileDemo(t *testing.T) {
 	c := loadCat(t)
-	p := plan.Build(profileDemo(), c, tools{c})
+	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p.KeySecret = "profile-demo-virtual-key" // the chart's Secret name; the control plane's carries the UID (plan.KeySecretName)
 	m, err := New(c, nil).Desired(p)
 	if err != nil {
 		t.Fatal(err)
@@ -139,7 +148,7 @@ func TestParityWithHelmProfileDemo(t *testing.T) {
 // Its tool list and ModelConfig name are set by hand in values, so the plan is adjusted the same way.
 func TestParityWithHelmAssistant(t *testing.T) {
 	c := loadCat(t)
-	d := &api.AgentDefinition{Metadata: api.ObjectMeta{Name: "assistant", Namespace: "kagent"}, Spec: api.Spec{
+	d := &api.AgentDefinition{Metadata: api.ObjectMeta{Name: "assistant", Namespace: "kagent", UID: "0a1b2c3d-1111-4222-8333-444444444444"}, Spec: api.Spec{
 		Description: "General assistant reachable from messaging channels",
 		Model:       "claude-haiku",
 		Instructions: "You are a concise, helpful assistant running on a Kubernetes-native agent\n" +
@@ -150,7 +159,12 @@ func TestParityWithHelmAssistant(t *testing.T) {
 		Knowledge: true, Notify: true,
 		Memory: api.Memory{Enabled: true, TTLDays: 30},
 	}}
-	p := plan.Build(d, c, tools{c})
+	// The chart's assistant has tools and no profile (the shared tool server); plan.Build refuses that, so the plan is built
+	// with a profile and the server set by hand, like the ModelConfig name and the Secret name below.
+	d.Spec.ToolProfile = "lookup"
+	p := must(plan.Build(d, c, tools{c}))
+	p.ToolServer = c.ToolServer
+	p.KeySecret = "assistant-virtual-key"
 	p.ModelConfigName = "gateway-claude-haiku" // agents[].modelConfigName in values
 	m, err := New(c, nil).Desired(p)
 	if err != nil {
@@ -161,7 +175,7 @@ func TestParityWithHelmAssistant(t *testing.T) {
 
 func TestOrderAndKinds(t *testing.T) {
 	c := loadCat(t)
-	m, _ := New(c, nil).Desired(plan.Build(profileDemo(), c, tools{c}))
+	m, _ := New(c, nil).Desired(must(plan.Build(profileDemo(), c, tools{c})))
 	var kinds []string
 	for _, x := range m {
 		kinds = append(kinds, x.Object["kind"].(string))
@@ -181,7 +195,7 @@ func TestNoEgressMeansNoPolicyAndNoRef(t *testing.T) {
 	c := loadCat(t)
 	d := profileDemo()
 	d.Spec.Egress = api.Egress{}
-	m, _ := New(c, nil).Desired(plan.Build(d, c, tools{c}))
+	m, _ := New(c, nil).Desired(must(plan.Build(d, c, tools{c})))
 	if len(m) != 4 {
 		t.Fatalf("%d objects", len(m))
 	}
@@ -195,7 +209,7 @@ func TestNoToolsMeansNoToolsKey(t *testing.T) {
 	c := loadCat(t)
 	d := profileDemo()
 	d.Spec.Tools, d.Spec.ToolProfile = nil, ""
-	m, _ := New(c, nil).Desired(plan.Build(d, c, tools{c}))
+	m, _ := New(c, nil).Desired(must(plan.Build(d, c, tools{c})))
 	if _, ok := m[2].Object["spec"].(map[string]any)["tools"]; ok {
 		t.Fatal("tools must be absent")
 	}
@@ -204,7 +218,7 @@ func TestNoToolsMeansNoToolsKey(t *testing.T) {
 func TestHarnessEnvFromCatalog(t *testing.T) {
 	c := loadCat(t)
 	c.HarnessEnv = []catalog.EnvVar{{Name: "OTEL_PROPAGATORS", Value: "tracecontext,baggage"}}
-	m, _ := New(c, nil).Desired(plan.Build(profileDemo(), c, tools{c}))
+	m, _ := New(c, nil).Desired(must(plan.Build(profileDemo(), c, tools{c})))
 	env := m[1].Object["spec"].(map[string]any)["env"].([]any)
 	e := env[0].(map[string]any)
 	if e["name"] != "OTEL_PROPAGATORS" || e["value"] != "tracecontext,baggage" {
@@ -214,7 +228,7 @@ func TestHarnessEnvFromCatalog(t *testing.T) {
 
 func TestCallEndpointAndRef(t *testing.T) {
 	c := loadCat(t)
-	p := plan.Build(profileDemo(), c, tools{c})
+	p := must(plan.Build(profileDemo(), c, tools{c}))
 	r := New(c, nil)
 	if got := r.CallEndpoint(p); got != "http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/profile-demo" {
 		t.Fatal(got)
@@ -240,7 +254,7 @@ func (g getter) Get(_ context.Context, r kube.Resource, _, name string) (kube.Ob
 
 func TestReadiness(t *testing.T) {
 	c := loadCat(t)
-	p := plan.Build(profileDemo(), c, tools{c})
+	p := must(plan.Build(profileDemo(), c, tools{c}))
 	cond := func(typ, status, reason, msg string) kube.Object {
 		return kube.Object{"status": kube.Object{"conditions": []any{kube.Object{"type": typ, "status": status, "reason": reason, "message": msg}}}}
 	}
@@ -264,5 +278,69 @@ func TestReadiness(t *testing.T) {
 				t.Fatalf("%+v", r)
 			}
 		})
+	}
+}
+
+func TestKeyFingerprintIsAnnotatedOnHarnessAndAgent(t *testing.T) {
+	c := loadCat(t)
+	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p.KeyFingerprint = "0123456789abcdef"
+	m, _ := New(c, nil).Desired(p)
+	got := map[string]string{}
+	for _, o := range m {
+		a, _ := o.Object["metadata"].(kube.Object)["annotations"].(kube.Object)
+		if v, ok := a["openagentix.io/key-fingerprint"].(string); ok {
+			got[o.Resource.Kind] = v
+		}
+	}
+	if len(got) != 2 || got["Harness"] != "0123456789abcdef" || got["Agent"] != "0123456789abcdef" {
+		t.Fatalf("want the fingerprint on the Harness and the Agent, got %v", got)
+	}
+}
+
+func TestReadinessRespectsTheRuntimesObservedGeneration(t *testing.T) {
+	c := loadCat(t)
+	p := must(plan.Build(profileDemo(), c, tools{c}))
+	agent := func(gen, observed float64, condGen float64) kube.Object {
+		cond := kube.Object{"type": "Ready", "status": "True", "reason": "Ready"}
+		if condGen > 0 {
+			cond["observedGeneration"] = condGen
+		}
+		st := kube.Object{"conditions": []any{cond}}
+		if observed > 0 {
+			st["observedGeneration"] = observed
+		}
+		return kube.Object{"metadata": kube.Object{"generation": gen}, "status": st}
+	}
+	for name, tc := range map[string]struct {
+		o     kube.Object
+		ready bool
+	}{
+		"caught up":                     {agent(3, 3, 3), true},
+		"status behind the spec":        {agent(3, 2, 0), false},
+		"condition behind the spec":     {agent(3, 0, 2), false},
+		"no generation information":     {agent(0, 0, 0), true},
+		"condition ahead is not behind": {agent(3, 3, 4), true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r, err := New(c, getter{"agents/profile-demo": tc.o}).Readiness(context.Background(), p)
+			if err != nil || r.Ready != tc.ready {
+				t.Fatalf("%+v %v", r, err)
+			}
+			if !tc.ready && r.Reason != "AgentStale" {
+				t.Fatalf("reason %q", r.Reason)
+			}
+		})
+	}
+}
+
+func TestReadinessMessageIsCutOnARuneBoundary(t *testing.T) {
+	c := loadCat(t)
+	p := must(plan.Build(profileDemo(), c, tools{c}))
+	long := strings.Repeat("€", 300) // 3 bytes each
+	o := kube.Object{"status": kube.Object{"conditions": []any{kube.Object{"type": "Ready", "status": "False", "reason": "X", "message": long}}}}
+	r, _ := New(c, getter{"agents/profile-demo": o}).Readiness(context.Background(), p)
+	if !utf8.ValidString(r.Message) || len([]rune(r.Message)) > 200 || r.Message == "" {
+		t.Fatalf("message must be valid UTF-8 and at most 200 characters: %d bytes, valid=%v", len(r.Message), utf8.ValidString(r.Message))
 	}
 }

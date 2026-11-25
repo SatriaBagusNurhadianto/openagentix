@@ -53,12 +53,12 @@ spec:
           properties:
             apiVersion: {type: string}
             kind: {type: string}
+            # The API server allows nothing but "type: object" here (no description). Reserved label keys
+            # (informational only, never an access or billing decision): openagentix.io/team and openagentix.io/project
+            # are copied onto the objects the controller creates and into the gateway key entry;
+            # openagentix.io/work-item is reserved for products.
             metadata:
               type: object
-              description: >-
-                Reserved label keys (informational only, never an access or billing decision): openagentix.io/team and
-                openagentix.io/project are copied onto the objects the controller creates and into the gateway key entry;
-                openagentix.io/work-item is reserved for products.
             spec:
               type: object
               required: [model]

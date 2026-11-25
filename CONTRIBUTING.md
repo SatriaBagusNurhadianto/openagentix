@@ -16,6 +16,10 @@ Good first contributions, from easiest to hardest:
 
 If you are unsure where to begin, open a GitHub Discussion or an issue and ask. Small questions are welcome.
 
+## How we work
+
+Issues are the single backlog, grouped in milestones that match the releases in [docs/roadmap.md](docs/roadmap.md). Look for the labels `good first issue`, `help wanted` and `adapter`. How issues are triaged, how branches and pull requests are named and merged, which checks are required, how review works while there is one maintainer, how releases are cut, and how security fixes are handled is written in [docs/contributing/workflow.md](docs/contributing/workflow.md). Decision records have their own guide: [docs/decisions/README.md](docs/decisions/README.md).
+
 ## Build and test
 
 You need Go (the modules use Go 1.25 or newer), plus `helm`, `jq` and `yq` for the chart tests. `yq` here is the Python wrapper (`pip install yq==3.4.3`), not mikefarah's `yq`. The full install needs Docker, `kind` and `kubectl`; see the README, "Prerequisites".

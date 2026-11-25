@@ -74,6 +74,8 @@ Not better:
 
 ## Releases
 
+Each release is a [milestone](https://github.com/openagentix/openagentix/milestones) with a tracking issue, and the issues are the backlog: [0.3 Control plane and console](https://github.com/openagentix/openagentix/milestone/1), [0.4 Runs and trust](https://github.com/openagentix/openagentix/milestone/2), [0.5 Work](https://github.com/openagentix/openagentix/milestone/3), [0.6 Lifecycle and quality](https://github.com/openagentix/openagentix/milestone/4), [Backlog](https://github.com/openagentix/openagentix/milestone/5). Where the table below and the "Roadmap change" table of [ADR 0012](decisions/0012-platform-primitives-for-agentic-delivery.md) differ, ADR 0012 wins; the milestones follow it. How the work is run: [docs/contributing/workflow.md](contributing/workflow.md).
+
 Sizes are relative. Each release has its own decision records before code.
 
 | Release | Theme | Adds | Depends on |

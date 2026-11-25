@@ -1,0 +1,61 @@
+name: Adapter request
+description: "An integration, such as a notify destination, a tool server, a knowledge loader, a runtime or a channel."
+labels: ["adapter", "kind/feature", "status/needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Adapters are the places where the platform can be extended without knowing the whole system. Say what you want to connect and, if you can, offer to build it. Do not paste tokens or private data.
+  - type: dropdown
+    id: type
+    attributes:
+      label: Kind of adapter
+      options:
+        - Notify destination (chat or webhook)
+        - Channel (a way to talk to an agent)
+        - MCP tool server
+        - Knowledge loader or source
+        - Model provider
+        - Runtime
+        - Observability or event sink
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: target
+    attributes:
+      label: What to connect to
+      description: The product or service, with a link to its public documentation.
+    validations:
+      required: true
+  - type: textarea
+    id: use
+    attributes:
+      label: What you want to do with it
+      description: A short example of the use, from the user's side.
+    validations:
+      required: true
+  - type: input
+    id: licence
+    attributes:
+      label: Licence of the thing to integrate
+      description: If it is an open-source project, its licence (it will be listed in THIRD-PARTY.md). Write "unknown" if you do not know.
+  - type: dropdown
+    id: help
+    attributes:
+      label: Can you build it?
+      options:
+        - "Yes, I will send a pull request"
+        - "Yes, with some guidance"
+        - "No, I can test it"
+        - "No"
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched existing issues.
+          required: true
+        - label: It does not need a commercial licence key or a service from one vendor to work.

@@ -31,6 +31,11 @@ updates:
       - /services/control-plane
       - /services/kb
       - /services/notify
+      - /services/console
+      - /services/stub-model
+      - /bridges/telegram
+      - /bridges/ax-adapter
+      - /tools/a2a-call
     schedule:
       interval: weekly
     groups:

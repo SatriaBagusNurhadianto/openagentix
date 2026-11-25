@@ -77,6 +77,8 @@ Candidates to adopt behind adapters (licences as read on 2026-11-25; check again
 
 Raised by the project owner on 2026-11-25: once v1 is done, support building a Kubernetes-native software factory, meaning agents that take a work item through plan, code, test, review and release, each step in a sandbox, governed and auditable.
 
+Scope named by the owner: a software factory including the "dark factory" case (work runs unattended, people set goals and approve at gates), an agentic software development life cycle (requirements, design, code, test, review, release, operations), and agentic CI/CD (agents as pipeline steps, and pipelines that agents drive), "and more".
+
 Working position, to be decided with its own decision record when v1 is done:
 
 - **A separate project on top of OpenAgentix, not part of this repository.** Foundation reviewers have declined proposals for having too much in one repository. OpenAgentix stays the neutral platform; the factory is the first serious application built on it, with its own resource kinds (for example repository, work item, pipeline, review gate) in its own API group.

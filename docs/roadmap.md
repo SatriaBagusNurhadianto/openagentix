@@ -1,0 +1,89 @@
+# Roadmap
+
+Written 2026-11-25. It replaces nothing: the changelog says what exists, the diary how it was proven. This page says what is planned and why, measured against the managed agent platforms that OpenAgentix wants to be an alternative to.
+
+## Aim
+
+A Kubernetes-native agent platform that an organisation can run on its own clusters instead of Amazon Bedrock AgentCore, Microsoft Foundry Agent Service or Google's Gemini Enterprise Agent Platform (the former Vertex AI Agent Builder and Agent Engine).
+
+## Where we stand
+
+The comparison below was made from the vendors' public documentation on 2026-11-25. Those products change every month, so check the vendor pages before quoting any line. "Built" means the repository shows it working on a cluster; see `docs/diary/what-works.md`.
+
+| Area | The managed platforms offer | OpenAgentix today |
+|---|---|---|
+| Runtime | hosted agents, an isolated sandbox per session, long-running sessions, many frameworks, your own container | **built**: kagent on Agent Substrate (gVisor, per-session identity). **Missing**: long-running and resumable runs, your own container, other frameworks wired in |
+| Identity | an identity per agent, inbound authentication, a credential vault, acting on behalf of a user with OAuth | **partly**: per-session identity, tool-layer tokens, the A2A gate. **Missing**: credential vault, on-behalf-of-user |
+| Tools | an MCP gateway, OpenAPI as tools, tool search, per-agent filtering, registries | **built**: MCP gateway, tool profiles, tool access rules. **Missing**: OpenAPI as tools, a registry |
+| Built-in tools | code interpreter, browser, computer use, file search | **built**: knowledge search. **Missing**: code interpreter, browser |
+| Memory and knowledge | short and long-term memory, retrieval, connectors | **built**: long-term memory with expiry, knowledge base, knowledge graph (the managed platforms list no graph). **Missing**: connectors to outside sources |
+| Multi-agent | A2A, workflows | **built**: A2A through the gate. **Missing**: workflows |
+| Builder | a no-code or low-code studio, a command-line tool, resources as code | **in progress**: ADR 0007 |
+| Models | a catalog, routing, failover | **built**: gateway, keys, failover, prompt caching. **Planned**: routing by rules and by a router (ADR 0008) |
+| Quality | evaluation, simulation, red teaming, prompt optimisation | **missing** |
+| Safety | content safety, prompt-attack detection, PII handling, egress control, human approval, deterministic tool policy | **built**: egress allowlists, tool policy. **Missing**: content guardrails, PII, approvals |
+| Observability and cost | traces, metrics, cost, budgets, alerts | **built**: traces, cost and tokens per agent, token budgets. **Planned**: FinOps and budgets (ADR 0009) |
+| Lifecycle | versions, environments, pinned endpoints | **missing** |
+| Channels | chat products, schedules | **built**: Telegram, signed webhooks, schedules. **Untested**: Slack |
+| Platform | tenancy, private networking, compliance attestations | **built**: network policies, one-command install. **Missing**: tenancy, more than one cluster. No attestations |
+
+Short version: the plumbing works (runtime, gateways, tools, memory, knowledge, observability, egress control). What a buyer sees first does not exist yet: a builder, evaluation, guardrails, approvals, versions, teams. Everything proven so far ran on one kind node.
+
+## Where this approach can be better, and where it cannot
+
+Better, with the limit of each:
+
+- **Data stays in your cluster.** Memory, knowledge, graph and traces are in your own databases. Model calls still leave unless you host the models.
+- **Any model and provider** behind one gateway. You carry the keys and the rate limits.
+- **No fee per session or per call.** The cost is your nodes, including idle ones.
+- **GitOps.** Agents and their configuration are resources in Git, reviewed like code (after ADR 0007).
+- **Canary releases** with standard Kubernetes traffic weights. Not built yet.
+- **Portable**: any cloud, on-premises, and in principle air-gapped. Air-gap is not proven.
+- **Cost you can read**: the gateway log and the node bill.
+
+Not better:
+
+- **Operations are yours.** Sizing, upgrades and scaling are the customer's work.
+- **No scaling to zero per session** as a managed service gives it.
+- **Connectors.** The managed platforms come with many business-system connectors. We have two channels.
+- **No compliance attestations.** Self-hosting moves the audit to the customer.
+- **Isolation is comparable, not stronger.** gVisor against micro virtual machines.
+- **Open standards are parity, not a lead.** The managed platforms speak MCP, A2A and OpenTelemetry too, and they are starting to govern agents that run on other clusters.
+
+## Principles
+
+1. Every configurable thing is a resource in `openagentix.io`. The console, `kubectl` and Git write the same resources (ADR 0007).
+2. Upstream tools sit behind adapters, so one can be exchanged. Adopt an existing open-source project before building.
+3. Off by default, deny by default, no content capture by default.
+4. Nothing counts as done until it is proven on a cluster and the limits are written down.
+
+## Releases
+
+Sizes are relative. Each release has its own decision records before code.
+
+| Release | Theme | Adds | Depends on |
+|---|---|---|---|
+| **0.3** | **Control plane and console** | `AgentDefinition`, the controller, platform policy, the web console with the agent builder and playground; then the other kinds: `Schedule`, `Channel` and `Trigger`, `ModelProvider` and `ModelRoute` (static and rules), `ToolServer` and `ToolProfile`, `KnowledgeCollection` and `KnowledgeSource`, `Skill` with the organisation registry, `ObservabilitySettings`, `Budget`, costs and traces pages | ADR 0007, 0008, 0009 |
+| **0.4** | **Trust** | an identity per agent, a credential store for outbound access and acting on behalf of a user, guardrails (prompt attacks, content, PII) at the model and tool gateways, human approval for chosen tool calls, console login with OpenID Connect | platform policy, gate rule reload |
+| **0.5** | **Lifecycle** | immutable agent versions, environments, canary releases, registries for agents, tools and MCP servers, agent blueprints | stable `AgentDefinition`, skill registry |
+| **0.6** | **Quality** | datasets, evaluation suites and runs, simulation, red-team runs, a release gate on evaluation results, the model router service with measured savings | versions, traces |
+| **0.7** | **Teams** | tenants, quotas, budgets in money per team, showback, more than one namespace | identity and login |
+| **0.8** | **Do more** | code interpreter and browser as sandboxed tool servers, OpenAPI as tools, durable multi-agent workflows, your own container and other agent frameworks behind an admission policy | credentials, approvals |
+| **0.9** | **Fleet and developers** | several clusters, a command-line tool, SDKs, an air-gap bundle | versions, tenancy |
+
+Candidates to adopt behind adapters (licences as read on 2026-11-25; check again before bundling): SPIFFE/SPIRE and Keycloak for identity, OpenBao with External Secrets for credentials, Presidio and NeMo Guardrails for safety, Argo Rollouts or Flagger for canary, promptfoo, DeepEval and Inspect for evaluation, garak and PyRIT for red teaming, Capsule or vCluster and Kueue for tenancy, OpenCost for cluster cost, `kubernetes-sigs/agent-sandbox` for code execution, Playwright MCP for the browser, Argo Workflows or Temporal for workflows, Karmada or Open Cluster Management for fleets. A broker for on-behalf-of-user OAuth with a consent step has no mature open-source project that we could confirm; expect to build a small one.
+
+## Open core and enterprise
+
+A first cut, to be settled with the licensing decision:
+
+| Open | Enterprise candidates |
+|---|---|
+| All resource kinds, controllers, adapters, the console, the gate, egress control, budgets per key, skills, knowledge, memory | Single sign-on with groups, fine-grained console roles, writes per user |
+| Guardrail kinds and engines, evaluation and red-team runners, canary, code sandbox, workflows | Tenancy, team quotas, chargeback |
+| Basic OpenID Connect login | Approval routing and escalation, audit history with retention |
+| One-approver approval | Fleet management across clusters |
+| | Credential vault integrations, signed skills, key rotation |
+| | Compliance evidence pack, support |
+
+The rule of thumb: what one team needs to run agents safely is open; what an organisation with many teams, auditors and several clusters needs is the enterprise line.

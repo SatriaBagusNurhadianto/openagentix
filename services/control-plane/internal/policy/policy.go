@@ -24,6 +24,9 @@ const (
 
 var nameRE = regexp.MustCompile(`^[a-z]([-a-z0-9]*[a-z0-9])?$`)
 
+// labelValueRE is the shape of a Kubernetes label value (an empty value is not accepted here).
+var labelValueRE = regexp.MustCompile(`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
+
 // secretShapes are the ten patterns of charts/openagentix/files/memory-expiry.sh, with the same names, and one more of
 // the platform's own (platform_virtual_key). PostgreSQL's word boundaries (\m, \M) became \b.
 var secretShapes = []struct {
@@ -78,11 +81,22 @@ func Validate(in Input) []string {
 	case !nameRE.MatchString(d.Metadata.Name):
 		add("name %q must be a DNS label (lower case letters, digits and dashes, starting with a letter)", d.Metadata.Name)
 	}
-	if slices.Contains(c.ReservedNames, d.Metadata.Name) || slices.Contains(p.ReservedNames, d.Metadata.Name) {
-		add("name %q is reserved (chart agents and platform services own it)", d.Metadata.Name)
+	if catalog.ReservedIn(c, p, d.Metadata.Namespace, d.Metadata.Name) {
+		add("name %q is reserved in namespace %q (chart agents and platform services own it)", d.Metadata.Name, d.Metadata.Namespace)
 	}
+	// maxAgents is per namespace: Earlier holds the accepted definitions of this definition's own namespace
 	if len(in.Earlier) >= p.MaxAgents {
-		add("the platform policy allows at most %d agents and %d already exist", p.MaxAgents, len(in.Earlier))
+		add("the platform policy allows at most %d agents in namespace %q and %d already exist", p.MaxAgents, d.Metadata.Namespace, len(in.Earlier))
+	}
+	for _, k := range []string{api.LabelTeam, api.LabelProject} {
+		if v, ok := d.Metadata.Labels[k]; ok && (len(v) > 63 || !labelValueRE.MatchString(v)) {
+			add("label %s %q is not a valid label value (at most 63 characters: letters, digits, '-', '_' and '.', starting and ending with a letter or digit)", k, v)
+		}
+		for _, sh := range secretShapes {
+			if sh.re.MatchString(d.Metadata.Labels[k]) {
+				add("label %s contains something shaped like a secret (%s); remove it", k, sh.name)
+			}
+		}
 	}
 
 	// size and content
@@ -90,8 +104,12 @@ func Validate(in Input) []string {
 		add("description is %d characters; at most %d", n, MaxDescriptionLen)
 	}
 	switch {
+	case s.InstructionsFrom != nil && strings.TrimSpace(s.Instructions) != "":
+		add("set exactly one of instructions and instructionsFrom")
+	case s.InstructionsFrom != nil:
+		add("instructionsFrom is not available yet; write the prompt in instructions")
 	case strings.TrimSpace(s.Instructions) == "":
-		add("instructions are required")
+		add("instructions are required: set exactly one of instructions and instructionsFrom")
 	case len(s.Instructions) > MaxInstructionsLen:
 		add("instructions are %d bytes; at most %d", len(s.Instructions), MaxInstructionsLen)
 	}
@@ -106,7 +124,8 @@ func Validate(in Input) []string {
 		text []string
 	}{
 		{"description", []string{s.Description}}, {"model", []string{s.Model}}, {"toolProfile", []string{s.ToolProfile}},
-		{"tools", s.Tools}, {"skills", s.Skills}, {"egress.allow", s.Egress.Allow},
+		{"tools", s.Tools}, {"skills", skillTexts(s.Skills)}, {"egress.allow", s.Egress.Allow},
+		{"knowledge.collections", s.Knowledge.Collections}, {"notify.destinations", s.Notify.Destinations},
 	} {
 		for _, sh := range secretShapes {
 			if slices.ContainsFunc(f.text, sh.re.MatchString) {
@@ -124,7 +143,7 @@ func Validate(in Input) []string {
 	}
 
 	// tool profile and tools
-	var prof catalog.Profile
+	var prof catalog.ToolProfile
 	haveProf := false
 	if s.ToolProfile != "" {
 		prof, haveProf = in.Tools.Profile(s.ToolProfile)
@@ -148,23 +167,15 @@ func Validate(in Input) []string {
 			add("the platform policy requires a toolProfile")
 		}
 	}
-	var offered []string
-	if haveProf {
-		offered = prof.Tools
-	}
 	seenTool := map[string]bool{}
 	checkTool := func(n string) {
 		if !haveProf {
 			return
 		}
-		if slices.Contains(offered, n) {
+		if slices.Contains(prof.Tools, n) {
 			return
 		}
-		if n == "execute_tool_script" {
-			add("the definition lists tool \"execute_tool_script\" but profile %q has codeMode off (set codeMode: true on the profile)", prof.Name)
-			return
-		}
-		add("the definition lists tool %q which is not in profile %q (the profile offers: %s)", n, prof.Name, strings.Join(offered, ", "))
+		add("%s", in.Tools.Missing(prof, n)) // the tools adapter knows why (a code-mode tool needs a profile with code mode on)
 	}
 	for _, t := range s.Tools {
 		if seenTool[t] {
@@ -195,8 +206,15 @@ func Validate(in Input) []string {
 			}
 		}
 	}
-	feature("knowledge", s.Knowledge, p.AllowKnowledge, c.Knowledge)
-	feature("notify", s.Notify, p.AllowNotify, c.Notify)
+	feature("knowledge", s.Knowledge.Enabled, p.AllowKnowledge, c.Knowledge)
+	feature("notify", s.Notify.Enabled, p.AllowNotify, c.Notify)
+	// reserved lists: refused with a clear sentence rather than silently ignored
+	if len(s.Knowledge.Collections) > 0 {
+		add("knowledge.collections: selecting collections is not available yet; leave the list empty")
+	}
+	if len(s.Notify.Destinations) > 0 {
+		add("notify.destinations: selecting destinations is not available yet; leave the list empty")
+	}
 
 	// memory
 	if s.Memory.Enabled {
@@ -223,18 +241,22 @@ func Validate(in Input) []string {
 		}
 	}
 
-	// skills
+	// skills: a name from the catalog; a version, when set, must be one the catalog offers (today: the digest of its ref)
 	seenSkill := map[string]bool{}
-	for _, n := range s.Skills {
-		if seenSkill[n] {
-			add("skill %q is listed twice", n)
+	for _, sk := range s.Skills {
+		if seenSkill[sk.Name] {
+			add("skill %q is listed twice", sk.Name)
 			continue
 		}
-		seenSkill[n] = true
-		if _, ok := c.Skills[n]; !ok {
-			add("skill %q is not in the platform catalog", n)
-		} else if !p.SkillAllowed(n) {
-			add("skill %q is not allowed by the platform policy", n)
+		seenSkill[sk.Name] = true
+		ref, ok := c.Skills[sk.Name]
+		switch {
+		case !ok:
+			add("skill %q is not in the platform catalog", sk.Name)
+		case !p.SkillAllowed(sk.Name):
+			add("skill %q is not allowed by the platform policy", sk.Name)
+		case sk.Version != "" && sk.Version != SkillVersion(ref):
+			add("skill %q has no version %q in the platform catalog (it offers %q); leave version empty to take it", sk.Name, sk.Version, SkillVersion(ref))
 		}
 	}
 
@@ -250,9 +272,11 @@ func Validate(in Input) []string {
 			case seen[o]:
 				add("egress.allow lists %q twice", o)
 			case inNamespace(o, c.Namespaces.Tools):
-				add("egress.allow entry %q is inside the tools namespace %q: that would reach a tool server around the profile", o, c.Namespaces.Tools)
+				add("egress.allow entry %q is inside the tools namespace %q: that would reach a tool server around the profile (it can never be listed)", o, c.Namespaces.Tools)
+			case p.InClusterAllowed(hostPort(o)):
+				// listed by the operator in egress.inClusterDestinations: the one exception to the rules below
 			case internalHost(o, c.Namespaces.Agents, c.Namespaces.Gateway):
-				add("egress.allow entry %q names a cluster-internal or local host (.svc, .cluster.local, a name without a dot, an address, or a platform namespace); the policy cannot allow it", o)
+				add("egress.allow entry %q names a cluster-internal or local host (.svc, .cluster.local, a name without a dot, an address, or a platform namespace); the policy cannot allow it unless the operator lists exactly host:port in egress.inClusterDestinations", o)
 			case !originAllowed(o, p.Egress.AllowedOrigins):
 				add("egress.allow entry %q is not matched by the platform policy", o)
 			}
@@ -266,6 +290,36 @@ func Validate(in Input) []string {
 		}
 	}
 	return v
+}
+
+// SkillVersion is the version of a skill the catalog offers: the digest of its OCI reference ("sha256:<64 hex>"). The
+// catalog has one digest per skill, so this is the only version a definition may name.
+func SkillVersion(ref string) string {
+	if i := strings.LastIndex(ref, "@"); i >= 0 {
+		return ref[i+1:]
+	}
+	return ""
+}
+
+func skillTexts(l []api.Skill) []string {
+	var out []string
+	for _, s := range l {
+		out = append(out, s.Name, s.Version)
+	}
+	return out
+}
+
+// hostPort is the origin's host and port in lower case, the port being the scheme's default when the origin names none.
+func hostPort(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+	}
+	return strings.ToLower(u.Hostname()) + ":" + port
 }
 
 // internalHost reports whether the origin's host is something that is not on the public internet from the cluster's point

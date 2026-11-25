@@ -17,7 +17,7 @@ func TestSecretShapesAreFoundInEveryFreeTextField(t *testing.T) {
 		"description": func(d *api.AgentDefinition) { d.Spec.Description = "uses " + secret },
 		"toolProfile": func(d *api.AgentDefinition) { d.Spec.ToolProfile = secret },
 		"tools":       func(d *api.AgentDefinition) { d.Spec.Tools = append(d.Spec.Tools, secret) },
-		"skills":      func(d *api.AgentDefinition) { d.Spec.Skills = []string{secret} },
+		"skills":      func(d *api.AgentDefinition) { d.Spec.Skills = []api.Skill{{Name: secret}} },
 		"model":       func(d *api.AgentDefinition) { d.Spec.Model = secret },
 	} {
 		t.Run(field, func(t *testing.T) {

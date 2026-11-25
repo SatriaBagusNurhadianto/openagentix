@@ -5,7 +5,8 @@
 # name profiles that exist). The controller is one small pod; an AgentDefinition (components/control-plane/researcher.yaml) becomes an agent,
 # which on the 6 CPU / 8 GB demo node costs the same as a chart agent (one golden snapshot build).
 # The policy below opens exactly one model and one profile, and does not forbid `knowledge: true`. Nothing else is allowed: no notify, no memory, no
-# skills, no egress. NOTE: the profile `lookup` offers only the tool knowledge_kb_search, and a definition with `knowledge: true` needs a profile that
+# skills, no egress (and no in-cluster destination: egress.inClusterDestinations is empty). controlPlane.policy.suspendAll: true is the stop switch for every
+# definition. NOTE: the profile `lookup` offers only the tool knowledge_kb_search, and a definition with `knowledge.enabled: true` needs a profile that
 # offers ALL the knowledge tools (the controller adds them all), so on this demo such a definition is refused: list the tools you want in `tools:`
 # instead, as components/control-plane/researcher.yaml does. Without the A2A gate caller rule an operator adds, nobody may call the built agent from
 # outside (the controller writes no gate rules). The control plane's ResourceQuota (controlPlane.maxDefinitions, default 50) caps definition objects.

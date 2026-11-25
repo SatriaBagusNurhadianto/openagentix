@@ -20,7 +20,9 @@ of built agents are created by the controller, never by the installer.
 {{- $catalogJSON := include "oa.cpCatalog" . }}
 {{- $policyJSON := include "oa.cpPolicy" . }}
 {{- $cat := $catalogJSON | fromJson }}
-{{- $servers := list }}{{ range $cat.profiles }}{{ $servers = append $servers .toolServer }}{{ end }}
+{{- $servers := list }}{{ range $cat.tools.toolhive.profiles }}{{ $servers = append $servers .toolServer }}{{ end }}
+{{- $rk := $cat.runtime.kagent }}
+{{- $inCluster := (.Values.controlPlane.policy.egress | default dict).inClusterDestinations | default list }}
 {{- $crd := .Files.Get "files/agentdefinition-crd.yaml" | fromYaml }}
 {{- if not $crd.metadata }}{{ fail "files/agentdefinition-crd.yaml is missing from the chart (it is a copy of services/control-plane/crd/agentdefinition.yaml)" }}{{ end }}
 {{- /* The ownership test of the output guard, for the CEL variable %[1]s (object or oldObject): both labels and an owner reference of kind AgentDefinition
@@ -319,15 +321,15 @@ spec:
       expression: |-
         variables.res != 'api.kagent.dev/harnesses' || variables.del || (
           object.metadata.name == variables.agent + '-harness' && has(object.spec) &&
-          has(object.spec.workload) && has(object.spec.workload.image) && object.spec.workload.image == {{ $cat.harnessImage | toJson }} &&
+          has(object.spec.workload) && has(object.spec.workload.image) && object.spec.workload.image == {{ $rk.harnessImage | toJson }} &&
           has(object.spec.substrate) && has(object.spec.substrate.workerPoolRef) && has(object.spec.substrate.workerPoolRef.name) &&
-          object.spec.substrate.workerPoolRef.name == {{ $cat.workerPool | toJson }} &&
+          object.spec.substrate.workerPoolRef.name == {{ $rk.workerPool | toJson }} &&
           has(object.spec.substrate.snapshotPolicy) && has(object.spec.substrate.snapshotPolicy.location) &&
-          object.spec.substrate.snapshotPolicy.location == {{ $cat.snapshotLocation | toJson }} &&
+          object.spec.substrate.snapshotPolicy.location == {{ $rk.snapshotLocation | toJson }} &&
           (!has(object.spec.kagent) || !has(object.spec.kagent.memory) || !has(object.spec.kagent.memory.modelConfigRef) ||
-            (has(object.spec.kagent.memory.modelConfigRef.name) && object.spec.kagent.memory.modelConfigRef.name == {{ $cat.memory.modelConfig | toJson }} &&
+            (has(object.spec.kagent.memory.modelConfigRef.name) && object.spec.kagent.memory.modelConfigRef.name == {{ $rk.memoryModelConfig | toJson }} &&
              (!has(object.spec.kagent.memory.modelConfigRef.namespace) || object.spec.kagent.memory.modelConfigRef.namespace == {{ $kns | toJson }}))) &&
-          (!has(object.spec.env) || object.spec.env.all(e, has(e.name) && has(e.value) && e in {{ $cat.harnessEnv | toJson }})))
+          (!has(object.spec.env) || object.spec.env.all(e, has(e.name) && has(e.value) && e in {{ $rk.harnessEnv | toJson }})))
     # Agent <agent>: its template, harness and egress policy are the ones of its own name (it cannot be pointed at another agent's objects).
     - message: "an Agent written by the control plane must reference <agent>-template, <agent>-harness and <agent>-egress only"
       expression: |-
@@ -337,18 +339,22 @@ spec:
           object.spec.template.ref.name == variables.agent + '-template' &&
           has(object.spec.harnessRef) && has(object.spec.harnessRef.name) && object.spec.harnessRef.name == variables.agent + '-harness' &&
           (!has(object.spec.egressPolicyRefs) || object.spec.egressPolicyRefs.all(r, has(r.name) && r.name == variables.agent + '-egress')))
-    # EgressPolicy <agent>-egress: no destination inside the cluster. The host of each origin (scheme and port cut off, lower case) must have a dot, must not
-    # be an IP address, must not end in .svc or .cluster.local or contain .svc., and must not be inside the tools, agents or gateway namespace.
-    # ([x].all(h, ...) binds the host once.)
-    - message: "an EgressPolicy written by the control plane may not name a host inside the cluster (.svc, .cluster.local, a namespace of the platform, an IP address, a name without a dot)"
+    # EgressPolicy <agent>-egress: no destination inside the cluster, except the exact host:port entries of controlPlane.policy.egress.inClusterDestinations
+    # (none by default). The host of each origin (scheme and port cut off, lower case) must have a dot, must not be an IP address, must not end in .svc or
+    # .cluster.local or contain .svc., and must not be inside the agents or gateway namespace; or its host:port (the scheme's default port when it names none)
+    # must be exactly a listed one. Whatever is listed, a host inside the tools namespace is refused. ([x].all(h, ...) binds a value once.)
+    - message: "an EgressPolicy written by the control plane may not name a host inside the cluster (.svc, .cluster.local, a namespace of the platform, an IP address, a name without a dot), except the exact host:port entries the operator lists"
       expression: |-
         variables.res != 'api.kagent.dev/egresspolicies' || variables.del || (
           object.metadata.name == variables.agent + '-egress' && has(object.spec) && has(object.spec.destinations) &&
           object.spec.destinations.all(d, has(d.origin) && d.origin.matches('^https?://') &&
-            [d.origin.split('://')[1].split(':')[0].lowerAscii()].all(h,
-              h.contains('.') && !h.matches('^[0-9.]+$') && !h.startsWith('[') &&
-              !h.endsWith('.svc') && !h.contains('.svc.') && !h.endsWith('.cluster.local') &&
-              ![{{ $cat.namespaces.agents | toJson }}, {{ $cat.namespaces.gateway | toJson }}, {{ $cat.namespaces.tools | toJson }}].exists(n, h.endsWith('.' + n) || h.contains('.' + n + '.')))))
+            [d.origin.split('://')].all(parts, [parts[1].lowerAscii()].all(authority, [authority.split(':')[0]].all(host,
+              [authority.contains(':') ? authority : authority + (parts[0] == 'https' ? ':443' : ':80')].all(hp,
+                ![{{ $cat.namespaces.tools | toJson }}].exists(n, host.endsWith('.' + n) || host.contains('.' + n + '.')) &&
+                ((host.contains('.') && !host.matches('^[0-9.]+$') && !host.startsWith('[') &&
+                  !host.endsWith('.svc') && !host.contains('.svc.') && !host.endsWith('.cluster.local') &&
+                  ![{{ $cat.namespaces.agents | toJson }}, {{ $cat.namespaces.gateway | toJson }}].exists(n, host.endsWith('.' + n) || host.contains('.' + n + '.'))) ||
+                 hp in {{ $inCluster | toJson }})))))))
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding

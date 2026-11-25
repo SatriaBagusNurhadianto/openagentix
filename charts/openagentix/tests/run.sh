@@ -1579,7 +1579,7 @@ POLT=$(q "$(docs "${CP9[@]}" -f "$CPT")" '.[]|select(.kind=="ConfigMap" and .met
 eq "policy equals the controller's testdata/policy.json when the values say the same (normalised)" "$([ "$(jq -S . <<<"$POLT")" = "$(jq -S . "$CPSVC/testdata/policy.json")" ] && echo equal || echo differs)" equal
 rm -f "$CPT"
 eq "demo policy: one model, one profile, knowledge, no notify, no memory, no egress" "$(jq -c '[.allowedModels,.allowedProfiles,.allowKnowledge,.allowNotify,.memory.allowed,.egress.allowedOrigins,.allowedSkills,.requireToolProfile,.maxAgents]' <<<"$POL")" '[["claude-haiku"],["lookup"],true,false,false,[],[],true,5]'
-eq "demo catalog lists the profile server and its tools" "$(jq -c '.profiles[0]|[.name,.toolServer,.codeMode]' <<<"$CAT")" '["lookup","toolhive-vmcp-lookup",true]'
+eq "demo catalog lists the profile server and its tools" "$(jq -c '.tools.toolhive.profiles[0]|[.name,.toolServer,.codeMode]' <<<"$CAT")" '["lookup","toolhive-vmcp-lookup",true]'
 eq "no Secret object and no Secret reference in the catalog or policy" "$(printf '%s%s' "$CAT" "$POL" | command grep -ciE 'secretRef|apiKeySecret|virtual-key' || true)" 0
 eq "no secret-shaped value in the catalog or policy"   "$(printf '%s%s' "$CAT" "$POL" | command grep -cE 'vk-[0-9a-f]{16,}|sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|xox[bpa]-[0-9A-Za-z-]{10,}|BEGIN [A-Z ]*PRIVATE KEY|eyJ[A-Za-z0-9_-]{10,}[.]' || true)" 0
 KC='.[]|select(.kind=="ConfigMap" and .metadata.name=="llm-api-keys-control-plane")'
@@ -1656,7 +1656,7 @@ eq "guard: worker pool and snapshot location are the catalog's" "$(gcount "worke
 eq "guard: the memory ModelConfig is the catalog's"    "$(gcount "gateway-embed-memory")" 1
 eq "guard: the harness env is the catalog's list"      "$(gcount "e in []")" 1
 eq "guard: the Agent refs derive from its own name"    "$(gcount "object.spec.template.ref.name == variables.agent + '-template'")+$(gcount "object.spec.harnessRef.name == variables.agent + '-harness'")+$(gcount "r.name == variables.agent + '-egress'")" 1+1+1
-eq "guard: egress hosts: no .svc, .cluster.local, namespace, single label, IP" "$(gcount "h.endsWith('.svc')")+$(gcount "h.endsWith('.cluster.local')")+$(gcount "[\"kagent\", \"agentgateway-system\", \"mcp-tools\"]")+$(gcount "h.contains('.')")+$(gcount "'^[0-9.]+\$'")" 1+1+1+1+1
+eq "guard: egress hosts: no .svc, .cluster.local, namespace, single label, IP" "$(gcount "host.endsWith('.svc')")+$(gcount "host.endsWith('.cluster.local')")+$(gcount "[\"kagent\", \"agentgateway-system\"]")+$(gcount "[\"mcp-tools\"]")+$(gcount "host.contains('.')")+$(gcount "'^[0-9.]+\$'")" 1+1+1+1+1+1
 eq "guard: every validation has a message"             "$(q "$D" "$VP|[.spec.validations[]|(.message//\"\")==\"\"]|any")" false
 eq "guard: 12 validations"                             "$(q "$D" "$VP|.spec.validations|length")" 12
 DKS=$(docs --set controlPlane.enabled=true --set kagent.namespace=ag2)
@@ -1714,9 +1714,9 @@ eq "networkPolicy.enabled=false renders no NetworkPolicy for the controller" "$(
 echo "# control plane: the catalog follows the chart values"
 eq "catalog: models are the gateway models"            "$(jq -c .models <<<"$CAT")" '["claude-haiku"]'
 eq "catalog: gateway URL is the one agents use"        "$(jq -r .gatewayBaseUrl <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="ModelConfig" and .metadata.name=="gateway-profile-demo")|.spec.openAI.baseUrl')"
-eq "catalog: the harness image is the one agents use"  "$(jq -r .harnessImage <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="profile-demo-harness")|.spec.workload.image')"
-eq "catalog: the profile's tools are the ones the chart validates agents against" "$(jq -c '.profiles[0].tools' <<<"$CAT")" '["knowledge_kb_search","osv_query_vulnerability","osv_get_vulnerability","execute_tool_script"]'
-eq "catalog: the profile server is the RemoteMCPServer name agents use" "$(jq -r '.profiles[0].toolServer' <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="AgentTemplate" and .metadata.name=="profile-demo-template")|.spec.tools[0].mcp.server.name')"
+eq "catalog: the harness image is the one agents use"  "$(jq -r .runtime.kagent.harnessImage <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="profile-demo-harness")|.spec.workload.image')"
+eq "catalog: the profile's tools are the ones the chart validates agents against" "$(jq -c '.tools.toolhive.profiles[0].tools' <<<"$CAT")" '["knowledge_kb_search","osv_query_vulnerability","osv_get_vulnerability","execute_tool_script"]'
+eq "catalog: the profile server is the RemoteMCPServer name agents use" "$(jq -r '.tools.toolhive.profiles[0].toolServer' <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="AgentTemplate" and .metadata.name=="profile-demo-template")|.spec.tools[0].mcp.server.name')"
 eq "catalog: reserved names are the chart agents, the platform's names, the key Secret bases, the non-default ModelConfig suffixes and every gateway user" "$(jq -c '.reservedNames' <<<"$CAT")" '["assistant","profile-demo","kb","kb-extract","memory","claude-haiku","embed-memory"]'
 eq "catalog: the gate URL (gate on)"                   "$(jq -r .gateUrl <<<"$CAT")" http://a2a-gate.openagentix-gateway.svc.cluster.local:8080
 GWU=$(q "$D" '[(.[]|select(.kind=="ModelConfig")|.metadata.annotations["openagentix.io/agent"]),(.[]|select(.kind=="Deployment")|(.metadata.annotations//{})|to_entries[]|select(.key|test("^openagentix.io/gateway-user(-.+)?$"))|.value)]|map(select(.!=null and .!=""))|unique|join(",")')
@@ -1747,12 +1747,29 @@ rm -f "$CPO"
 eq "catalog: an overridden memory key Secret reserves its base too" "$(q "$(docs --set controlPlane.enabled=true --set memory.modelConfig.virtualKeySecret=mem2-virtual-key)" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]|fromjson|.reservedNames|index("mem2")!=null')" true
 DOFF=$(docs --set controlPlane.enabled=true)
 CATOFF=$(q "$DOFF" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]')
-eq "catalog without the other demos: no profiles, no gate, no notify; knowledge and memory follow the chart defaults" "$(jq -c '[.profiles,.gateUrl,.knowledge.available,.notify.available,.memory.available]' <<<"$CATOFF")" '[[],"",true,false,true]'
+eq "catalog without the other demos: no profiles, no gate, no notify; knowledge and memory follow the chart defaults" "$(jq -c '[.tools.toolhive.profiles,.gateUrl,.knowledge.available,.notify.available,.memory.available]' <<<"$CATOFF")" '[[],"",true,false,true]'
 eq "catalog: the chart's default agent has memory, so the memory stack is present" "$(jq -r .memory.available <<<"$CATOFF")" true
 CPM="$(dirname "$0")/.cp-nomem.yaml"
 yq -y '{agents: (.agents|map(del(.memory)))}' "$CHART/values.yaml" > "$CPM"
 DNM=$(docs --set controlPlane.enabled=true -f "$CPM")
 eq "catalog: memory.available follows the chart's own memory switch" "$(q "$DNM" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]|fromjson|.memory.available')" false
+
+echo "# control plane: adapter-owned catalog sections and the policy additions (ADR 0012)"
+eq "catalog: nothing of kagent or the tool servers is at the top level (adapter-owned sections only)" "$(jq -c '[has("harnessImage"),has("workerPool"),has("snapshotLocation"),has("harnessEnv"),has("toolServer"),has("profiles"),(.memory|has("modelConfig"))]|any' <<<"$CAT")" false
+eq "catalog: runtime.kagent holds the harness image, worker pool, snapshot location, env and the memory model config" "$(jq -c '.runtime.kagent|[(.harnessImage|startswith("ghcr.io")),.workerPool,.snapshotLocation,.harnessEnv,.memoryModelConfig]' <<<"$CAT")" '[true,"kagent-default","s3://ate-snapshots/kagent/",[],"gateway-embed-memory"]'
+eq "catalog: the memory model config is the one the chart agents use" "$(jq -r '.runtime.kagent.memoryModelConfig' <<<"$CAT")" "$(q "$D" '.[]|select(.kind=="Harness" and .metadata.name=="assistant-harness")|.spec.kagent.memory.modelConfigRef.name')"
+eq "catalog: tools.toolhive names the code-mode tool and holds the profiles" "$(jq -c '.tools.toolhive|[.codeModeTool,(.profiles|length)]' <<<"$CAT")" '["execute_tool_script",1]'
+eq "catalog: the adapter sections are the only ones (runtime.kagent, tools.toolhive)" "$(jq -c '[(.runtime|keys),(.tools|keys)]' <<<"$CAT")" '[["kagent"],["toolhive"]]'
+eq "catalog: harnessEnv follows observability baggage into runtime.kagent" "$(jq -c '.runtime.kagent.harnessEnv|map(.name)' <<<"$(q "$(docs "${CP8[@]}" -f "$CPV" --set observability.baggage=true)" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-catalog")|.data["catalog.json"]')")" '["OTEL_PROPAGATORS"]'
+eq "policy: suspendAll is off by default"              "$(jq -c .suspendAll <<<"$POL")" false
+eq "policy: inClusterDestinations is empty by default" "$(jq -c .egress.inClusterDestinations <<<"$POL")" '[]'
+DS=$(docs "${CP9[@]}" --set controlPlane.policy.suspendAll=true --set 'controlPlane.policy.egress.inClusterDestinations={registry.ci.svc:5000,db.data.svc.cluster.local:5432}')
+POLS=$(q "$DS" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]')
+eq "policy: suspendAll and inClusterDestinations reach the policy file" "$(jq -c '[.suspendAll,.egress.inClusterDestinations]' <<<"$POLS")" '[true,["registry.ci.svc:5000","db.data.svc.cluster.local:5432"]]'
+eq "a suspendAll change rolls the pod (checksum differs)" "$([ "$(q "$DS" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" != "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" ] && echo differs || echo same)" differs
+VPS=$(q "$DS" "$VP|(.spec.variables+.spec.validations)|map(.expression)|join(\"\\n\")")
+eq "guard: the EgressPolicy rule allows exactly the operator's in-cluster destinations (none by default)" "$(printf '%s' "$GEXPR" | command grep -c -F -- 'hp in []')+$(printf '%s' "$VPS" | command grep -c -F -- 'hp in ["registry.ci.svc:5000","db.data.svc.cluster.local:5432"]')" 1+1
+eq "guard: an in-cluster destination can never be one in the tools namespace (the rule keeps that check)" "$(printf '%s' "$VPS" | command grep -c -F -- '["mcp-tools"].exists(')" 1
 
 echo "# control plane: the controller accepts the rendered files"
 if command -v go >/dev/null 2>&1 && [ -d "$CPSVC/cmd/control-plane" ]; then
@@ -1791,6 +1808,14 @@ cpfail "an egress origin that is not an origin fails"  --set 'controlPlane.polic
 cpfail "an egress origin inside the tools namespace fails" --set 'controlPlane.policy.egress.allowedOrigins={https://vmcp.mcp-tools.svc}'
 cpfail "an allow list that is not a list fails"        --set controlPlane.policy.allowedModels=claude-haiku
 cpfail "a bad API server CIDR fails"                   --set 'controlPlane.apiServerCIDRs={not-a-cidr}'
+cpfail "suspendAll must be a boolean"                  --set controlPlane.policy.suspendAll=yes
+cpfail "inClusterDestinations without a port fails"    --set 'controlPlane.policy.egress.inClusterDestinations={registry.ci.svc}'
+cpfail "inClusterDestinations with a scheme fails"     --set 'controlPlane.policy.egress.inClusterDestinations={http://registry.ci.svc:5000}'
+cpfail "inClusterDestinations with a wildcard fails"   --set 'controlPlane.policy.egress.inClusterDestinations={*.ci.svc:5000}'
+cpfail "inClusterDestinations that is an IP fails"     --set 'controlPlane.policy.egress.inClusterDestinations={10.0.0.4:5000}'
+cpfail "inClusterDestinations without a namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={registry:5000}'
+cpfail "inClusterDestinations in the tools namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={vmcp.mcp-tools.svc:4483}'
+cpfail "inClusterDestinations that is not a list fails" --set controlPlane.policy.egress.inClusterDestinations=registry.ci.svc:5000
 cpfail "memoryDefaultTtlDays below 1 fails"            --set controlPlane.memoryDefaultTtlDays=0
 cpfail "maxDefinitions below 1 fails"                  --set controlPlane.maxDefinitions=0
 cpfail "maxDefinitions that is not a number fails"     --set controlPlane.maxDefinitions=many

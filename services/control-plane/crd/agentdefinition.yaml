@@ -1,11 +1,17 @@
-# CustomResourceDefinition of AgentDefinition (ADR 0007). Group openagentix.io, version v1alpha1.
+# CustomResourceDefinition of AgentDefinition (ADR 0007, changed in place by ADR 0012). Group openagentix.io, version v1alpha1 (nothing
+# depended on the first shape, so it was changed without a new version; from here on a change follows the alpha/beta/stable rules
+# of services/control-plane/README.md, "API conventions").
 # The limits below are the ones of the ADR. The controller checks all of them again (policy package) and is the authority;
 # the schema is the first, cheap line of defence at `kubectl apply` time.
 #   - name: a DNS label of at most 40 characters. A CRD schema cannot constrain metadata, so two CEL rules on the object do it.
-#   - description at most 256 characters; instructions required, 1 to 16384 characters (the controller counts bytes);
+#   - description at most 256 characters; instructions 1 to 16384 characters (the controller counts bytes), exactly one of
+#     instructions and instructionsFrom by a rule;
 #   - ttlDays at least 1; egress.allow at most 64 origins.
 # There is deliberately no field for a model config, image, tool server, egress policy reference, namespace, caller, gateway
-# user or budget: those come from the platform, so a definition cannot reach around the policy.
+# user or budget: those come from the platform, so a definition cannot reach around the policy. No upstream product is named
+# in a spec field or in the public status; the status is a contract (conditions, observedGeneration, endpoint, revision,
+# effectiveTools, effectiveEgress, violations, capabilities, agentRef) and everything the controller keeps for itself is under
+# status.controller, which may change without notice.
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -32,6 +38,8 @@ spec:
         - {name: Profile, type: string, jsonPath: .spec.toolProfile}
         - {name: Accepted, type: string, jsonPath: '.status.conditions[?(@.type=="Accepted")].status'}
         - {name: Ready, type: string, jsonPath: '.status.conditions[?(@.type=="Ready")].status'}
+        - {name: Revision, type: string, jsonPath: .status.revision}
+        - {name: Suspended, type: boolean, jsonPath: .spec.suspend}
         - {name: Age, type: date, jsonPath: .metadata.creationTimestamp}
       schema:
         openAPIV3Schema:
@@ -45,15 +53,23 @@ spec:
           properties:
             apiVersion: {type: string}
             kind: {type: string}
-            metadata: {type: object}
+            metadata:
+              type: object
+              description: >-
+                Reserved label keys (informational only, never an access or billing decision): openagentix.io/team and
+                openagentix.io/project are copied onto the objects the controller creates and into the gateway key entry;
+                openagentix.io/work-item is reserved for products.
             spec:
               type: object
-              required: [model, instructions]
+              required: [model]
+              x-kubernetes-validations:
+                - rule: "has(self.instructions) != has(self.instructionsFrom)"
+                  message: "set exactly one of instructions and instructionsFrom"
               properties:
                 description:
                   type: string
                   maxLength: 256
-                  description: One line about what the agent does.
+                  description: One line about what the agent does. Not part of the revision.
                 model:
                   type: string
                   minLength: 1
@@ -63,7 +79,18 @@ spec:
                   type: string
                   minLength: 1
                   maxLength: 16384
-                  description: The system prompt. It must not contain anything shaped like a secret.
+                  description: The system prompt. Exactly one of instructions and instructionsFrom is set. It must not contain anything shaped like a secret.
+                instructionsFrom:
+                  type: object
+                  required: [configMap]
+                  description: Reserved. A reference to the prompt in a ConfigMap of the same namespace; this release refuses a definition that sets it ("not available yet").
+                  properties:
+                    configMap:
+                      type: object
+                      required: [name, key]
+                      properties:
+                        name: {type: string, minLength: 1, maxLength: 253}
+                        key: {type: string, minLength: 1, maxLength: 253}
                 toolProfile:
                   type: string
                   maxLength: 20
@@ -75,11 +102,25 @@ spec:
                   items: {type: string, minLength: 1, maxLength: 128}
                   description: Agent-side tool names; each must be offered by the tool profile.
                 knowledge:
-                  type: boolean
-                  description: Adds the knowledge tools and prompt, when the platform has them and the policy allows it.
+                  type: object
+                  description: The knowledge tools and prompt, when the platform has them and the policy allows it.
+                  properties:
+                    enabled: {type: boolean}
+                    collections:
+                      type: array
+                      maxItems: 16
+                      items: {type: string, minLength: 1, maxLength: 63}
+                      description: Reserved. Selecting collections is not available yet; a definition that lists some is refused.
                 notify:
-                  type: boolean
-                  description: Adds the notify tools and prompt, when the platform has them and the policy allows it.
+                  type: object
+                  description: The notify tools and prompt, when the platform has them and the policy allows it.
+                  properties:
+                    enabled: {type: boolean}
+                    destinations:
+                      type: array
+                      maxItems: 16
+                      items: {type: string, minLength: 1, maxLength: 63}
+                      description: Reserved. Selecting destinations is not available yet; a definition that lists some is refused.
                 memory:
                   type: object
                   properties:
@@ -92,8 +133,13 @@ spec:
                 skills:
                   type: array
                   maxItems: 16
-                  items: {type: string, minLength: 1, maxLength: 63}
-                  description: Names from the platform catalog, never an image reference.
+                  description: Skills of the platform catalog, never an image reference.
+                  items:
+                    type: object
+                    required: [name]
+                    properties:
+                      name: {type: string, minLength: 1, maxLength: 63}
+                      version: {type: string, maxLength: 128, description: "Optional. When set it must be a version the catalog offers (today: the digest sha256:<hex> of the catalog's reference); absent takes the catalog's."}
                 egress:
                   type: object
                   properties:
@@ -102,8 +148,12 @@ spec:
                       maxItems: 64
                       items: {type: string, maxLength: 270}
                       description: Origins (https://host[:port]) the sandbox may reach. Each must match the platform policy.
+                suspend:
+                  type: boolean
+                  description: The definition stays accepted and its objects stay, but the agent takes no new work (Ready=False, reason Suspended). The operator's policy can suspend every definition too.
             status:
               type: object
+              description: The public fields are the contract; everything the controller keeps for itself is under controller and may change without notice.
               properties:
                 observedGeneration: {type: integer, format: int64}
                 conditions:
@@ -111,6 +161,8 @@ spec:
                   maxItems: 8 # Accepted, KeyReady, Applied, Ready, and Synced (present only after a pass could not read something)
                   x-kubernetes-list-type: map
                   x-kubernetes-list-map-keys: [type]
+                  description: >-
+                      Ready=True means the agent is callable at status.endpoint, at status.revision. The other conditions are informational. Reasons by condition. Accepted: Accepted (the definition passes the catalog and the policy); PolicyViolation (one or more rules refused it; each is one sentence in status.violations). KeyReady: KeyReady (the key exists and its hash is registered); KeyFailed (the key could not be made or registered); NotAccepted (unknown: refused, so no key); NotApplied (unknown: an earlier step stopped the pass). Applied: Applied (the objects of this generation were written); PreviousGenerationRunning (this generation is refused, the previous one keeps running); NotAccepted (refused, nothing runs); NotApplied (a step before the write failed or waits); NameConflict (an object with a target name is not owned by this definition, nothing was written); CheckFailed (the name check could not read the cluster); RenderFailed (the objects could not be rendered); ApplyFailed (writing an object failed); PruneFailed (removing an unwanted object failed); RemoveFailed (removing the objects or the key failed); PolicyRemoved (the catalog or the policy changed and what ran is no longer allowed: objects and key were removed). Ready: Ready (callable at status.endpoint at status.revision); Suspended (suspended by spec.suspend or by the operator: no new work, nothing is wrong); NotAccepted (refused, or its objects were removed); NotApplied (the objects of this generation are not written yet); ReadinessUnknown (the runtime state could not be read); NoEndpoint (the runtime says ready but no endpoint is advertised); RuntimeNotCreated (the runtime has not created the agent yet); RuntimeStale (the runtime has not caught up with the latest spec); RuntimePending (the runtime reports no verdict yet); RuntimeNotReady (the runtime reports not ready, its words are in the message); RuntimeRejected (the runtime refused the agent, its words are in the message). Synced: Synced (the last pass could read everything); TransientError (a read failed; the other conditions are the last known state).
                   items:
                     type: object
                     required: [type, status, reason]
@@ -121,26 +173,50 @@ spec:
                       message: {type: string, maxLength: 1024}
                       observedGeneration: {type: integer, format: int64}
                       lastTransitionTime: {type: string, format: date-time}
-                agentRef:
+                endpoint:
                   type: object
+                  description: Where the agent is callable. Absent while suspended, refused or when the platform advertises no route.
                   properties:
-                    apiVersion: {type: string}
-                    kind: {type: string}
-                    name: {type: string}
-                gatewayUserId: {type: string}
-                toolServer: {type: string}
+                    protocol: {type: string, description: "a2a today"}
+                    url: {type: string}
+                    protocolVersion: {type: string}
+                revision:
+                  type: string
+                  maxLength: 64
+                  description: A stable hash of what was applied (instructions, model, tool profile and tools, skill digests, knowledge, notify and memory settings, egress). A change of description or labels does not change it.
                 effectiveTools:
                   type: array
                   items: {type: string}
                 effectiveEgress:
                   type: array
                   items: {type: string}
-                a2aUrl: {type: string}
                 violations:
                   type: array
                   items: {type: string}
-                # What the controller remembers between passes (none of it secret). Added after the first version; additive.
-                keySecret: {type: string, description: "Name of the key Secret in use: <name>-virtual-key-<first 8 hex of the UID>."}
-                keyFingerprint: {type: string, maxLength: 64, description: "Head of the registered key's hash; the same value is the annotation openagentix.io/key-fingerprint on the Secret and on the runtime objects."}
-                appliedGeneration: {type: integer, format: int64, description: "Generation of the spec whose objects exist; 0 when nothing runs."}
-                appliedSpec: {type: string, maxLength: 200000, description: "The spec that was applied, as JSON text. Lets the controller decide what to do when a later spec is refused."}
+                capabilities:
+                  type: object # the enums below are quoted: an unquoted yes or no is a boolean in YAML 1.1, which Helm reads
+                  description: What the runtime can do, reported by its adapter; "unknown" where it could not be verified.
+                  properties:
+                    approvals: {type: string, enum: ["yes", "no", "unknown"]}
+                    durableWaits: {type: string, enum: ["yes", "no", "unknown"]}
+                    workspacePersistence: {type: string, enum: [none, snapshot, volume, unknown]}
+                    maxStepSeconds: {type: integer, description: "0 is unknown"}
+                    cancelStopsLoop: {type: string, enum: ["yes", "no", "unknown"]}
+                    perRunIdentity: {type: string, enum: [none, session, run, unknown]}
+                agentRef:
+                  type: object
+                  description: One generic reference to the runtime's object, for people who debug.
+                  properties:
+                    apiVersion: {type: string}
+                    kind: {type: string}
+                    name: {type: string}
+                controller:
+                  type: object
+                  description: What the controller remembers between passes. None of it is secret. Not part of the contract.
+                  properties:
+                    keySecret: {type: string, description: "Name of the key Secret in use: <name>-virtual-key-<first 8 hex of the UID>."}
+                    keyFingerprint: {type: string, maxLength: 64, description: "Head of the registered key's hash; the same value is the annotation openagentix.io/key-fingerprint on the Secret and on the runtime objects."}
+                    appliedGeneration: {type: integer, format: int64, description: "Generation of the spec whose objects exist; 0 when nothing runs."}
+                    appliedSpec: {type: string, maxLength: 200000, description: "The spec that was applied, as JSON text. Lets the controller decide what to do when a later spec is refused."}
+                    gatewayUserId: {type: string, description: "Opaque. <namespace>.<name> today."}
+                    toolServer: {type: string}

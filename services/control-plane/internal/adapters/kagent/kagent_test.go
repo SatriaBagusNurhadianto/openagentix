@@ -25,9 +25,16 @@ func must(p plan.Plan, err error) plan.Plan {
 	return p
 }
 
-func (f tools) Profile(n string) (catalog.Profile, bool) { return f.c.Profile(n) }
-func (f tools) Profiles() []string                       { return f.c.ProfileNames() }
-func (f tools) SharedServer() string                     { return f.c.ToolServer }
+func (f tools) Profile(n string) (catalog.ToolProfile, bool) {
+	p, ok := f.c.Tools.Toolhive.Profile(n)
+	return catalog.ToolProfile{Name: p.Name, Backend: p.ToolServer, Tools: p.Tools}, ok
+}
+func (f tools) Profiles() []string                                { return nil }
+func (f tools) Missing(p catalog.ToolProfile, tool string) string { return tool }
+
+func build(d *api.AgentDefinition, c *catalog.Catalog) (plan.Plan, error) {
+	return plan.Build(d, c, tools{c}, &catalog.Policy{})
+}
 
 func loadCat(t *testing.T) *catalog.Catalog {
 	t.Helper()
@@ -75,12 +82,17 @@ var ignoredGolden = map[string]string{
 
 func compare(t *testing.T, golden string, got []kube.Manifest) {
 	t.Helper()
+	compareWith(t, golden, strings.NewReplacer(), got)
+}
+
+func compareWith(t *testing.T, golden string, rename *strings.Replacer, got []kube.Manifest) {
+	t.Helper()
 	raw, err := os.ReadFile(golden)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var want []map[string]any
-	if err := json.Unmarshal(raw, &want); err != nil {
+	if err := json.Unmarshal([]byte(rename.Replace(string(raw))), &want); err != nil {
 		t.Fatal(err)
 	}
 	if len(want) != len(got) {
@@ -135,7 +147,7 @@ func profileDemo() *api.AgentDefinition {
 
 func TestParityWithHelmProfileDemo(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	p.KeySecret = "profile-demo-virtual-key" // the chart's Secret name; the control plane's carries the UID (plan.KeySecretName)
 	m, err := New(c, nil).Desired(p)
 	if err != nil {
@@ -155,27 +167,28 @@ func TestParityWithHelmAssistant(t *testing.T) {
 			"platform. Answers are read in a chat app, so keep them short and use plain text.\n" +
 			"Use the available tools when they help; say when you used one.\n",
 		Tools:     []string{"execute_tool_script", "fetch_fetch", "osv_get_vulnerability", "osv_query_vulnerabilities_batch", "osv_query_vulnerability"},
-		Skills:    []string{"openagentix-canary"},
-		Knowledge: true, Notify: true,
+		Skills:    []api.Skill{{Name: "openagentix-canary"}},
+		Knowledge: api.Knowledge{Enabled: true}, Notify: api.Notify{Enabled: true},
 		Memory: api.Memory{Enabled: true, TTLDays: 30},
 	}}
 	// The chart's assistant has tools and no profile (the shared tool server); plan.Build refuses that, so the plan is built
 	// with a profile and the server set by hand, like the ModelConfig name and the Secret name below.
 	d.Spec.ToolProfile = "lookup"
-	p := must(plan.Build(d, c, tools{c}))
-	p.ToolServer = c.ToolServer
+	p := must(build(d, c))
+	p.ToolBackend = "toolhive-vmcp"
 	p.KeySecret = "assistant-virtual-key"
-	p.ModelConfigName = "gateway-claude-haiku" // agents[].modelConfigName in values
 	m, err := New(c, nil).Desired(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	compare(t, "../../../testdata/golden-assistant.json", m)
+	// The chart's assistant names its ModelConfig by hand in values (agents[].modelConfigName: gateway-claude-haiku); the
+	// adapter derives gateway-<name> and does not offer an override, so the golden is read with that one name replaced.
+	compareWith(t, "../../../testdata/golden-assistant.json", strings.NewReplacer("gateway-claude-haiku", "gateway-assistant"), m)
 }
 
 func TestOrderAndKinds(t *testing.T) {
 	c := loadCat(t)
-	m, _ := New(c, nil).Desired(must(plan.Build(profileDemo(), c, tools{c})))
+	m, _ := New(c, nil).Desired(must(build(profileDemo(), c)))
 	var kinds []string
 	for _, x := range m {
 		kinds = append(kinds, x.Object["kind"].(string))
@@ -195,7 +208,7 @@ func TestNoEgressMeansNoPolicyAndNoRef(t *testing.T) {
 	c := loadCat(t)
 	d := profileDemo()
 	d.Spec.Egress = api.Egress{}
-	m, _ := New(c, nil).Desired(must(plan.Build(d, c, tools{c})))
+	m, _ := New(c, nil).Desired(must(build(d, c)))
 	if len(m) != 4 {
 		t.Fatalf("%d objects", len(m))
 	}
@@ -209,7 +222,7 @@ func TestNoToolsMeansNoToolsKey(t *testing.T) {
 	c := loadCat(t)
 	d := profileDemo()
 	d.Spec.Tools, d.Spec.ToolProfile = nil, ""
-	m, _ := New(c, nil).Desired(must(plan.Build(d, c, tools{c})))
+	m, _ := New(c, nil).Desired(must(build(d, c)))
 	if _, ok := m[2].Object["spec"].(map[string]any)["tools"]; ok {
 		t.Fatal("tools must be absent")
 	}
@@ -217,8 +230,8 @@ func TestNoToolsMeansNoToolsKey(t *testing.T) {
 
 func TestHarnessEnvFromCatalog(t *testing.T) {
 	c := loadCat(t)
-	c.HarnessEnv = []catalog.EnvVar{{Name: "OTEL_PROPAGATORS", Value: "tracecontext,baggage"}}
-	m, _ := New(c, nil).Desired(must(plan.Build(profileDemo(), c, tools{c})))
+	c.Runtime.Kagent.HarnessEnv = []catalog.EnvVar{{Name: "OTEL_PROPAGATORS", Value: "tracecontext,baggage"}}
+	m, _ := New(c, nil).Desired(must(build(profileDemo(), c)))
 	env := m[1].Object["spec"].(map[string]any)["env"].([]any)
 	e := env[0].(map[string]any)
 	if e["name"] != "OTEL_PROPAGATORS" || e["value"] != "tracecontext,baggage" {
@@ -226,16 +239,17 @@ func TestHarnessEnvFromCatalog(t *testing.T) {
 	}
 }
 
-func TestCallEndpointAndRef(t *testing.T) {
+func TestEndpointAndRef(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	r := New(c, nil)
-	if got := r.CallEndpoint(p); got != "http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/profile-demo" {
-		t.Fatal(got)
+	want := api.Endpoint{Protocol: "a2a", URL: "http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/profile-demo", ProtocolVersion: "1.0"}
+	if got := r.Endpoint(p); got == nil || *got != want {
+		t.Fatalf("%+v", got)
 	}
 	c.GateURL = ""
-	if got := New(c, nil).CallEndpoint(p); got != "" {
-		t.Fatalf("no gate, no endpoint: %q", got)
+	if got := New(c, nil).Endpoint(p); got != nil {
+		t.Fatalf("no gate, no endpoint: %+v", got)
 	}
 	ref := r.Ref(p)
 	if ref != (api.ObjectRef{APIVersion: "api.kagent.dev/v1alpha3", Kind: "Agent", Name: "profile-demo"}) {
@@ -254,7 +268,7 @@ func (g getter) Get(_ context.Context, r kube.Resource, _, name string) (kube.Ob
 
 func TestReadiness(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	cond := func(typ, status, reason, msg string) kube.Object {
 		return kube.Object{"status": kube.Object{"conditions": []any{kube.Object{"type": typ, "status": status, "reason": reason, "message": msg}}}}
 	}
@@ -263,11 +277,11 @@ func TestReadiness(t *testing.T) {
 		ready bool
 		why   string
 	}{
-		"missing":    {getter{}, false, "AgentNotFound"},
-		"no status":  {getter{"agents/profile-demo": kube.Object{}}, false, "AgentPending"},
+		"missing":    {getter{}, false, "RuntimeNotCreated"},
+		"no status":  {getter{"agents/profile-demo": kube.Object{}}, false, "RuntimePending"},
 		"ready":      {getter{"agents/profile-demo": cond("Ready", "True", "Ready", "")}, true, "Ready"},
-		"not ready":  {getter{"agents/profile-demo": cond("Ready", "False", "DeploymentNotReady", "waiting")}, false, "DeploymentNotReady"},
-		"unaccepted": {getter{"agents/profile-demo": cond("Accepted", "False", "InvalidTemplate", "bad")}, false, "InvalidTemplate"},
+		"not ready":  {getter{"agents/profile-demo": cond("Ready", "False", "DeploymentNotReady", "waiting")}, false, "RuntimeNotReady"},
+		"unaccepted": {getter{"agents/profile-demo": cond("Accepted", "False", "InvalidTemplate", "bad")}, false, "RuntimeRejected"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			r, err := New(c, tc.g).Readiness(context.Background(), p)
@@ -277,13 +291,16 @@ func TestReadiness(t *testing.T) {
 			if r.Ready != tc.ready || r.Reason != tc.why {
 				t.Fatalf("%+v", r)
 			}
+			if !r.Ready && !api.ValidReason(api.CondReady, r.Reason) {
+				t.Fatalf("the adapter reports a reason that is not in the condition table: %q", r.Reason)
+			}
 		})
 	}
 }
 
 func TestKeyFingerprintIsAnnotatedOnHarnessAndAgent(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	p.KeyFingerprint = "0123456789abcdef"
 	m, _ := New(c, nil).Desired(p)
 	got := map[string]string{}
@@ -300,7 +317,7 @@ func TestKeyFingerprintIsAnnotatedOnHarnessAndAgent(t *testing.T) {
 
 func TestReadinessRespectsTheRuntimesObservedGeneration(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	agent := func(gen, observed float64, condGen float64) kube.Object {
 		cond := kube.Object{"type": "Ready", "status": "True", "reason": "Ready"}
 		if condGen > 0 {
@@ -327,7 +344,7 @@ func TestReadinessRespectsTheRuntimesObservedGeneration(t *testing.T) {
 			if err != nil || r.Ready != tc.ready {
 				t.Fatalf("%+v %v", r, err)
 			}
-			if !tc.ready && r.Reason != "AgentStale" {
+			if !tc.ready && r.Reason != "RuntimeStale" {
 				t.Fatalf("reason %q", r.Reason)
 			}
 		})
@@ -336,11 +353,74 @@ func TestReadinessRespectsTheRuntimesObservedGeneration(t *testing.T) {
 
 func TestReadinessMessageIsCutOnARuneBoundary(t *testing.T) {
 	c := loadCat(t)
-	p := must(plan.Build(profileDemo(), c, tools{c}))
+	p := must(build(profileDemo(), c))
 	long := strings.Repeat("€", 300) // 3 bytes each
 	o := kube.Object{"status": kube.Object{"conditions": []any{kube.Object{"type": "Ready", "status": "False", "reason": "X", "message": long}}}}
 	r, _ := New(c, getter{"agents/profile-demo": o}).Readiness(context.Background(), p)
 	if !utf8.ValidString(r.Message) || len([]rune(r.Message)) > 200 || r.Message == "" {
 		t.Fatalf("message must be valid UTF-8 and at most 200 characters: %d bytes, valid=%v", len(r.Message), utf8.ValidString(r.Message))
+	}
+}
+
+// The runtime's own words are kept in the message, so that a person debugging sees them.
+func TestRuntimeReasonWordsStayInTheMessage(t *testing.T) {
+	c := loadCat(t)
+	p := must(build(profileDemo(), c))
+	o := kube.Object{"status": kube.Object{"conditions": []any{kube.Object{"type": "Ready", "status": "False", "reason": "DeploymentNotReady", "message": "waiting"}}}}
+	r, _ := New(c, getter{"agents/profile-demo": o}).Readiness(context.Background(), p)
+	if r.Message != "DeploymentNotReady: waiting" {
+		t.Fatalf("%q", r.Message)
+	}
+}
+
+func TestNamesAreDerivedFromTheNameAndTheCatalogSection(t *testing.T) {
+	c := loadCat(t)
+	d := profileDemo()
+	d.Spec.Memory = api.Memory{Enabled: true, TTLDays: 7}
+	d.Metadata.Namespace = "team-a"
+	m, _ := New(c, nil).Desired(must(build(d, c)))
+	got := map[string]string{}
+	for _, o := range m {
+		got[o.Resource.Kind] = o.Object["metadata"].(kube.Object)["name"].(string) + "@" + o.Object["metadata"].(kube.Object)["namespace"].(string)
+	}
+	for k, want := range map[string]string{"ModelConfig": "gateway-profile-demo@team-a", "Harness": "profile-demo-harness@team-a", "AgentTemplate": "profile-demo-template@team-a", "EgressPolicy": "profile-demo-egress@team-a", "Agent": "profile-demo@team-a"} {
+		if got[k] != want {
+			t.Errorf("%s: got %q want %q", k, got[k], want)
+		}
+	}
+	// the memory model config is the catalog's, in the catalog's agents namespace (where it is rendered once)
+	ref := m[1].Object["spec"].(kube.Object)["kagent"].(kube.Object)["memory"].(kube.Object)["modelConfigRef"].(kube.Object)
+	if ref["name"] != "gateway-embed-memory" || ref["namespace"] != "kagent" {
+		t.Fatalf("%v", ref)
+	}
+	if New(c, nil).KeyDataKey() != "OPENAI_API_KEY" {
+		t.Fatal("the key Secret's data key is the adapter's")
+	}
+}
+
+// Suspend: kagent's Agent and Harness have no suspend, pause or replicas field (checked in the kagent API types and docs), so
+// a suspended plan produces every object but the Agent: the key, ModelConfig, Harness, AgentTemplate and EgressPolicy stay.
+func TestSuspendedPlanOmitsOnlyTheAgent(t *testing.T) {
+	c := loadCat(t)
+	d := profileDemo()
+	d.Spec.Suspend = true
+	m, err := New(c, nil).Desired(must(build(d, c)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var kinds []string
+	for _, x := range m {
+		kinds = append(kinds, x.Resource.Kind)
+	}
+	if strings.Join(kinds, ",") != "ModelConfig,Harness,AgentTemplate,EgressPolicy" {
+		t.Fatalf("%v", kinds)
+	}
+}
+
+func TestCapabilitiesAreOnlyWhatTheKagentDocsAndSourceSay(t *testing.T) {
+	got := New(loadCat(t), nil).Capabilities()
+	want := api.Capabilities{Approvals: api.Yes, DurableWaits: api.Yes, WorkspacePersistence: "snapshot", MaxStepSeconds: 600, CancelStopsLoop: api.Unknown, PerRunIdentity: "session"}
+	if got != want {
+		t.Fatalf("got %+v want %+v", got, want)
 	}
 }

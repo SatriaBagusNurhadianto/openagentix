@@ -12,12 +12,16 @@ func TestLoadExamples(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Adapters.Runtime != "kagent" || c.Namespaces.Tools != "mcp-tools" || len(c.Profiles) != 1 {
+	if c.Adapters.Runtime != "kagent" || c.Namespaces.Tools != "mcp-tools" || c.Tools.Toolhive == nil || len(c.Tools.Toolhive.Profiles) != 1 {
 		t.Fatalf("%+v", c)
 	}
-	p, ok := c.Profile("lookup")
+	p, ok := c.Tools.Toolhive.Profile("lookup")
 	if !ok || p.ToolServer != "toolhive-vmcp-lookup" || !p.CodeMode {
 		t.Fatalf("profile: %+v %v", p, ok)
+	}
+	k := c.Runtime.Kagent
+	if k == nil || k.WorkerPool != "kagent-default" || k.MemoryModelConfig != "gateway-embed-memory" || k.HarnessEnv == nil {
+		t.Fatalf("adapter-owned runtime section: %+v", k)
 	}
 	if !c.HasModel("claude-haiku") || c.HasModel("gpt") {
 		t.Fatal("HasModel")
@@ -42,13 +46,17 @@ func write(t *testing.T, s string) string {
 func TestLoadCatalogRefusals(t *testing.T) {
 	base, _ := os.ReadFile("../../testdata/catalog.json")
 	cases := map[string]struct{ from, to, want string }{
-		"unknown field":     {`"models"`, `"modles": [], "models"`, "unknown field"},
-		"skill not digest":  {"@sha256:0000000000000000000000000000000000000000000000000000000000000000", "@latest", "digest-pinned"},
-		"no runtime":        {`"runtime": "kagent"`, `"runtime": ""`, "adapters.runtime"},
-		"no harness image":  {`"workerPool": "kagent-default"`, `"workerPool": ""`, "workerPool"},
-		"bad gateway url":   {`"gatewayBaseUrl": "http`, `"gatewayBaseUrl": "ftp`, "gatewayBaseUrl"},
-		"profile no server": {`"toolServer": "toolhive-vmcp-lookup"`, `"toolServer": ""`, "toolServer"},
-		"memory no prompt":  {`"modelConfig": "gateway-embed-memory"`, `"modelConfig": ""`, "memory.modelConfig"},
+		"unknown field":                     {`"models"`, `"modles": [], "models"`, "unknown field"},
+		"skill not digest":                  {"@sha256:0000000000000000000000000000000000000000000000000000000000000000", "@latest", "digest-pinned"},
+		"no runtime":                        {`"runtime": "kagent"`, `"runtime": ""`, "adapters.runtime"},
+		"no harness image":                  {`"workerPool": "kagent-default"`, `"workerPool": ""`, "runtime.kagent.workerPool"},
+		"no runtime section":                {`"runtime": {`, `"runtimeX": {`, "unknown field"},
+		"no tools section":                  {`"toolhive": {`, `"toolhiveX": {`, "unknown field"},
+		"codeMode and the tool disagree":    {`"codeMode": true`, `"codeMode": false`, "codeMode"},
+		"top-level adapter fields are gone": {`"models"`, `"harnessImage": "x", "models"`, "unknown field"},
+		"bad gateway url":                   {`"gatewayBaseUrl": "http`, `"gatewayBaseUrl": "ftp`, "gatewayBaseUrl"},
+		"profile no server":                 {`"toolServer": "toolhive-vmcp-lookup"`, `"toolServer": ""`, "toolServer"},
+		"memory no model config":            {`"memoryModelConfig": "gateway-embed-memory"`, `"memoryModelConfig": ""`, "runtime.kagent.memoryModelConfig"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -69,12 +77,21 @@ func TestLoadCatalogRefusals(t *testing.T) {
 
 func TestLoadPolicyRefusals(t *testing.T) {
 	for name, c := range map[string]struct{ in, want string }{
-		"negative max":                 {`{"maxAgents": -1}`, "maxAgents"},
-		"unknown field":                {`{"maxAgents": 1, "allowAll": true}`, "unknown field"},
-		"bad origin":                   {`{"maxAgents": 1, "egress": {"allowedOrigins": ["api.osv.dev"]}}`, "allowedOrigins"},
-		"ttl negative":                 {`{"maxAgents": 1, "memory": {"allowed": true, "maxTtlDays": -3}}`, "maxTtlDays"},
-		"memory allowed without a cap": {`{"maxAgents": 1, "memory": {"allowed": true}}`, "maxTtlDays"},
-		"trailing json":                {`{"maxAgents": 1} {}`, "trailing"},
+		"negative max":                       {`{"maxAgents": -1}`, "maxAgents"},
+		"unknown field":                      {`{"maxAgents": 1, "allowAll": true}`, "unknown field"},
+		"bad origin":                         {`{"maxAgents": 1, "egress": {"allowedOrigins": ["api.osv.dev"]}}`, "allowedOrigins"},
+		"ttl negative":                       {`{"maxAgents": 1, "memory": {"allowed": true, "maxTtlDays": -3}}`, "maxTtlDays"},
+		"memory allowed without a cap":       {`{"maxAgents": 1, "memory": {"allowed": true}}`, "maxTtlDays"},
+		"trailing json":                      {`{"maxAgents": 1} {}`, "trailing"},
+		"in-cluster entry without a port":    {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["registry.ci.svc"]}}`, "inClusterDestinations"},
+		"in-cluster entry with a scheme":     {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["http://registry.ci.svc:5000"]}}`, "inClusterDestinations"},
+		"in-cluster entry with a wildcard":   {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["*.ci.svc:5000"]}}`, "inClusterDestinations"},
+		"in-cluster entry that is an IP":     {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["10.0.0.4:5000"]}}`, "inClusterDestinations"},
+		"in-cluster entry, port 0":           {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["registry.ci.svc:0"]}}`, "inClusterDestinations"},
+		"in-cluster entry, port too big":     {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["registry.ci.svc:65536"]}}`, "inClusterDestinations"},
+		"in-cluster entry, not namespaced":   {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["registry:5000"]}}`, "inClusterDestinations"},
+		"in-cluster entry listed twice":      {`{"maxAgents": 1, "egress": {"inClusterDestinations": ["registry.ci.svc:5000", "registry.ci.svc:5000"]}}`, "twice"},
+		"reserved name with a bad namespace": {`{"maxAgents": 1, "reservedNames": ["Bad/x"]}`, "reservedNames"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := LoadPolicy(write(t, c.in))
@@ -95,5 +112,53 @@ func TestPolicyAllows(t *testing.T) {
 	}
 	if (&Policy{}).SkillAllowed("x") {
 		t.Fatal("empty list allows nothing")
+	}
+}
+
+func TestPolicyInClusterDestinationsAndSuspendAll(t *testing.T) {
+	p, err := LoadPolicy(write(t, `{"maxAgents": 1, "suspendAll": true, "egress": {"inClusterDestinations": ["registry.ci.svc:5000", "db.data.svc.cluster.local:5432", "x.ns:80"]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.SuspendAll || len(p.Egress.InClusterDestinations) != 3 {
+		t.Fatalf("%+v", p)
+	}
+	if !p.InClusterAllowed("registry.ci.svc:5000") || p.InClusterAllowed("registry.ci.svc:5001") || p.InClusterAllowed("other.ci.svc:5000") {
+		t.Fatal("exact host and port only")
+	}
+	if (&Policy{}).InClusterAllowed("registry.ci.svc:5000") {
+		t.Fatal("the default is none")
+	}
+}
+
+func TestPolicyAgainstCatalogRefusesInClusterDestinationInTheToolsNamespace(t *testing.T) {
+	c, err := LoadCatalog("../../testdata/catalog.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &Policy{Egress: PolicyEgress{InClusterDestinations: []string{"vmcp.mcp-tools.svc:4483"}}}
+	if err := CheckPolicy(c, p); err == nil || !strings.Contains(err.Error(), "tools namespace") {
+		t.Fatalf("got %v", err)
+	}
+	p.Egress.InClusterDestinations = []string{"registry.ci.svc:5000"}
+	if err := CheckPolicy(c, p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReservedInNamespace(t *testing.T) {
+	c := &Catalog{Namespaces: Namespaces{Agents: "kagent"}, ReservedNames: []string{"assistant"}}
+	p := &Policy{ReservedNames: []string{"x", "team-a/y"}}
+	for _, tc := range []struct {
+		ns, name string
+		want     bool
+	}{
+		{"kagent", "assistant", true}, {"team-a", "assistant", false}, // the catalog's names are the chart's, in the agents namespace
+		{"kagent", "x", true}, {"team-a", "x", true}, // a bare name is reserved in every namespace
+		{"team-a", "y", true}, {"kagent", "y", false}, // ns/name is reserved in that namespace only
+	} {
+		if got := ReservedIn(c, p, tc.ns, tc.name); got != tc.want {
+			t.Errorf("%s/%s: got %v want %v", tc.ns, tc.name, got, tc.want)
+		}
 	}
 }

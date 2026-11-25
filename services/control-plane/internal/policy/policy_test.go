@@ -13,9 +13,23 @@ import (
 // fakeTools is a ToolResolver that does not depend on the toolhive adapter.
 type fakeTools struct{ c *catalog.Catalog }
 
-func (f fakeTools) Profile(n string) (catalog.Profile, bool) { return f.c.Profile(n) }
-func (f fakeTools) Profiles() []string                       { return f.c.ProfileNames() }
-func (f fakeTools) SharedServer() string                     { return f.c.ToolServer }
+func (f fakeTools) Profile(n string) (catalog.ToolProfile, bool) {
+	p, ok := f.c.Tools.Toolhive.Profile(n)
+	return catalog.ToolProfile{Name: p.Name, Backend: p.ToolServer, Tools: p.Tools}, ok
+}
+func (f fakeTools) Profiles() []string {
+	var n []string
+	for _, p := range f.c.Tools.Toolhive.Profiles {
+		n = append(n, p.Name)
+	}
+	return n
+}
+func (f fakeTools) Missing(p catalog.ToolProfile, tool string) string {
+	if tool == f.c.Tools.Toolhive.CodeModeTool {
+		return fmt.Sprintf("the definition lists tool %q but profile %q has codeMode off", tool, p.Name)
+	}
+	return fmt.Sprintf("the definition lists tool %q which is not in profile %q (the profile offers: %s)", tool, p.Name, strings.Join(p.Tools, ", "))
+}
 
 func load(t *testing.T) (*catalog.Catalog, *catalog.Policy) {
 	t.Helper()
@@ -74,12 +88,12 @@ func TestAccepted(t *testing.T) {
 		},
 		"wildcard policy lists": func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
 			p.AllowedModels, p.AllowedProfiles, p.AllowedSkills = []string{"*"}, []string{"*"}, []string{"*"}
-			d.Spec.Skills = []string{"openagentix-canary"}
+			d.Spec.Skills = []api.Skill{{Name: "openagentix-canary"}}
 		},
 		"knowledge and notify with a profile that offers their tools": func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
-			c.Profiles[0].Tools = append(c.Profiles[0].Tools, c.Knowledge.Tools...)
-			c.Profiles[0].Tools = append(c.Profiles[0].Tools, c.Notify.Tools...)
-			d.Spec.Knowledge, d.Spec.Notify = true, true
+			c.Tools.Toolhive.Profiles[0].Tools = append(c.Tools.Toolhive.Profiles[0].Tools, c.Knowledge.Tools...)
+			c.Tools.Toolhive.Profiles[0].Tools = append(c.Tools.Toolhive.Profiles[0].Tools, c.Notify.Tools...)
+			d.Spec.Knowledge.Enabled, d.Spec.Notify.Enabled = true, true
 		},
 		"a name at the length limit": func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
 			d.Metadata.Name = strings.Repeat("a", 40)
@@ -110,9 +124,11 @@ func TestRefusals(t *testing.T) {
 		}, `model "big" is not allowed by the platform policy`},
 		{"profile not in catalog", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.ToolProfile = "ghost" }, `toolProfile "ghost" is not defined (defined: lookup)`},
 		{"profile not allowed", func(_ *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) { p.AllowedProfiles = nil }, `toolProfile "lookup" is not allowed by the platform policy`},
-		{"skill not in catalog", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Skills = []string{"ghost"} }, `skill "ghost" is not in the platform catalog`},
+		{"skill not in catalog", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+			d.Spec.Skills = []api.Skill{{Name: "ghost"}}
+		}, `skill "ghost" is not in the platform catalog`},
 		{"skill not allowed", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
-			d.Spec.Skills = []string{"openagentix-canary"}
+			d.Spec.Skills = []api.Skill{{Name: "openagentix-canary"}}
 			p.AllowedSkills = nil
 		}, `skill "openagentix-canary" is not allowed by the platform policy`},
 		// tools
@@ -127,36 +143,36 @@ func TestRefusals(t *testing.T) {
 			d.Spec.Tools = append(d.Spec.Tools, "fetch_fetch")
 		}, `lists tool "fetch_fetch" which is not in profile "lookup" (the profile offers: knowledge_kb_search, osv_query_vulnerability, osv_get_vulnerability, execute_tool_script)`},
 		{"code mode off", func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
-			c.Profiles[0].CodeMode = false
-			c.Profiles[0].Tools = c.Profiles[0].Tools[:3]
+			c.Tools.Toolhive.Profiles[0].CodeMode = false
+			c.Tools.Toolhive.Profiles[0].Tools = c.Tools.Toolhive.Profiles[0].Tools[:3]
 		}, `lists tool "execute_tool_script" but profile "lookup" has codeMode off`},
 		{"tool listed twice", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
 			d.Spec.Tools = append(d.Spec.Tools, "osv_query_vulnerability")
 		}, `lists tool "osv_query_vulnerability" twice`},
 		// knowledge and notify
 		{"knowledge not allowed by policy", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
-			d.Spec.Knowledge = true
+			d.Spec.Knowledge.Enabled = true
 			p.AllowKnowledge = false
 		}, "knowledge is not allowed by the platform policy"},
 		{"knowledge service off", func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
-			d.Spec.Knowledge = true
+			d.Spec.Knowledge.Enabled = true
 			c.Knowledge.Available = false
 		}, "knowledge is not available on this platform"},
-		{"knowledge tools not in the profile", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Knowledge = true }, `lists tool "knowledge_kb_get_document" which is not in profile "lookup"`},
+		{"knowledge tools not in the profile", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Knowledge.Enabled = true }, `lists tool "knowledge_kb_get_document" which is not in profile "lookup"`},
 		{"knowledge needs a profile", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
-			d.Spec.Knowledge, d.Spec.ToolProfile, d.Spec.Tools = true, "", nil
+			d.Spec.Knowledge.Enabled, d.Spec.ToolProfile, d.Spec.Tools = true, "", nil
 			p.RequireToolProfile = false
 		}, "knowledge adds tools, so it needs a toolProfile"},
 		{"notify not allowed by policy", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
-			d.Spec.Notify = true
+			d.Spec.Notify.Enabled = true
 			p.AllowNotify = false
 		}, "notify is not allowed by the platform policy"},
 		{"notify service off", func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
-			d.Spec.Notify = true
+			d.Spec.Notify.Enabled = true
 			c.Notify.Available = false
 		}, "notify is not available on this platform"},
 		{"notify needs a profile", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
-			d.Spec.Notify, d.Spec.ToolProfile, d.Spec.Tools = true, "", nil
+			d.Spec.Notify.Enabled, d.Spec.ToolProfile, d.Spec.Tools = true, "", nil
 			p.RequireToolProfile = false
 		}, "notify adds tools, so it needs a toolProfile"},
 		// memory
@@ -226,11 +242,11 @@ func TestRefusals(t *testing.T) {
 			d.Metadata.Name = strings.Repeat("a", 41)
 		}, "at most 40 characters"},
 		{"name not a DNS label", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Metadata.Name = "Bad_Name" }, "must be a DNS label"},
-		{"too many definitions", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) { p.MaxAgents = 2 }, "the platform policy allows at most 2 agents"},
+		{"too many definitions", func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) { p.MaxAgents = 2 }, "the platform policy allows at most 2 agents in namespace \"kagent\""},
 		{"description too long", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
 			d.Spec.Description = strings.Repeat("d", 257)
 		}, "description is 257 characters; at most 256"},
-		{"instructions empty", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Instructions = "  \n" }, "instructions are required"},
+		{"instructions empty", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Instructions = "  \n" }, "instructions are required: set exactly one of instructions and instructionsFrom"},
 		{"instructions too long", func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
 			d.Spec.Instructions = strings.Repeat("i", 16385)
 		}, "instructions are 16385 bytes; at most 16384"},
@@ -302,12 +318,226 @@ func TestManyViolationsAreAllReportedInOrder(t *testing.T) {
 	v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
 		d.Spec.Model = "gpt-9"
 		d.Spec.ToolProfile = "ghost"
-		d.Spec.Skills = []string{"ghost"}
+		d.Spec.Skills = []api.Skill{{Name: "ghost"}}
 	})
 	if len(v) < 3 {
 		t.Fatalf("want at least three, got %q", v)
 	}
 	if !strings.HasPrefix(v[0], "model ") {
 		t.Fatalf("model comes first: %q", v)
+	}
+}
+
+func has(v []string, sub string) bool {
+	return slices.ContainsFunc(v, func(s string) bool { return strings.Contains(s, sub) })
+}
+
+func TestReservedNamesAreScopedToTheDefinitionsNamespace(t *testing.T) {
+	// the catalog's names are the chart's, in the agents namespace; elsewhere the name is free
+	v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Metadata.Name, d.Metadata.Namespace = "assistant", "team-a"
+	})
+	if has(v, "reserved") {
+		t.Fatalf("assistant is only reserved in the agents namespace: %q", v)
+	}
+	v = run(t, func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
+		d.Metadata.Name, d.Metadata.Namespace = "assistant", c.Namespaces.Agents
+	})
+	if !has(v, `name "assistant" is reserved in namespace "kagent"`) {
+		t.Fatalf("%q", v)
+	}
+	// the namespace comes from the catalog: rename it and the rule follows
+	v = run(t, func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
+		c.Namespaces.Agents = "agents-2"
+		d.Metadata.Name, d.Metadata.Namespace = "assistant", "agents-2"
+	})
+	if !has(v, "reserved") {
+		t.Fatalf("nothing may assume the namespace is kagent: %q", v)
+	}
+	// a policy entry "ns/name" is one namespace only; a bare name is every namespace
+	mut := func(ns, name string, res ...string) []string {
+		return run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
+			d.Metadata.Name, d.Metadata.Namespace = name, ns
+			p.ReservedNames = res
+		})
+	}
+	if !has(mut("team-a", "ci", "team-a/ci"), "reserved") || has(mut("team-b", "ci", "team-a/ci"), "reserved") {
+		t.Fatal("ns/name")
+	}
+	if !has(mut("team-b", "ci", "ci"), "reserved") {
+		t.Fatal("bare name")
+	}
+}
+
+func TestKnowledgeAndNotifyCollectionsAndDestinationsAreNotAvailableYet(t *testing.T) {
+	v := run(t, func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
+		d.Spec.Knowledge = api.Knowledge{Collections: []string{"docs"}}
+	})
+	if !has(v, "knowledge.collections: selecting collections is not available yet") {
+		t.Fatalf("%q", v)
+	}
+	v = run(t, func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
+		d.Spec.Notify = api.Notify{Destinations: []string{"chat-1"}}
+	})
+	if !has(v, "notify.destinations: selecting destinations is not available yet") {
+		t.Fatalf("%q", v)
+	}
+	// enabled: false with an empty list is simply off
+	if v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Spec.Knowledge, d.Spec.Notify = api.Knowledge{Enabled: false}, api.Notify{}
+	}); len(v) != 0 {
+		t.Fatalf("%q", v)
+	}
+}
+
+func TestSkillVersionMustBeOneTheCatalogOffers(t *testing.T) {
+	digest := func(c *catalog.Catalog) string { return "sha256:" + strings.Repeat("0", 64) }
+	ok := func(version string) []string {
+		return run(t, func(d *api.AgentDefinition, c *catalog.Catalog, _ *catalog.Policy) {
+			d.Spec.Skills = []api.Skill{{Name: "openagentix-canary", Version: version}}
+		})
+	}
+	if v := ok(""); len(v) != 0 {
+		t.Fatalf("an absent version takes the catalog's: %q", v)
+	}
+	c, _ := load(t)
+	if v := ok(digest(c)); len(v) != 0 {
+		t.Fatalf("the catalog's own digest is a version it offers: %q", v)
+	}
+	v := ok("2.0")
+	if !has(v, `skill "openagentix-canary" has no version "2.0" in the platform catalog`) || !has(v, digest(c)) {
+		t.Fatalf("the sentence must say what the catalog offers: %q", v)
+	}
+}
+
+func TestInstructionsFromIsReservedAndExactlyOneOfTheTwo(t *testing.T) {
+	ref := &api.InstructionsFrom{ConfigMap: &api.ConfigMapKeyRef{Name: "prompts", Key: "a"}}
+	v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Spec.Instructions, d.Spec.InstructionsFrom = "", ref
+	})
+	if !has(v, "instructionsFrom is not available yet") || has(v, "instructions are required") {
+		t.Fatalf("%q", v)
+	}
+	v = run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.InstructionsFrom = ref })
+	if !has(v, "set exactly one of instructions and instructionsFrom") {
+		t.Fatalf("both set: %q", v)
+	}
+	v = run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { d.Spec.Instructions = "" })
+	if !has(v, "instructions are required: set exactly one of instructions and instructionsFrom") {
+		t.Fatalf("neither set: %q", v)
+	}
+}
+
+func TestInClusterDestinationsAreTheOnlyExceptionAndOnlyExact(t *testing.T) {
+	with := func(origin string, listed ...string) []string {
+		return run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) {
+			d.Spec.Egress.Allow = []string{origin}
+			p.Egress.InClusterDestinations = listed
+		})
+	}
+	if v := with("http://registry.ci.svc:5000"); !has(v, "cluster-internal") {
+		t.Fatalf("default: none allowed: %q", v)
+	}
+	if v := with("http://registry.ci.svc:5000", "registry.ci.svc:5000"); len(v) != 0 {
+		t.Fatalf("listed exactly: %q", v)
+	}
+	if v := with("https://registry.ci.svc:5000", "registry.ci.svc:5000"); len(v) != 0 {
+		t.Fatalf("the scheme is not part of the entry: %q", v)
+	}
+	for name, origin := range map[string]string{
+		"another port":      "http://registry.ci.svc:5001",
+		"the default port":  "http://registry.ci.svc",
+		"another host":      "http://other.ci.svc:5000",
+		"a subdomain":       "http://x.registry.ci.svc:5000",
+		"a wildcard":        "http://*.ci.svc:5000",
+		"the full name":     "http://registry.ci.svc.cluster.local:5000",
+		"an address":        "http://10.0.0.4:5000",
+		"the tools service": "http://vmcp.mcp-tools.svc:4483",
+	} {
+		if v := with(origin, "registry.ci.svc:5000"); len(v) == 0 {
+			t.Errorf("%s (%s) must stay refused", name, origin)
+		}
+	}
+	// the tools namespace can never be listed, whatever the operator wrote
+	if v := with("http://vmcp.mcp-tools.svc:4483", "vmcp.mcp-tools.svc:4483"); !has(v, "inside the tools namespace") {
+		t.Fatalf("%q", v)
+	}
+	// a default port is the scheme's
+	if v := with("http://registry.ci.svc", "registry.ci.svc:80"); len(v) != 0 {
+		t.Fatalf("port 80 is http's default: %q", v)
+	}
+	if v := with("https://registry.ci.svc", "registry.ci.svc:443"); len(v) != 0 {
+		t.Fatalf("port 443 is https's default: %q", v)
+	}
+}
+
+func TestReservedLabelsAreValidatedButNeverDecide(t *testing.T) {
+	if v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Metadata.Labels = map[string]string{api.LabelTeam: strings.Repeat("a", 64)}
+	}); !has(v, "label openagentix.io/team") {
+		t.Fatalf("a label value over 63 characters: %q", v)
+	}
+	if v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Metadata.Labels = map[string]string{api.LabelProject: "bad value!"}
+	}); !has(v, "label openagentix.io/project") {
+		t.Fatalf("%q", v)
+	}
+	secret := "s" + "k-" + strings.Repeat("Z", 40)
+	if v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+		d.Metadata.Labels = map[string]string{api.LabelTeam: secret}
+	}); !has(v, "label openagentix.io/team") {
+		t.Fatalf("a secret-shaped label value: %q", v)
+	}
+}
+
+// Policy decisions ignore labels: for definitions that pass and definitions that do not, every combination of the reserved
+// labels (also values that look like privileges) gives exactly the same verdict as no labels.
+func TestPolicyDecisionsIgnoreLabels(t *testing.T) {
+	variants := []map[string]string{
+		nil,
+		{api.LabelTeam: "platform"},
+		{api.LabelTeam: "admin", api.LabelProject: "root", api.LabelWorkItem: "wi-1"},
+		{api.LabelProject: "unlimited", "openagentix.io/allow-everything": "true", "app.kubernetes.io/managed-by": "openagentix-control-plane"},
+	}
+	defs := map[string]mut{
+		"accepted": nil,
+		"refused": func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) {
+			d.Spec.Model = "gpt-9"
+			d.Spec.Egress.Allow = []string{"https://api.github.com"}
+		},
+		"over the limit": func(d *api.AgentDefinition, _ *catalog.Catalog, p *catalog.Policy) { p.MaxAgents = 1 },
+	}
+	for name, m := range defs {
+		want := run(t, m, "someone-else")
+		for i, labels := range variants {
+			got := run(t, func(d *api.AgentDefinition, c *catalog.Catalog, p *catalog.Policy) {
+				if m != nil {
+					m(d, c, p)
+				}
+				d.Metadata.Labels = labels
+			}, "someone-else")
+			if !slices.Equal(got, want) {
+				t.Errorf("%s, labels variant %d changed the verdict:\n  without: %q\n  with:    %q", name, i, want, got)
+			}
+		}
+	}
+}
+
+func TestSecretShapesInCollectionsDestinationsAndSkillVersions(t *testing.T) {
+	secret := "s" + "k-" + strings.Repeat("Z", 40)
+	for field, set := range map[string]func(d *api.AgentDefinition){
+		"knowledge.collections": func(d *api.AgentDefinition) { d.Spec.Knowledge.Collections = []string{secret} },
+		"notify.destinations":   func(d *api.AgentDefinition) { d.Spec.Notify.Destinations = []string{secret} },
+		"skills":                func(d *api.AgentDefinition) { d.Spec.Skills = []api.Skill{{Name: "x", Version: secret}} },
+	} {
+		v := run(t, func(d *api.AgentDefinition, _ *catalog.Catalog, _ *catalog.Policy) { set(d) })
+		if !has(v, field+" contains something shaped like a secret") {
+			t.Errorf("%s: %q", field, v)
+		}
+		for _, x := range v {
+			if strings.Contains(x, secret) {
+				t.Errorf("%s: a violation repeats the secret: %q", field, x)
+			}
+		}
 	}
 }

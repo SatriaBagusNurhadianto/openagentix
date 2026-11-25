@@ -35,14 +35,21 @@ func TestHashMatchesInstaller(t *testing.T) {
 
 type fakeRegistry struct {
 	entries map[string]string
+	labels  map[string]map[string]string
+	calls   int
 	err     error
 }
 
-func (f *fakeRegistry) Register(_ context.Context, user, hash string) error {
+func (f *fakeRegistry) Register(_ context.Context, user, hash string, labels map[string]string) error {
+	f.calls++
 	if f.err != nil {
 		return f.err
 	}
 	f.entries[user] = hash
+	if f.labels == nil {
+		f.labels = map[string]map[string]string{}
+	}
+	f.labels[user] = labels
 	return nil
 }
 
@@ -219,3 +226,75 @@ func TestSecondCreateConflictIsAnError(t *testing.T) {
 }
 
 type kubetestRequest = kubetest.Request
+
+func TestLabelsAreRegisteredWithTheHash(t *testing.T) {
+	_, sec, reg := setup(t)
+	p := params()
+	p.Labels = map[string]string{"app.kubernetes.io/managed-by": "openagentix-control-plane"}
+	p.EntryLabels = map[string]string{"openagentix.io/team": "payments"}
+	if _, err := Ensure(context.Background(), p, sec, reg, fixed("vk-one")); err != nil {
+		t.Fatal(err)
+	}
+	if reg.labels["r"]["openagentix.io/team"] != "payments" {
+		t.Fatalf("%v", reg.labels)
+	}
+}
+
+func TestChangedLabelsRewriteTheEntryWithoutANewKey(t *testing.T) {
+	s, sec, reg := setup(t)
+	p := params()
+	p.EntryLabels = map[string]string{"openagentix.io/team": "a"}
+	res, err := Ensure(context.Background(), p, sec, reg, fixed("vk-one"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// the key is in order, only the team label changed
+	p.Registered, p.Known = res.Hash, res.Fingerprint
+	p.RegisteredLabels = map[string]string{"openagentix.io/team": "a"}
+	p.EntryLabels = map[string]string{"openagentix.io/team": "b"}
+	creates := len(s.Matching("POST", "secrets"))
+	res2, err := Ensure(context.Background(), p, sec, reg, fixed("vk-two"))
+	if err != nil || res2.Outcome != Relabeled || res2.Hash != res.Hash {
+		t.Fatalf("%+v %v", res2, err)
+	}
+	if reg.labels["r"]["openagentix.io/team"] != "b" || reg.entries["r"] != res.Hash {
+		t.Fatalf("%v %v", reg.labels, reg.entries)
+	}
+	if len(s.Matching("POST", "secrets")) != creates || len(s.Matching("DELETE", "secrets")) != 0 {
+		t.Fatal("a label change must not touch the key Secret")
+	}
+	// unchanged labels: no request at all
+	p.RegisteredLabels = p.EntryLabels
+	calls := reg.calls
+	if res3, err := Ensure(context.Background(), p, sec, reg, fixed("vk-three")); err != nil || res3.Outcome != Unchanged || reg.calls != calls {
+		t.Fatalf("%+v %v calls %d->%d", res3, err, calls, reg.calls)
+	}
+}
+
+// An entry the previous controller registered under another user id (the plain name) is adopted only when the Secret is there.
+func TestAdoptedHashIsRegisteredUnderTheNewUserOnlyWhenTheSecretExists(t *testing.T) {
+	// the Secret exists (409): the legacy hash is its key's, so it is written under the new user and the Secret is kept
+	s, sec, reg := setup(t)
+	s.Seed(secrets, kubetest.Object{"apiVersion": "v1", "kind": "Secret", "metadata": kubetest.Object{"name": "r-virtual-key-0a1b2c3d", "namespace": "kagent"}})
+	p := params()
+	p.Registered, p.Adopted = "sha256:0123456789abcdef0123456789abcdef", true
+	res, err := Ensure(context.Background(), p, sec, reg, fixed("vk-never"))
+	if err != nil || res.Outcome != Exists || res.Hash != p.Registered {
+		t.Fatalf("%+v %v", res, err)
+	}
+	if reg.entries["r"] != p.Registered {
+		t.Fatalf("the adopted hash must be written under the new user: %v", reg.entries)
+	}
+	if len(s.Matching("DELETE", "secrets")) != 0 {
+		t.Fatal("the Secret must stay")
+	}
+	// no Secret (201): the legacy hash belongs to nothing that exists; a new key is made and registered
+	s2, sec2, reg2 := setup(t)
+	res, err = Ensure(context.Background(), p, sec2, reg2, fixed("vk-new"))
+	if err != nil || res.Outcome != Created || reg2.entries["r"] != Hash("vk-new") {
+		t.Fatalf("%+v %v %v", res, err, reg2.entries)
+	}
+	if len(s2.Matching("POST", "secrets")) != 1 {
+		t.Fatal("one Secret created")
+	}
+}

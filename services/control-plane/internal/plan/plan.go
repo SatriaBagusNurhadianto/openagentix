@@ -1,9 +1,12 @@
-// Package plan turns an accepted definition into a Plan: the platform-level facts an agent needs (final prompt, tool
-// server and tools, skills with digests, egress, memory), with no upstream vocabulary. Runtime adapters translate a Plan
-// into their own objects. Validation happens before: Build assumes the definition passed package policy.
+// Package plan turns an accepted definition into a Plan: the platform-level facts an agent needs (final prompt, tools,
+// skills with digests, egress, memory), with no upstream vocabulary. Runtime adapters translate a Plan into their own
+// objects and derive their own names. Validation happens before: Build assumes the definition passed package policy.
 package plan
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"slices"
@@ -12,9 +15,6 @@ import (
 	"github.com/openagentix/openagentix/services/control-plane/internal/api"
 	"github.com/openagentix/openagentix/services/control-plane/internal/catalog"
 )
-
-// KeySecretKey is the data key of the virtual-key Secret; the chart's agent Secrets use the same one.
-const KeySecretKey = "OPENAI_API_KEY"
 
 var hex8 = regexp.MustCompile(`^[0-9a-f]{8}`)
 
@@ -32,49 +32,67 @@ func KeySecretName(name, uid string) (string, error) {
 type Skill struct{ Name, Ref string }
 
 type Memory struct {
-	TTLDays     int // 0: the runtime's default
-	ModelConfig string
-	Namespace   string
+	TTLDays int // 0: the runtime's default
 }
 
+// Plan is the platform-level description of one agent. It names no upstream object: each adapter derives the names of its
+// own objects from Name and Namespace, and the tools adapter's reference to what serves a profile is opaque (ToolBackend).
 type Plan struct {
-	Name            string
-	Namespace       string
-	Description     string
-	Model           string
-	GatewayBaseURL  string
-	GatewayUserID   string
-	ModelConfigName string
-	KeySecret       string
-	KeySecretKey    string
+	Name           string
+	Namespace      string // the definition's namespace
+	Description    string
+	Model          string
+	GatewayBaseURL string
+	// GatewayUserID is opaque to everyone but the gateway adapter: "<namespace>.<name>" today (ADR 0012, change 1).
+	GatewayUserID string
+	KeySecret     string
 	// KeyFingerprint is a non-secret fingerprint of the registered key hash. A runtime adapter puts it on the objects that
 	// must be recreated when the key is replaced. Empty until the key step has run.
 	KeyFingerprint string
 	Prompt         string
-	ToolServer     string // "" when the agent has no tools
+	ToolBackend    string // "" when the agent has no tools; opaque, resolved by the tools adapter from the profile
 	Tools          []string
 	Skills         []Skill
 	Egress         []string
 	Memory         *Memory
-	HarnessEnv     []catalog.EnvVar
+	// Suspended: the agent stays but takes no new work (spec.suspend, or the operator's policy suspendAll).
+	Suspended bool
+	// Labels holds the reserved labels team and project, copied from the definition (informational only).
+	Labels map[string]string
+	// Revision is a stable hash of what was applied (see Revision).
+	Revision string
 }
 
+// GatewayUser is the opaque gateway user id of a definition: "<namespace>.<name>". A dot cannot occur in a namespace or
+// in a name, so two definitions never share one, and the id never equals a chart agent's (a plain name).
+func GatewayUser(namespace, name string) string { return namespace + "." + name }
+
 // Build composes the plan. The prompt follows the chart: with no addition the instructions pass through unchanged,
-// otherwise each part is trimmed and joined by a newline, in the order knowledge, notify, memory.
-func Build(d *api.AgentDefinition, c *catalog.Catalog, tr catalog.ToolResolver) (Plan, error) {
+// otherwise each part is trimmed and joined by a newline, in the order knowledge, notify, memory. pol may be nil.
+func Build(d *api.AgentDefinition, c *catalog.Catalog, tr catalog.ToolResolver, pol *catalog.Policy) (Plan, error) {
 	s := d.Spec
+	if d.Metadata.Namespace == "" {
+		return Plan{}, fmt.Errorf("definition %s has no namespace", d.Metadata.Name)
+	}
 	secret, err := KeySecretName(d.Metadata.Name, d.Metadata.UID)
 	if err != nil {
 		return Plan{}, err
 	}
 	p := Plan{
-		Name: d.Metadata.Name, Namespace: c.Namespaces.Agents, Description: s.Description, Model: s.Model,
-		GatewayBaseURL: c.GatewayBaseURL, GatewayUserID: d.Metadata.Name,
-		ModelConfigName: "gateway-" + d.Metadata.Name,
-		KeySecret:       secret, KeySecretKey: KeySecretKey,
-		Prompt:     s.Instructions,
-		Egress:     slices.Clone(s.Egress.Allow),
-		HarnessEnv: slices.Clone(c.HarnessEnv),
+		Name: d.Metadata.Name, Namespace: d.Metadata.Namespace, Description: s.Description, Model: s.Model,
+		GatewayBaseURL: c.GatewayBaseURL, GatewayUserID: GatewayUser(d.Metadata.Namespace, d.Metadata.Name),
+		KeySecret: secret,
+		Prompt:    s.Instructions,
+		Egress:    slices.Clone(s.Egress.Allow),
+		Suspended: s.Suspend || (pol != nil && pol.SuspendAll),
+	}
+	for _, k := range []string{api.LabelTeam, api.LabelProject} {
+		if v, ok := d.Metadata.Labels[k]; ok && v != "" {
+			if p.Labels == nil {
+				p.Labels = map[string]string{}
+			}
+			p.Labels[k] = v
+		}
 	}
 	add := func(extra string) { p.Prompt = strings.TrimSpace(p.Prompt) + "\n" + strings.TrimSpace(extra) }
 	tools := slices.Clone(s.Tools)
@@ -85,17 +103,17 @@ func Build(d *api.AgentDefinition, c *catalog.Catalog, tr catalog.ToolResolver) 
 			}
 		}
 	}
-	if s.Knowledge {
+	if s.Knowledge.Enabled {
 		add(c.Knowledge.Prompt)
 		extend(c.Knowledge.Tools)
 	}
-	if s.Notify {
+	if s.Notify.Enabled {
 		add(c.Notify.Prompt)
 		extend(c.Notify.Tools)
 	}
 	if s.Memory.Enabled {
 		add(c.Memory.Prompt)
-		p.Memory = &Memory{TTLDays: s.Memory.TTLDays, ModelConfig: c.Memory.ModelConfig, Namespace: c.Namespaces.Agents}
+		p.Memory = &Memory{TTLDays: s.Memory.TTLDays}
 	}
 	p.Tools = tools
 	if len(tools) > 0 {
@@ -106,12 +124,64 @@ func Build(d *api.AgentDefinition, c *catalog.Catalog, tr catalog.ToolResolver) 
 		if !ok {
 			return Plan{}, fmt.Errorf("definition %s names toolProfile %q, which the tools adapter does not know", d.Metadata.Name, s.ToolProfile)
 		}
-		p.ToolServer = prof.ToolServer
+		p.ToolBackend = prof.Backend
 	}
-	for _, n := range s.Skills {
-		p.Skills = append(p.Skills, Skill{Name: n, Ref: c.Skills[n]})
+	for _, sk := range s.Skills {
+		p.Skills = append(p.Skills, Skill{Name: sk.Name, Ref: c.Skills[sk.Name]})
 	}
+	p.Revision = revision(s, p, c.Memory.DefaultTTLDays)
 	return p, nil
+}
+
+// revision is the first 12 hex characters of the SHA-256 of a canonical encoding of what was applied: the final prompt,
+// the model, the tool profile and the effective tools, the skills with their digests, the knowledge, notify and memory
+// settings, and the egress. Lists are sets, so they are sorted; the encoding is JSON of a fixed struct, never of a map.
+// What it leaves out on purpose: description, labels, suspend, namespace and name (they are not behaviour), and the
+// runtime adapter's own settings (image, worker pool), which the plan does not see.
+func revision(s api.Spec, p Plan, defaultTTL int) string {
+	sorted := func(l []string) []string {
+		out := slices.Clone(l)
+		if out == nil {
+			out = []string{}
+		}
+		slices.Sort(out)
+		return out
+	}
+	type skill struct{ Name, Ref string }
+	in := struct {
+		V           int
+		Model       string
+		ToolProfile string
+		Prompt      string
+		Tools       []string
+		Skills      []skill
+		Knowledge   struct {
+			On          bool
+			Collections []string
+		}
+		Notify struct {
+			On           bool
+			Destinations []string
+		}
+		MemoryOn  bool
+		MemoryTTL int
+		Egress    []string
+	}{V: 1, Model: p.Model, ToolProfile: s.ToolProfile, Prompt: p.Prompt, Tools: sorted(p.Tools), Egress: sorted(p.Egress), Skills: []skill{}}
+	for _, sk := range p.Skills {
+		in.Skills = append(in.Skills, skill{sk.Name, sk.Ref})
+	}
+	slices.SortFunc(in.Skills, func(a, b skill) int { return strings.Compare(a.Name, b.Name) })
+	in.Knowledge.On, in.Knowledge.Collections = s.Knowledge.Enabled, sorted(s.Knowledge.Collections)
+	in.Notify.On, in.Notify.Destinations = s.Notify.Enabled, sorted(s.Notify.Destinations)
+	if s.Memory.Enabled {
+		in.MemoryOn, in.MemoryTTL = true, s.Memory.TTLDays
+		if in.MemoryTTL == 0 {
+			in.MemoryTTL = defaultTTL
+		}
+	}
+	b, _ := json.Marshal(in)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])[:12]
 }
 
 // Readiness is what a runtime reports about a running agent.

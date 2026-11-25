@@ -405,8 +405,8 @@ reach a vMCP or an unauthenticated backend proxy around the profile. */}}
 {{- end -}}
 
 {{/* The platform catalog the controller reads (services/control-plane/README.md, "The catalog"), as pretty JSON. It is derived from the
-SAME values and helpers that render the chart agents (kagent.yaml), so the two cannot drift. It holds no secret: names, URLs, tool names,
-prompts and digest-pinned skill references only. Fails the render for a skill that is not digest-pinned (the controller refuses the file). */}}
+SAME values and helpers that render the chart agents (kagent.yaml), so the two cannot drift. What only one adapter needs is in that
+adapter's own section (runtime.kagent, tools.toolhive). It holds no secret: names, URLs, tool names, prompts and digest-pinned skill references only. Fails the render for a skill that is not digest-pinned (the controller refuses the file). */}}
 {{- define "oa.cpCatalog" -}}
 {{- $k := .Values.kagent -}}
 {{- $models := list -}}{{- range .Values.gateway.models }}{{ $models = append $models .name }}{{ end -}}
@@ -423,7 +423,7 @@ prompts and digest-pinned skill references only. Fails the render for a skill th
 {{- $ntOn := and .Values.notify.enabled .Values.mcp.enabled -}}
 {{- $notify := dict "available" false "tools" (list) "prompt" "" -}}
 {{- if $ntOn }}{{ $notify = dict "available" true "tools" (include "oa.notifyTools" . | fromJsonArray) "prompt" (include "oa.notifyAgentPrompt" . | trim) }}{{ end -}}
-{{- $memory := dict "available" (eq (include "oa.memoryEnabled" .) "true") "expiryEnabled" (ternary true false (and .Values.memory.expiry.enabled $k.enabled)) "defaultTtlDays" (int .Values.controlPlane.memoryDefaultTtlDays) "modelConfig" .Values.memory.modelConfig.name "prompt" (trim .Values.memory.agentPrompt) -}}
+{{- $memory := dict "available" (eq (include "oa.memoryEnabled" .) "true") "expiryEnabled" (ternary true false (and .Values.memory.expiry.enabled $k.enabled)) "defaultTtlDays" (int .Values.controlPlane.memoryDefaultTtlDays) "prompt" (trim .Values.memory.agentPrompt) -}}
 {{- $skills := dict -}}
 {{- range $n, $s := (.Values.skills | default dict) -}}
 {{- if not (regexMatch "@sha256:[0-9a-f]{64}$" (toString $s.oci)) }}{{ fail (printf "skill %q must be a digest-pinned OCI ref (...@sha256:<64 hex>), got %q: the control plane catalog lists every skill" $n (toString $s.oci)) }}{{ end -}}
@@ -435,9 +435,11 @@ prompts and digest-pinned skill references only. Fails the render for a skill th
 {{- if include "oa.a2aGateOn" . }}{{ $gate = include "oa.a2aGateUrl" . }}{{ end -}}
 {{- $reserved := list -}}
 {{- range .Values.agents }}{{ $reserved = append $reserved .name }}{{ end -}}
-{{- /* Names a definition may not take, because its objects would collide with chart objects. The gateway user ids the installer registers
-(ModelConfig annotation openagentix.io/agent: every agent and "memory"; Deployment annotations openagentix.io/gateway-user*: "kb" and "kb-extract")
-are covered by the agents and the three platform names; tests/run.sh derives the users from the render and fails if one is missing. */ -}}
+{{- /* Names a definition may not take IN THE AGENTS NAMESPACE (the controller applies this list to namespaces.agents only), because its objects would
+collide with chart objects. A definition's gateway user is "<namespace>.<name>", which can never equal a chart user (a plain name), so the gateway users
+are no longer a reason; the list still covers every user the installer registers (ModelConfig annotation openagentix.io/agent: every agent and "memory";
+Deployment annotations openagentix.io/gateway-user*: "kb" and "kb-extract"), because those names belong to the platform's services; tests/run.sh derives
+the users from the render and fails if one is missing. */ -}}
 {{- $reserved = concat $reserved (list "kb" "kb-extract" "memory") -}}
 {{- /* the base name of every virtualKeySecret override (<base>-virtual-key; a name without that ending counts whole), memory's key included */ -}}
 {{- range .Values.agents }}{{ if .virtualKeySecret }}{{ $reserved = append $reserved (trimSuffix "-virtual-key" (toString .virtualKeySecret)) }}{{ end }}{{ end -}}
@@ -451,16 +453,12 @@ are covered by the agents and the three platform names; tests/run.sh derives the
     "namespaces" (dict "agents" $k.namespace "gateway" .Values.gateway.namespace "tools" .Values.mcp.namespace)
     "gatewayBaseUrl" (include "oa.gatewayBaseUrl" .)
     "models" $models
-    "toolServer" $k.remoteMCPServer.name
-    "profiles" $profiles
+    "runtime" (dict "kagent" (dict "harnessImage" $k.harnessImage "workerPool" $k.workerPool "snapshotLocation" $k.snapshotLocation "harnessEnv" $env "memoryModelConfig" .Values.memory.modelConfig.name))
+    "tools" (dict "toolhive" (dict "codeModeTool" "execute_tool_script" "profiles" $profiles))
     "knowledge" $knowledge
     "notify" $notify
     "memory" $memory
     "skills" $skills
-    "harnessImage" $k.harnessImage
-    "workerPool" $k.workerPool
-    "snapshotLocation" $k.snapshotLocation
-    "harnessEnv" $env
     "gateUrl" $gate
     "reservedNames" $reserved -}}
 {{- $cat | toPrettyJson -}}
@@ -480,8 +478,9 @@ are covered by the agents and the three platform names; tests/run.sh derives the
     "allowNotify" $p.allowNotify
     "allowedSkills" ($p.allowedSkills | default list)
     "memory" (dict "allowed" $m.allowed "maxTtlDays" (int $m.maxTtlDays) "requireExpiry" $m.requireExpiry)
-    "egress" (dict "allowedOrigins" ($e.allowedOrigins | default list))
+    "egress" (dict "allowedOrigins" ($e.allowedOrigins | default list) "inClusterDestinations" ($e.inClusterDestinations | default list))
     "reservedNames" ($p.reservedNames | default list)
+    "suspendAll" (default false $p.suspendAll)
   | toPrettyJson -}}
 {{- end -}}
 
@@ -495,7 +494,7 @@ are covered by the agents and the three platform names; tests/run.sh derives the
 {{- if not .Values.gateway.enabled }}{{ fail "controlPlane.enabled needs gateway.enabled=true (every built agent gets a key at the model gateway)" }}{{ end -}}
 {{- if not .Values.gateway.models }}{{ fail "controlPlane.enabled needs at least one entry in gateway.models: the catalog would have no model to offer" }}{{ end -}}
 {{- if eq .Values.kagent.namespace .Values.gateway.namespace }}{{ fail "controlPlane.enabled needs kagent.namespace and gateway.namespace to differ: the controller's Roles are one per namespace" }}{{ end -}}
-{{- range $f := list "requireToolProfile" "allowKnowledge" "allowNotify" }}
+{{- range $f := list "requireToolProfile" "allowKnowledge" "allowNotify" "suspendAll" }}
 {{- if not (kindIs "bool" (get $p $f)) }}{{ fail (printf "controlPlane.policy.%s must be true or false" $f) }}{{ end }}
 {{- end }}
 {{- if not (kindIs "bool" $m.allowed) }}{{ fail "controlPlane.policy.memory.allowed must be true or false" }}{{ end }}
@@ -519,6 +518,16 @@ are covered by the agents and the three platform names; tests/run.sh derives the
 {{- $o := $e.allowedOrigins | default list -}}
 {{- if not (kindIs "slice" $o) }}{{ fail "controlPlane.policy.egress.allowedOrigins must be a list of origins (an empty list allows no egress)" }}{{ end -}}
 {{- $_ := include "oa.agentEgress" (dict "root" . "agent" (dict "name" "controlPlane.policy.egress.allowedOrigins" "egress" (dict "allow" $o))) -}}
+{{- $ic := $e.inClusterDestinations | default list -}}
+{{- if not (kindIs "slice" $ic) }}{{ fail "controlPlane.policy.egress.inClusterDestinations must be a list of host:port (an empty list allows no in-cluster destination)" }}{{ end -}}
+{{- range $x := $ic }}
+{{- if not (and (kindIs "string" $x) (regexMatch "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)+:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$" $x)) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v must be host:port with a namespace-qualified service name (service.namespace.svc:5000) and a numeric port: no scheme, no wildcard, no address" $x) }}{{ end }}
+{{- $h := first (splitList ":" $x) }}
+{{- if regexMatch "^[0-9.]+$" $h }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is an address, not a service name" $x) }}{{ end }}
+{{- $tn := $.Values.mcp.namespace }}
+{{- if or (hasSuffix (printf ".%s" $tn) $h) (hasSuffix (printf ".%s.svc" $tn) $h) (hasSuffix (printf ".%s.svc.cluster.local" $tn) $h) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is inside the tools namespace %q: that would reach a tool server around its profile and can never be listed" $x $tn) }}{{ end }}
+{{- end }}
+{{- if ne (len $ic) (len (uniq $ic)) }}{{ fail "controlPlane.policy.egress.inClusterDestinations lists an entry twice" }}{{ end -}}
 {{- if and $p.allowNotify (not (and .Values.notify.enabled .Values.mcp.enabled)) }}{{ fail "controlPlane.policy.allowNotify needs notify.enabled=true and mcp.enabled=true: the catalog has no notify tools, so every definition asking for notify would be refused" }}{{ end -}}
 {{- if $m.allowed -}}
 {{- if not (include "oa.memoryEnabled" .) }}{{ fail "controlPlane.policy.memory.allowed needs the memory stack: it is installed only when a chart agent has memory.enabled (agents[].memory.enabled), see README Memory. Without it every definition asking for memory would be refused" }}{{ end -}}

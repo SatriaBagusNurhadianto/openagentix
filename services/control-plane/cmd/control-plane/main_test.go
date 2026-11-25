@@ -79,7 +79,7 @@ func TestRunServesHealthReconcilesAndStopsOnCancel(t *testing.T) {
 		}
 	}
 	cm, _ := srv.Get("configmaps", "agentgateway-system", "llm-api-keys-control-plane")
-	if e, _ := cm["data"].(map[string]any)["researcher"].(string); !strings.HasPrefix(e, `{"keyHash":"sha256:`) {
+	if e, _ := cm["data"].(map[string]any)["kagent.researcher"].(string); !strings.HasPrefix(e, `{"keyHash":"sha256:`) {
 		t.Fatalf("gateway entry %v", cm["data"])
 	}
 	cancel()
@@ -118,6 +118,8 @@ func TestRunRefusesBadSetup(t *testing.T) {
 	badCat := filepath.Join(dir, "cat.json")
 	b, _ := os.ReadFile("../../testdata/catalog.json")
 	_ = os.WriteFile(badCat, []byte(strings.Replace(string(b), `"runtime": "kagent"`, `"runtime": "ax"`, 1)), 0o600)
+	badPol := filepath.Join(dir, "pol.json")
+	_ = os.WriteFile(badPol, []byte(`{"maxAgents": 1, "egress": {"inClusterDestinations": ["vmcp.mcp-tools.svc:4483"]}}`), 0o600)
 	for name, tc := range map[string]struct {
 		env  map[string]string
 		want string
@@ -125,6 +127,7 @@ func TestRunRefusesBadSetup(t *testing.T) {
 		"no files":            {map[string]string{}, "CONTROL_PLANE_CATALOG_FILE"},
 		"missing catalog":     {map[string]string{"CONTROL_PLANE_CATALOG_FILE": filepath.Join(dir, "none.json"), "CONTROL_PLANE_POLICY_FILE": "../../testdata/policy.json"}, "catalog"},
 		"unsupported runtime": {map[string]string{"CONTROL_PLANE_CATALOG_FILE": badCat, "CONTROL_PLANE_POLICY_FILE": "../../testdata/policy.json"}, `adapter "ax"`},
+		"an in-cluster destination in the tools namespace": {map[string]string{"CONTROL_PLANE_CATALOG_FILE": "../../testdata/catalog.json", "CONTROL_PLANE_POLICY_FILE": badPol}, "tools namespace"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := run(context.Background(), getenv(tc.env), deps{Log: slog.New(slog.NewJSONHandler(io.Discard, nil)), Kube: kube.New("http://127.0.0.1:1", http.DefaultClient, func() (string, error) { return "", nil })})

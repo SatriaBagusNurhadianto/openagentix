@@ -1,5 +1,5 @@
-// Package api holds the AgentDefinition types of openagentix.io/v1alpha1 exactly as ADR 0007 defines them. It has no
-// upstream vocabulary: nothing here names kagent, agentgateway or ToolHive.
+// Package api holds the AgentDefinition types of openagentix.io/v1alpha1 as ADR 0007 defines them, with the changes of
+// ADR 0012. It has no upstream vocabulary: nothing here names a runtime, a gateway or a tool server product.
 package api
 
 import (
@@ -21,6 +21,16 @@ const (
 	ManagedByValue  = "openagentix-control-plane"
 	LabelDefinition = "openagentix.io/agent-definition"
 
+	// Reserved label keys (ADR 0012, change 12). They are informational: anyone who can write the object can set them, so
+	// no access, policy or billing decision may ever read them. The controller copies team and project onto the objects it
+	// creates and into the gateway key entry's metadata, so that cost metrics can carry them later.
+	LabelTeam     = "openagentix.io/team"
+	LabelProject  = "openagentix.io/project"
+	LabelWorkItem = "openagentix.io/work-item"
+
+	// Endpoint protocol names.
+	ProtocolA2A = "a2a"
+
 	CondAccepted = "Accepted"
 	CondKeyReady = "KeyReady"
 	CondApplied  = "Applied"
@@ -35,14 +45,16 @@ var ConditionTypes = []string{CondAccepted, CondKeyReady, CondApplied, CondReady
 
 // ObjectMeta is the part of metadata the controller reads.
 type ObjectMeta struct {
-	Name              string   `json:"name"`
-	Namespace         string   `json:"namespace,omitempty"`
-	UID               string   `json:"uid,omitempty"`
-	Generation        int64    `json:"generation,omitempty"`
-	ResourceVersion   string   `json:"resourceVersion,omitempty"`
-	CreationTimestamp string   `json:"creationTimestamp,omitempty"`
-	DeletionTimestamp string   `json:"deletionTimestamp,omitempty"`
-	Finalizers        []string `json:"finalizers,omitempty"`
+	Name            string `json:"name"`
+	Namespace       string `json:"namespace,omitempty"`
+	UID             string `json:"uid,omitempty"`
+	Generation      int64  `json:"generation,omitempty"`
+	ResourceVersion string `json:"resourceVersion,omitempty"`
+	// Labels: only the reserved keys (LabelTeam, LabelProject) are ever read, and never for an access decision.
+	Labels            map[string]string `json:"labels,omitempty"`
+	CreationTimestamp string            `json:"creationTimestamp,omitempty"`
+	DeletionTimestamp string            `json:"deletionTimestamp,omitempty"`
+	Finalizers        []string          `json:"finalizers,omitempty"`
 }
 
 type Memory struct {
@@ -54,19 +66,54 @@ type Egress struct {
 	Allow []string `json:"allow,omitempty"`
 }
 
+// Knowledge is the knowledge-base feature. Collections is reserved: selecting collections is not available yet and a
+// definition that lists some is refused.
+type Knowledge struct {
+	Enabled     bool     `json:"enabled"`
+	Collections []string `json:"collections,omitempty"`
+}
+
+// Notify is the delivery feature. Destinations is reserved: selecting destinations is not available yet and a definition
+// that lists some is refused.
+type Notify struct {
+	Enabled      bool     `json:"enabled"`
+	Destinations []string `json:"destinations,omitempty"`
+}
+
+// Skill names a skill of the platform catalog. Version, when set, must be one the catalog offers.
+type Skill struct {
+	Name    string `json:"name"`
+	Version string `json:"version,omitempty"`
+}
+
+// ConfigMapKeyRef points at one key of a ConfigMap in the definition's namespace.
+type ConfigMapKeyRef struct {
+	Name string `json:"name"`
+	Key  string `json:"key"`
+}
+
+// InstructionsFrom is reserved: the field is in the schema so that its name and shape are fixed, but this release refuses
+// a definition that sets it ("not available yet").
+type InstructionsFrom struct {
+	ConfigMap *ConfigMapKeyRef `json:"configMap,omitempty"`
+}
+
 // Spec is the whole builder surface. There is deliberately no field for a model config, image, tool server, egress
 // policy reference, namespace, caller, gateway user or budget.
 type Spec struct {
-	Description  string   `json:"description,omitempty"`
-	Model        string   `json:"model"`
-	Instructions string   `json:"instructions"`
-	ToolProfile  string   `json:"toolProfile,omitempty"`
-	Tools        []string `json:"tools,omitempty"`
-	Knowledge    bool     `json:"knowledge,omitempty"`
-	Notify       bool     `json:"notify,omitempty"`
-	Memory       Memory   `json:"memory,omitempty"`
-	Skills       []string `json:"skills,omitempty"`
-	Egress       Egress   `json:"egress,omitempty"`
+	Description      string            `json:"description,omitempty"`
+	Model            string            `json:"model"`
+	Instructions     string            `json:"instructions,omitempty"`
+	InstructionsFrom *InstructionsFrom `json:"instructionsFrom,omitempty"`
+	ToolProfile      string            `json:"toolProfile,omitempty"`
+	Tools            []string          `json:"tools,omitempty"`
+	Knowledge        Knowledge         `json:"knowledge,omitzero"`
+	Notify           Notify            `json:"notify,omitzero"`
+	Memory           Memory            `json:"memory,omitzero"`
+	Skills           []Skill           `json:"skills,omitempty"`
+	Egress           Egress            `json:"egress,omitzero"`
+	// Suspend keeps the definition accepted and its objects in place, but the agent takes no new work.
+	Suspend bool `json:"suspend,omitempty"`
 }
 
 type Condition struct {
@@ -85,23 +132,62 @@ type ObjectRef struct {
 	Name       string `json:"name"`
 }
 
-type Status struct {
-	ObservedGeneration int64       `json:"observedGeneration"`
-	Conditions         []Condition `json:"conditions"`
-	AgentRef           *ObjectRef  `json:"agentRef,omitempty"`
-	GatewayUserID      string      `json:"gatewayUserId"`
-	ToolServer         string      `json:"toolServer"`
-	EffectiveTools     []string    `json:"effectiveTools"`
-	EffectiveEgress    []string    `json:"effectiveEgress"`
-	A2AURL             string      `json:"a2aUrl"`
-	Violations         []string    `json:"violations"`
+// Tri is a three-valued fact an adapter reports about its runtime.
+type Tri string
 
-	// What the controller itself needs to remember between passes; none of it is secret.
+const (
+	Yes     Tri = "yes"
+	No      Tri = "no"
+	Unknown Tri = "unknown"
+)
+
+// Capabilities is what the runtime adapter reports about the runtime (ADR 0012, "Runtime contract"). A value the adapter
+// could not verify is "unknown" (MaxStepSeconds 0), never a guess.
+type Capabilities struct {
+	Approvals            Tri    `json:"approvals"`            // a tool call can wait for a person's decision
+	DurableWaits         Tri    `json:"durableWaits"`         // a wait for input survives a restart of the runtime's workload
+	WorkspacePersistence string `json:"workspacePersistence"` // none, snapshot, volume or unknown: what keeps files across a wait
+	MaxStepSeconds       int    `json:"maxStepSeconds"`       // the longest single step (a shell command); 0 is unknown
+	CancelStopsLoop      Tri    `json:"cancelStopsLoop"`      // a cancel really stops the agent's loop
+	PerRunIdentity       string `json:"perRunIdentity"`       // none, session, run or unknown: the granularity of the agent's identity
+}
+
+// Endpoint says where the agent is callable. Protocol and version are data, so that a second protocol needs no new field.
+type Endpoint struct {
+	Protocol        string `json:"protocol"`
+	URL             string `json:"url"`
+	ProtocolVersion string `json:"protocolVersion"`
+}
+
+// ControllerState is what the controller itself needs to remember between passes. It lives under status.controller, is
+// not part of the contract and may change without notice. None of it is secret.
+type ControllerState struct {
 	KeySecret         string `json:"keySecret"`         // name of the key Secret in use
 	KeyFingerprint    string `json:"keyFingerprint"`    // head of the registered key's hash (keys.Fingerprint)
 	AppliedGeneration int64  `json:"appliedGeneration"` // generation of the spec whose objects exist (0: none)
 	AppliedSpec       string `json:"appliedSpec"`       // that spec as JSON; a string so a merge patch replaces it whole
+	GatewayUserID     string `json:"gatewayUserId"`     // opaque: "<namespace>.<name>" today
+	ToolServer        string `json:"toolServer"`        // the tool backend the profile resolved to
 }
+
+// Status is the status contract (ADR 0012, change 5): the public fields below are what products may read; everything
+// else is under Controller.
+type Status struct {
+	ObservedGeneration int64         `json:"observedGeneration"`
+	Conditions         []Condition   `json:"conditions"`
+	Endpoint           *Endpoint     `json:"endpoint,omitempty"`
+	Revision           string        `json:"revision"`
+	EffectiveTools     []string      `json:"effectiveTools"`
+	EffectiveEgress    []string      `json:"effectiveEgress"`
+	Violations         []string      `json:"violations"`
+	Capabilities       *Capabilities `json:"capabilities,omitempty"`
+	AgentRef           *ObjectRef    `json:"agentRef,omitempty"`
+
+	Controller ControllerState `json:"controller"`
+}
+
+// PublicStatusFields lists the status fields that are part of the contract, besides status.controller.
+var PublicStatusFields = []string{"conditions", "observedGeneration", "endpoint", "revision", "effectiveTools", "effectiveEgress", "violations", "capabilities", "agentRef"}
 
 type AgentDefinition struct {
 	APIVersion string     `json:"apiVersion"`
@@ -188,8 +274,10 @@ func (s Status) Patch() map[string]any {
 	b, _ := json.Marshal(s)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
-	if s.AgentRef == nil {
-		m["agentRef"] = nil // merge patch: null removes the field
+	for _, k := range []string{"endpoint", "agentRef", "capabilities"} {
+		if _, ok := m[k]; !ok {
+			m[k] = nil // merge patch: null removes the field
+		}
 	}
 	return map[string]any{"status": m}
 }

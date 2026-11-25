@@ -526,7 +526,11 @@ controlPlane:
       requireExpiry: true             # refuse memory while the expiry job is off (the time limit would not be enforced)
     egress:
       allowedOrigins: []              # https://host[:port]; a leading "*." stands for exactly one label. Empty: no egress
-    reservedNames: []                 # more names a definition may not use (the chart agents and kb, kb-extract, memory are always reserved)
+      # In-cluster destinations (exact host:port, a namespace-qualified service such as registry.ci.svc:5000) that a definition's egress may
+      # name. Every other in-cluster destination stays refused. Empty: none. Never a destination inside the tools namespace (mcp.namespace).
+      inClusterDestinations: []
+    reservedNames: []                 # more names a definition may not use: "name" in every namespace, "namespace/name" in one (the chart agents and kb, kb-extract, memory are always reserved in the agents namespace)
+    suspendAll: false                 # the operator's stop switch: every definition is treated as suspended (its agent object is removed, nothing else), see the README
 
 # ---- Long-term memory (kagent memory + pgvector + local embedding model) ---------------------------------
 # Shared pieces for agents that opt in with `agents[].memory.enabled: true`. Rendered only when at least one agent

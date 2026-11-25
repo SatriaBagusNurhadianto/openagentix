@@ -65,6 +65,9 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 	if err != nil {
 		return fmt.Errorf("policy: %w", err)
 	}
+	if err := catalog.CheckPolicy(cat, pol); err != nil {
+		return fmt.Errorf("policy: %w", err)
+	}
 	for _, a := range []struct{ kind, got, want string }{
 		{"runtime", cat.Adapters.Runtime, "kagent"},
 		{"modelGateway", cat.Adapters.ModelGateway, "agentgateway"},

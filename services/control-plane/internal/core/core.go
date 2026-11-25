@@ -31,18 +31,26 @@ type Runtime interface {
 	Name() string
 	// OwnedKinds lists the endpoints the core lists by label to prune what is no longer wanted.
 	OwnedKinds() []kube.Resource
+	// KeyDataKey is the data key under which the key Secret holds the key (the runtime reads it from there).
+	KeyDataKey() string
+	// Desired returns the objects of a plan. A suspended plan omits what makes the agent take work (it has no suspend
+	// switch of its own to set, see the adapter).
 	Desired(p plan.Plan) ([]kube.Manifest, error)
 	Ref(p plan.Plan) api.ObjectRef
-	CallEndpoint(p plan.Plan) string
+	// Endpoint says where the agent is callable; nil when the platform advertises no route.
+	Endpoint(p plan.Plan) *api.Endpoint
+	// Readiness reports on the running agent with one of the documented Ready reasons (api.ReasonsFor).
 	Readiness(ctx context.Context, p plan.Plan) (plan.Readiness, error)
+	// Capabilities is what the runtime can do; "unknown" where the adapter could not verify.
+	Capabilities() api.Capabilities
 }
 
 // ModelGateway registers the hash of an agent's key under a gateway user.
 type ModelGateway interface {
 	Name() string
 	keys.Registry
-	// Entries returns the hash registered for every user ("" for an entry that is present but unusable).
-	Entries(ctx context.Context) (map[string]string, error)
+	// Entries returns what is registered for every user (an empty hash for an entry that is present but unusable).
+	Entries(ctx context.Context) (map[string]keys.Entry, error)
 	Unregister(ctx context.Context, user string) error
 }
 
@@ -69,7 +77,7 @@ const (
 )
 
 type Config struct {
-	Namespace string // the only namespace reconciled
+	Namespace string // the namespace listed and watched; every rule and every object name is scoped to the definition's own
 	Catalog   *catalog.Catalog
 	Policy    *catalog.Policy
 	Kube      Kube
@@ -109,7 +117,7 @@ type failure struct {
 // passState is what one pass reads once: the gateway's key entries.
 type passState struct {
 	loaded  bool
-	entries map[string]string
+	entries map[string]keys.Entry
 	err     error
 }
 
@@ -285,9 +293,12 @@ func (c *Controller) relevant(e kube.Event) bool {
 	g, _ := m["generation"].(float64)
 	c.smu.Lock()
 	defer c.smu.Unlock()
-	old, ok := c.seen[m.String("name")]
+	old, ok := c.seen[defKey(m.String("namespace"), m.String("name"))]
 	return !ok || old != int64(g)
 }
+
+// defKey identifies a definition in the controller's own maps: names are only unique within a namespace.
+func defKey(ns, name string) string { return ns + "/" + name }
 
 // ---- per-definition retry ----
 
@@ -373,14 +384,16 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 	if err != nil {
 		return "", err
 	}
-	live := map[string]bool{}
+	live := map[string]bool{}  // by defKey
+	users := map[string]bool{} // gateway user ids of every listed definition
 	seen := map[string]int64{}
 	var items []item
 	for _, raw := range raws {
-		name := kube.Meta(raw).String("name")
-		live[name] = true
+		name, ns := kube.Meta(raw).String("name"), kube.Meta(raw).String("namespace")
+		live[defKey(ns, name)] = true
+		users[plan.GatewayUser(ns, name)] = true
 		g, _ := kube.Meta(raw)["generation"].(float64)
-		seen[name] = int64(g)
+		seen[defKey(ns, name)] = int64(g)
 		d, err := api.FromObject(raw)
 		if err != nil {
 			c.cfg.Log.Warn("skipping an object that is not a valid AgentDefinition", "outcome", "undecodable", "agent", name, "err", err)
@@ -400,6 +413,9 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 		if x := strings.Compare(a.d.Metadata.CreationTimestamp, b.d.Metadata.CreationTimestamp); x != 0 {
 			return x
 		}
+		if x := strings.Compare(a.d.Metadata.Namespace, b.d.Metadata.Namespace); x != 0 {
+			return x
+		}
 		return strings.Compare(a.d.Metadata.Name, b.d.Metadata.Name)
 	})
 	c.smu.Lock()
@@ -417,25 +433,27 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 	c.smu.Unlock()
 
 	var errs []error
-	var earlier []string // the definitions accepted so far in this pass: they count against maxAgents
+	// the definitions accepted so far in this pass, by namespace: they count against maxAgents, which is per namespace
+	earlier := map[string][]string{}
 	for _, it := range items {
 		d := it.d
-		if honourBackoff && c.backingOff(d.Metadata.Name, d.Metadata.Generation) {
+		ns, key := d.Metadata.Namespace, defKey(d.Metadata.Namespace, d.Metadata.Name)
+		if honourBackoff && c.backingOff(key, d.Metadata.Generation) {
 			if it.wasAccepted && !d.Deleting() {
-				earlier = append(earlier, d.Metadata.Name)
+				earlier[ns] = append(earlier[ns], d.Metadata.Name)
 			}
 			continue
 		}
-		accepted, err := c.safeOne(ctx, it.raw, d, earlier)
+		accepted, err := c.safeOne(ctx, it.raw, d, earlier[ns])
 		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", d.Metadata.Name, err))
-			c.noteFailure(d.Metadata.Name, d.Metadata.Generation, true)
+			errs = append(errs, fmt.Errorf("%s: %w", key, err))
+			c.noteFailure(key, d.Metadata.Generation, true)
 		}
 		if accepted {
-			earlier = append(earlier, d.Metadata.Name)
+			earlier[ns] = append(earlier[ns], d.Metadata.Name)
 		}
 	}
-	if err := c.sweep(ctx, live); err != nil {
+	if err := c.sweep(ctx, users); err != nil {
 		c.cfg.Log.Warn("gateway sweep failed", "outcome", "sweep_failed", "err", err)
 	}
 	return rv, errors.Join(errs...)
@@ -453,7 +471,7 @@ func (c *Controller) safeOne(ctx context.Context, raw kube.Object, d *api.AgentD
 }
 
 // gatewayEntries reads the gateway's key entries once per pass.
-func (c *Controller) gatewayEntries(ctx context.Context) (map[string]string, error) {
+func (c *Controller) gatewayEntries(ctx context.Context) (map[string]keys.Entry, error) {
 	if !c.ps.loaded {
 		c.ps.entries, c.ps.err = c.cfg.Gateway.Entries(ctx)
 		c.ps.loaded = true
@@ -461,9 +479,10 @@ func (c *Controller) gatewayEntries(ctx context.Context) (map[string]string, err
 	return c.ps.entries, c.ps.err
 }
 
-// sweep removes the entries of the key ConfigMap that belong to no listed definition. live holds every name the list
-// returned (decodable or not, deleting or not), so a definition created in this pass is never swept; the list was
-// complete, or reconcile would have returned before.
+// sweep removes the entries of the key ConfigMap that belong to no listed definition. live holds the gateway user id
+// (<namespace>.<name>) of every definition the list returned (decodable or not, deleting or not), so a definition created
+// in this pass is never swept; the list was complete, or reconcile would have returned before. An entry of the previous
+// format (the plain name) is nobody's user and goes too.
 func (c *Controller) sweep(ctx context.Context, live map[string]bool) error {
 	entries, err := c.gatewayEntries(ctx)
 	if err != nil {
@@ -488,16 +507,16 @@ func selector(name string) string {
 	return api.LabelDefinition + "=" + name + "," + api.LabelManagedBy + "=" + api.ManagedByValue
 }
 
-func (c *Controller) logOutcome(name, outcome string, kv ...any) {
+func (c *Controller) logOutcome(ns, name, outcome string, kv ...any) {
 	c.smu.Lock()
-	changed := c.last[name] != outcome
-	c.last[name] = outcome
+	changed := c.last[defKey(ns, name)] != outcome
+	c.last[defKey(ns, name)] = outcome
 	c.smu.Unlock()
 	lvl := slog.LevelDebug
 	if changed {
 		lvl = slog.LevelInfo
 	}
-	c.cfg.Log.Log(context.Background(), lvl, "reconciled", append([]any{"agent", name, "outcome", outcome}, kv...)...)
+	c.cfg.Log.Log(context.Background(), lvl, "reconciled", append([]any{"agent", name, "namespace", ns, "outcome", outcome}, kv...)...)
 }
 
 // clip cuts s to n characters on a character boundary and drops invalid UTF-8.
@@ -529,17 +548,33 @@ type attempt struct {
 	ctx     context.Context
 	d       *api.AgentDefinition
 	name    string
+	ns      string
+	key     string // defKey(ns, name)
+	user    string // the gateway user id, <namespace>.<name>
 	gen     int64
 	now     string
 	st      api.Status
 	running bool // the last status says objects of this definition run
 }
 
+// setGen sets a condition. Every reason the code passes here is a literal of the documented table (api.reasons), checked by
+// a test that reads this file; a reason that comes from outside goes through setReadyFromRuntime.
 func (a *attempt) setGen(t, status, reason, msg string, g int64) {
 	a.st.SetCondition(api.Condition{Type: t, Status: status, Reason: clip(reason, maxReasonRunes), Message: clip(msg, maxMessageRunes)}, a.now, g)
 }
 
 func (a *attempt) set(t, status, reason, msg string) { a.setGen(t, status, reason, msg, a.gen) }
+
+// setReadyFromRuntime sets Ready=False from what the runtime adapter reported. The adapter is meant to use a documented
+// reason; one that is not is mapped to RuntimeNotReady with its own word in the message, so the table stays closed.
+func (a *attempt) setReadyFromRuntime(rd plan.Readiness, g int64) {
+	reason, msg := rd.Reason, rd.Message
+	if !api.ValidReason(api.CondReady, reason) || reason == "Ready" {
+		msg = strings.TrimSuffix(reason+": "+msg, ": ")
+		reason = "RuntimeNotReady"
+	}
+	a.setGen(api.CondReady, "False", reason, msg, g)
+}
 
 func (a *attempt) unknownIfAbsent(t, reason string) {
 	if a.st.Condition(t).Type == "" {
@@ -548,18 +583,18 @@ func (a *attempt) unknownIfAbsent(t, reason string) {
 }
 
 func (a *attempt) finish(outcome string, r retry, kv ...any) error {
-	a.c.logOutcome(a.name, outcome, kv...)
+	a.c.logOutcome(a.ns, a.name, outcome, kv...)
 	if err := a.c.patchStatus(a.ctx, a.d, a.st); err != nil {
-		a.c.noteFailure(a.name, a.gen, true)
+		a.c.noteFailure(a.key, a.gen, true)
 		return err
 	}
 	switch r {
 	case retryNone:
-		a.c.clearFailure(a.name)
+		a.c.clearFailure(a.key)
 	case retryFlat:
-		a.c.noteFailure(a.name, a.gen, false)
+		a.c.noteFailure(a.key, a.gen, false)
 	default:
-		a.c.noteFailure(a.name, a.gen, true)
+		a.c.noteFailure(a.key, a.gen, true)
 	}
 	return nil
 }
@@ -581,12 +616,12 @@ func (a *attempt) synced() {
 }
 
 func (c *Controller) one(ctx context.Context, raw kube.Object, d *api.AgentDefinition, earlier []string) (bool, error) {
-	name := d.Metadata.Name
+	name, ns := d.Metadata.Name, d.Metadata.Namespace
 	if d.Deleting() {
 		return false, c.finalize(ctx, d)
 	}
 	if !d.HasFinalizer(api.FinalizerGatewayKey) {
-		updated, err := c.addFinalizer(ctx, raw, name)
+		updated, err := c.addFinalizer(ctx, raw, ns, name)
 		if err != nil {
 			return false, fmt.Errorf("add finalizer: %w", err)
 		}
@@ -594,9 +629,12 @@ func (c *Controller) one(ctx context.Context, raw kube.Object, d *api.AgentDefin
 			d = nd
 		}
 	}
-	a := &attempt{c: c, ctx: ctx, d: d, name: name, gen: d.Metadata.Generation, now: c.cfg.Now().UTC().Format(time.RFC3339), st: cloneStatus(d.Status)}
+	a := &attempt{c: c, ctx: ctx, d: d, name: name, ns: ns, key: defKey(ns, name), user: plan.GatewayUser(ns, name),
+		gen: d.Metadata.Generation, now: c.cfg.Now().UTC().Format(time.RFC3339), st: cloneStatus(d.Status)}
 	a.st.ObservedGeneration = a.gen
-	a.running = a.st.AppliedSpec != "" || a.st.Condition(api.CondApplied).Status == "True"
+	caps := c.cfg.Runtime.Capabilities()
+	a.st.Capabilities = &caps
+	a.running = a.st.Controller.AppliedSpec != "" || a.st.Condition(api.CondApplied).Status == "True"
 
 	// 1. accept or refuse
 	violations := policy.Validate(policy.Input{Def: d, Catalog: c.cfg.Catalog, Policy: c.cfg.Policy, Tools: c.cfg.Tools, Earlier: earlier})
@@ -608,28 +646,61 @@ func (c *Controller) one(ctx context.Context, raw kube.Object, d *api.AgentDefin
 	return true, a.apply()
 }
 
+// objectError says which object a write failed on.
+type objectError struct {
+	step, kind, name string
+	err              error
+}
+
+func (e *objectError) Error() string { return e.err.Error() }
+
+// writeObjects renders the plan, writes every object with server-side apply and prunes what the definition owns and no
+// longer wants. The plan carries the key fingerprint the objects must show.
+func (c *Controller) writeObjects(ctx context.Context, d *api.AgentDefinition, p plan.Plan, labels map[string]string, owner keys.OwnerRef) ([]string, *objectError) {
+	ms, err := c.cfg.Runtime.Desired(p)
+	if err != nil {
+		return nil, &objectError{step: "render", err: err}
+	}
+	for _, m := range ms {
+		stamp(m.Object, labels, owner)
+	}
+	keep := map[string]bool{}
+	var names []string
+	for _, m := range ms {
+		n := kube.Meta(m.Object).String("name")
+		if err := c.cfg.Kube.Apply(ctx, m.Resource, p.Namespace, n, m.Object); err != nil {
+			return names, &objectError{step: "apply", kind: m.Resource.Kind, name: n, err: err}
+		}
+		keep[m.Resource.Plural+"/"+n] = true
+		names = append(names, m.Resource.Kind+"/"+n)
+	}
+	if _, err := c.prune(ctx, d, keep); err != nil {
+		return names, &objectError{step: "prune", err: err}
+	}
+	return names, nil
+}
+
+func definitionLabels(name string, p plan.Plan) map[string]string {
+	l := map[string]string{api.LabelManagedBy: api.ManagedByValue, api.LabelDefinition: name}
+	for k, v := range p.Labels {
+		l[k] = v
+	}
+	return l
+}
+
 // apply is the accepted path: render, check names, key, apply, prune, report.
 func (a *attempt) apply() error {
 	c, ctx, d, name := a.c, a.ctx, a.d, a.name
-	p, err := plan.Build(d, c.cfg.Catalog, c.cfg.Tools)
+	p, err := plan.Build(d, c.cfg.Catalog, c.cfg.Tools, c.cfg.Policy)
 	if err != nil {
 		a.set(api.CondApplied, "False", "RenderFailed", err.Error())
 		a.set(api.CondReady, "False", "NotApplied", "")
 		return a.finish("render_failed", retryExp, "err", err)
 	}
 	owner := keys.OwnerRef{APIVersion: api.APIVersion, Kind: api.Kind, Name: name, UID: d.Metadata.UID}
-	labels := map[string]string{api.LabelManagedBy: api.ManagedByValue, api.LabelDefinition: name}
-	render := func() ([]kube.Manifest, error) {
-		ms, err := c.cfg.Runtime.Desired(p)
-		if err != nil {
-			return nil, err
-		}
-		for _, m := range ms {
-			stamp(m.Object, labels, owner)
-		}
-		return ms, nil
-	}
-	manifests, err := render()
+	labels := definitionLabels(name, p)
+	// the objects are rendered once without the key fingerprint, to see their names for the name check
+	manifests, err := c.cfg.Runtime.Desired(p)
 	if err != nil {
 		a.set(api.CondApplied, "False", "RenderFailed", err.Error())
 		a.set(api.CondReady, "False", "NotApplied", "")
@@ -663,12 +734,21 @@ func (a *attempt) apply() error {
 		return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
 	}
 	known := ""
-	if a.st.KeySecret == p.KeySecret {
-		known = a.st.KeyFingerprint
+	if a.st.Controller.KeySecret == p.KeySecret {
+		known = a.st.Controller.KeyFingerprint
+	}
+	reg := entries[p.GatewayUserID]
+	// The previous controller registered the key under the plain name. With no entry under the new user id, such an entry is this
+	// definition's key from before the upgrade (the key Secret has the same name): keys.Ensure moves its hash to the new user when
+	// the Secret exists, instead of replacing a key that is in order. The old entry is swept at the end of the pass.
+	adopted := false
+	if old := entries[p.Name]; reg.Hash == "" && old.Hash != "" {
+		reg, adopted = old, true
 	}
 	res, err := keys.Ensure(ctx, keys.Params{
-		Namespace: p.Namespace, SecretName: p.KeySecret, DataKey: p.KeySecretKey, User: p.GatewayUserID,
-		Labels: labels, Owner: owner, Registered: entries[p.GatewayUserID], Known: known,
+		Namespace: p.Namespace, SecretName: p.KeySecret, DataKey: c.cfg.Runtime.KeyDataKey(), User: p.GatewayUserID,
+		Labels: labels, Owner: owner, Registered: reg.Hash, Known: known,
+		EntryLabels: p.Labels, RegisteredLabels: reg.Labels, Adopted: adopted,
 	}, c.cfg.Secrets, c.cfg.Gateway, c.cfg.Mint)
 	if err != nil {
 		a.set(api.CondKeyReady, "False", "KeyFailed", err.Error())
@@ -676,64 +756,90 @@ func (a *attempt) apply() error {
 		a.set(api.CondReady, "False", "NotApplied", "")
 		return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
 	}
-	entries[p.GatewayUserID] = res.Hash
+	entries[p.GatewayUserID] = keys.Entry{Hash: res.Hash, Labels: p.Labels}
 	a.set(api.CondKeyReady, "True", "KeyReady", "Secret "+p.KeySecret)
-	a.st.KeySecret, a.st.KeyFingerprint = p.KeySecret, res.Fingerprint
+	a.st.Controller.KeySecret, a.st.Controller.KeyFingerprint = p.KeySecret, res.Fingerprint
 	// the objects carry the fingerprint (they must roll when the key is replaced), so they are rendered again with it
-	p.KeyFingerprint = res.Fingerprint
-	if manifests, err = render(); err != nil {
-		a.set(api.CondApplied, "False", "RenderFailed", err.Error())
-		a.set(api.CondReady, "False", "NotApplied", "")
-		return a.finish("render_failed", retryExp, "err", err)
-	}
 
 	// 4. apply, then prune
-	keep := map[string]bool{}
-	var names []string
-	for _, m := range manifests {
-		n := kube.Meta(m.Object).String("name")
-		if err := c.cfg.Kube.Apply(ctx, m.Resource, p.Namespace, n, m.Object); err != nil {
-			a.set(api.CondApplied, "False", "ApplyFailed", fmt.Sprintf("%s %s: %v", m.Resource.Kind, n, err))
+	p.KeyFingerprint = res.Fingerprint
+	names, oe := c.writeObjects(ctx, d, p, labels, owner)
+	if oe != nil {
+		switch oe.step {
+		case "render":
+			a.set(api.CondApplied, "False", "RenderFailed", oe.Error())
 			a.set(api.CondReady, "False", "NotApplied", "")
-			return a.finish("apply_failed", retryExp, "kind", m.Resource.Kind, "object", n, "err", err)
+			return a.finish("render_failed", retryExp, "err", oe.err)
+		case "apply":
+			a.set(api.CondApplied, "False", "ApplyFailed", fmt.Sprintf("%s %s: %v", oe.kind, oe.name, oe.err))
+			a.set(api.CondReady, "False", "NotApplied", "")
+			return a.finish("apply_failed", retryExp, "kind", oe.kind, "object", oe.name, "err", oe.err)
+		default:
+			a.set(api.CondApplied, "False", "PruneFailed", oe.Error())
+			a.set(api.CondReady, "False", "NotApplied", "")
+			return a.finish("prune_failed", retryExp, "err", oe.err)
 		}
-		keep[m.Resource.Plural+"/"+n] = true
-		names = append(names, m.Resource.Kind+"/"+n)
-	}
-	if _, err := c.prune(ctx, d, keep); err != nil {
-		a.set(api.CondApplied, "False", "PruneFailed", err.Error())
-		a.set(api.CondReady, "False", "NotApplied", "")
-		return a.finish("prune_failed", retryExp, "err", err)
 	}
 	a.set(api.CondApplied, "True", "Applied", "")
-	ref := c.cfg.Runtime.Ref(p)
-	a.st.AgentRef = &ref
-	a.st.GatewayUserID = p.GatewayUserID
-	a.st.ToolServer = p.ToolServer
-	a.st.EffectiveTools = slices.Clone(p.Tools)
-	a.st.EffectiveEgress = slices.Clone(p.Egress)
-	a.st.A2AURL = c.cfg.Runtime.CallEndpoint(p)
-	a.st.AppliedGeneration = a.gen
-	a.st.AppliedSpec = specJSON(d.Spec)
+	a.setFacts(p)
 
-	// 5. readiness
+	// 5. suspended: the objects stay, the agent takes no work
+	if p.Suspended {
+		a.st.Endpoint, a.st.AgentRef = nil, nil
+		a.set(api.CondReady, "False", "Suspended", a.suspendedBy(p))
+		a.synced()
+		return a.finish("suspended", retryNone, "objects", names)
+	}
+
+	// 6. readiness
 	rd, err := c.cfg.Runtime.Readiness(ctx, p)
 	switch {
 	case err != nil:
-		if prev := a.st.Condition(api.CondReady); prev.Type != "" && a.running && prev.Reason != "NotApplied" && prev.Reason != "NotAccepted" && prev.Reason != "ReadinessUnknown" {
+		if prev := a.st.Condition(api.CondReady); prev.Type != "" && a.running && prev.Reason != "NotApplied" && prev.Reason != "NotAccepted" && prev.Reason != "ReadinessUnknown" && prev.Reason != "Suspended" {
 			a.transient("read readiness", err) // the last known Ready stays
 			return a.finish("transient", retryExp, "objects", names, "err", err)
 		}
 		a.set(api.CondReady, "False", "ReadinessUnknown", err.Error())
 		return a.finish("readiness_unknown", retryFlat, "objects", names, "err", err)
+	case rd.Ready && a.st.Endpoint == nil:
+		// Ready=True promises "callable at status.endpoint": with no endpoint the promise cannot be made
+		a.set(api.CondReady, "False", "NoEndpoint", "the runtime reports the agent ready, but the platform advertises no endpoint (the A2A gate is off)")
+		a.synced()
+		return a.finish("no_endpoint", retryNone, "objects", names)
 	case rd.Ready:
 		a.set(api.CondReady, "True", "Ready", "")
 		a.synced()
 		return a.finish("ready", retryNone, "objects", names, "key", string(res.Outcome))
 	default:
-		a.set(api.CondReady, "False", rd.Reason, rd.Message)
+		a.setReadyFromRuntime(rd, a.gen)
 		a.synced()
 		return a.finish("not_ready", retryFlat, "reason", rd.Reason, "objects", names)
+	}
+}
+
+// setFacts records what this plan applied: the public facts and the controller's own bookkeeping.
+func (a *attempt) setFacts(p plan.Plan) {
+	c := a.c
+	ref := c.cfg.Runtime.Ref(p)
+	a.st.AgentRef = &ref
+	a.st.Endpoint = c.cfg.Runtime.Endpoint(p)
+	a.st.Revision = p.Revision
+	a.st.EffectiveTools = slices.Clone(p.Tools)
+	a.st.EffectiveEgress = slices.Clone(p.Egress)
+	a.st.Controller.GatewayUserID = p.GatewayUserID
+	a.st.Controller.ToolServer = p.ToolBackend
+	a.st.Controller.AppliedGeneration = a.gen
+	a.st.Controller.AppliedSpec = specJSON(a.d.Spec)
+}
+
+func (a *attempt) suspendedBy(p plan.Plan) string {
+	switch {
+	case a.c.cfg.Policy.SuspendAll && a.d.Spec.Suspend:
+		return "suspended: spec.suspend is true and the operator's stop switch (policy suspendAll) is on; the agent takes no new work"
+	case a.c.cfg.Policy.SuspendAll:
+		return "suspended by the operator's stop switch (policy suspendAll); the agent takes no new work"
+	default:
+		return "suspended: spec.suspend is true; the agent takes no new work"
 	}
 }
 
@@ -755,12 +861,12 @@ func (a *attempt) refused(violations []string, earlier []string) error {
 	}
 
 	var prev api.Spec
-	havePrev := a.st.AppliedSpec != "" && json.Unmarshal([]byte(a.st.AppliedSpec), &prev) == nil
-	if havePrev && a.st.AppliedSpec != specJSON(a.d.Spec) { // the refusal comes from the author's edit
+	havePrev := a.st.Controller.AppliedSpec != "" && json.Unmarshal([]byte(a.st.Controller.AppliedSpec), &prev) == nil
+	if havePrev && a.st.Controller.AppliedSpec != specJSON(a.d.Spec) { // the refusal comes from the author's edit
 		pd := *a.d
 		pd.Spec = prev
 		if len(policy.Validate(policy.Input{Def: &pd, Catalog: c.cfg.Catalog, Policy: c.cfg.Policy, Tools: c.cfg.Tools, Earlier: earlier})) == 0 {
-			if pp, err := plan.Build(&pd, c.cfg.Catalog, c.cfg.Tools); err == nil {
+			if pp, err := plan.Build(&pd, c.cfg.Catalog, c.cfg.Tools, c.cfg.Policy); err == nil {
 				return a.keepPrevious(pp, violations)
 			}
 		}
@@ -770,9 +876,22 @@ func (a *attempt) refused(violations []string, earlier []string) error {
 
 func (a *attempt) keepPrevious(pp plan.Plan, violations []string) error {
 	c := a.c
-	pg := a.st.AppliedGeneration
+	pg := a.st.Controller.AppliedGeneration
 	a.setGen(api.CondApplied, "True", "PreviousGenerationRunning",
 		fmt.Sprintf("generation %d keeps running; generation %d is refused (see status.violations)", pg, a.gen), pg)
+	if pp.Suspended {
+		// the operator's stop switch is on (or the previous spec was suspended): the previous generation is suspended too
+		pp.KeyFingerprint = a.st.Controller.KeyFingerprint
+		owner := keys.OwnerRef{APIVersion: api.APIVersion, Kind: api.Kind, Name: a.name, UID: a.d.Metadata.UID}
+		if _, oe := c.writeObjects(a.ctx, a.d, pp, definitionLabels(a.name, pp), owner); oe != nil {
+			a.transient("suspend the previous generation", oe.err)
+			return a.finish("transient", retryExp, "err", oe.err)
+		}
+		a.st.Endpoint, a.st.AgentRef = nil, nil
+		a.setGen(api.CondReady, "False", "Suspended", a.suspendedBy(pp), pg)
+		a.synced()
+		return a.finish("refused_previous_suspended", retryNone, "violations", len(violations))
+	}
 	rd, err := c.cfg.Runtime.Readiness(a.ctx, pp)
 	if err != nil {
 		a.transient("read readiness", err)
@@ -783,7 +902,7 @@ func (a *attempt) keepPrevious(pp plan.Plan, violations []string) error {
 		a.synced()
 		return a.finish("refused_previous_running", retryNone, "violations", len(violations))
 	}
-	a.setGen(api.CondReady, "False", rd.Reason, rd.Message, pg)
+	a.setReadyFromRuntime(rd, pg)
 	a.synced()
 	return a.finish("refused_previous_not_ready", retryFlat, "reason", rd.Reason)
 }
@@ -795,17 +914,17 @@ func (a *attempt) removeRunning(violations []string) error {
 		a.set(api.CondReady, "False", "NotAccepted", "")
 		return a.finish("remove_failed", retryExp, "err", err)
 	}
-	if err := c.cfg.Gateway.Unregister(a.ctx, a.name); err != nil {
+	if err := c.cfg.Gateway.Unregister(a.ctx, a.user); err != nil {
 		a.set(api.CondApplied, "False", "RemoveFailed", "unregister key: "+err.Error())
 		a.set(api.CondReady, "False", "NotAccepted", "")
 		return a.finish("remove_failed", retryExp, "err", err)
 	}
 	if c.ps != nil && c.ps.entries != nil {
-		delete(c.ps.entries, a.name)
+		delete(c.ps.entries, a.user)
 	}
-	a.st.AgentRef, a.st.A2AURL, a.st.ToolServer, a.st.GatewayUserID = nil, "", "", ""
+	a.st.AgentRef, a.st.Endpoint, a.st.Revision = nil, nil, ""
 	a.st.EffectiveTools, a.st.EffectiveEgress = nil, nil
-	a.st.AppliedGeneration, a.st.AppliedSpec, a.st.KeyFingerprint, a.st.KeySecret = 0, "", "", ""
+	a.st.Controller = api.ControllerState{}
 	a.set(api.CondKeyReady, "Unknown", "NotAccepted", "")
 	a.set(api.CondApplied, "False", "PolicyRemoved", "the definition is refused under the current catalog and policy; the agent's objects and key were removed")
 	a.set(api.CondReady, "False", "NotAccepted", "")
@@ -821,6 +940,14 @@ func cloneStatus(s api.Status) api.Status {
 	if s.AgentRef != nil {
 		r := *s.AgentRef
 		s.AgentRef = &r
+	}
+	if s.Endpoint != nil {
+		e := *s.Endpoint
+		s.Endpoint = &e
+	}
+	if s.Capabilities != nil {
+		cp := *s.Capabilities
+		s.Capabilities = &cp
 	}
 	return s
 }
@@ -882,7 +1009,7 @@ func owned(obj kube.Object, d *api.AgentDefinition) bool {
 func (c *Controller) conflicts(ctx context.Context, d *api.AgentDefinition, ms []kube.Manifest) (string, error) {
 	for _, m := range ms {
 		n := kube.Meta(m.Object).String("name")
-		cur, err := c.cfg.Kube.Get(ctx, m.Resource, c.cfg.Catalog.Namespaces.Agents, n)
+		cur, err := c.cfg.Kube.Get(ctx, m.Resource, d.Metadata.Namespace, n)
 		if kube.IsNotFound(err) {
 			continue
 		}
@@ -896,12 +1023,13 @@ func (c *Controller) conflicts(ctx context.Context, d *api.AgentDefinition, ms [
 	return "", nil
 }
 
-// prune deletes the objects this definition owns (labels and owner reference) that are not in keep ("plural/name"). A kind
-// the cluster does not know (404 on the list: the CRD is not installed) has nothing to prune.
+// prune deletes the objects this definition owns (labels and owner reference) that are not in keep ("plural/name"), in the
+// definition's namespace. A kind the cluster does not know (404 on the list: the CRD is not installed) has nothing to prune.
 func (c *Controller) prune(ctx context.Context, d *api.AgentDefinition, keep map[string]bool) ([]string, error) {
 	var deleted []string
+	ns := d.Metadata.Namespace
 	for _, kind := range c.cfg.Runtime.OwnedKinds() {
-		items, _, err := c.cfg.Kube.List(ctx, kind, c.cfg.Catalog.Namespaces.Agents, selector(d.Metadata.Name))
+		items, _, err := c.cfg.Kube.List(ctx, kind, ns, selector(d.Metadata.Name))
 		if kube.IsNotFound(err) {
 			continue
 		}
@@ -913,43 +1041,44 @@ func (c *Controller) prune(ctx context.Context, d *api.AgentDefinition, keep map
 			if keep[kind.Plural+"/"+n] || !owned(it, d) {
 				continue
 			}
-			if err := c.cfg.Kube.Delete(ctx, kind, c.cfg.Catalog.Namespaces.Agents, n); err != nil && !kube.IsNotFound(err) {
+			if err := c.cfg.Kube.Delete(ctx, kind, ns, n); err != nil && !kube.IsNotFound(err) {
 				return deleted, fmt.Errorf("delete %s %s: %w", kind.Kind, n, err)
 			}
 			deleted = append(deleted, kind.Kind+"/"+n)
-			c.cfg.Log.Info("pruned", "agent", d.Metadata.Name, "kind", kind.Kind, "object", n, "outcome", "pruned")
+			c.cfg.Log.Info("pruned", "agent", d.Metadata.Name, "namespace", ns, "kind", kind.Kind, "object", n, "outcome", "pruned")
 		}
 	}
 	return deleted, nil
 }
 
-func (c *Controller) addFinalizer(ctx context.Context, raw kube.Object, name string) (kube.Object, error) {
+func (c *Controller) addFinalizer(ctx context.Context, raw kube.Object, ns, name string) (kube.Object, error) {
 	m := kube.Meta(raw)
 	fin, _ := m["finalizers"].([]any)
 	m["finalizers"] = append(fin, api.FinalizerGatewayKey)
-	return c.cfg.Kube.Update(ctx, definitions, c.cfg.Namespace, name, raw)
+	return c.cfg.Kube.Update(ctx, definitions, ns, name, raw)
 }
 
 // finalize runs when deletion was requested: owned objects and the key hash go, then the finalizer. The key Secret is
 // removed by the owner reference.
 func (c *Controller) finalize(ctx context.Context, d *api.AgentDefinition) error {
-	name := d.Metadata.Name
+	name, ns := d.Metadata.Name, d.Metadata.Namespace
+	key, user := defKey(ns, name), plan.GatewayUser(ns, name)
 	if !d.HasFinalizer(api.FinalizerGatewayKey) {
-		c.forget(name)
+		c.forget(key)
 		return nil
 	}
 	if _, err := c.prune(ctx, d, nil); err != nil {
 		return fmt.Errorf("remove objects: %w", err)
 	}
-	if err := c.cfg.Gateway.Unregister(ctx, name); err != nil {
+	if err := c.cfg.Gateway.Unregister(ctx, user); err != nil {
 		return fmt.Errorf("unregister key: %w", err)
 	}
 	if c.ps != nil && c.ps.entries != nil {
-		delete(c.ps.entries, name)
+		delete(c.ps.entries, user)
 	}
-	cur, err := c.cfg.Kube.Get(ctx, definitions, c.cfg.Namespace, name)
+	cur, err := c.cfg.Kube.Get(ctx, definitions, ns, name)
 	if kube.IsNotFound(err) {
-		c.forget(name)
+		c.forget(key)
 		return nil
 	}
 	if err != nil {
@@ -965,7 +1094,7 @@ func (c *Controller) finalize(ctx context.Context, d *api.AgentDefinition) error
 	}
 	if len(rest) == len(fins) && len(fins) == 0 {
 		// no finalizers at all on the fresh object: nothing of ours holds it any more
-		c.forget(name)
+		c.forget(key)
 		return nil
 	}
 	if rest == nil {
@@ -973,10 +1102,10 @@ func (c *Controller) finalize(ctx context.Context, d *api.AgentDefinition) error
 	} else {
 		m["finalizers"] = rest
 	}
-	if _, err := c.cfg.Kube.Update(ctx, definitions, c.cfg.Namespace, name, cur); err != nil && !kube.IsNotFound(err) {
+	if _, err := c.cfg.Kube.Update(ctx, definitions, ns, name, cur); err != nil && !kube.IsNotFound(err) {
 		return fmt.Errorf("remove finalizer: %w", err)
 	}
-	c.logOutcome(name, "deleted")
-	c.forget(name)
+	c.logOutcome(ns, name, "deleted")
+	c.forget(key)
 	return nil
 }

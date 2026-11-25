@@ -136,7 +136,7 @@ func TestDeletionCompletesWhenAKindIsMissing(t *testing.T) {
 	if _, ok := e.srv.Get("agentdefinitions", "kagent", "researcher"); ok {
 		t.Fatal("the definition is wedged: a missing kind must not hold the finalizer")
 	}
-	if _, ok := e.gw.entries["researcher"]; ok {
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
 		t.Fatal("hash must be unregistered")
 	}
 }
@@ -171,7 +171,7 @@ func TestOrphanedGatewayEntriesAreSwept(t *testing.T) {
 	if _, ok := e.gw.entries["ghost"]; ok {
 		t.Fatal("the entry of a definition that does not exist must go")
 	}
-	if _, ok := e.gw.entries["researcher"]; !ok {
+	if _, ok := e.gw.entries["kagent.researcher"]; !ok {
 		t.Fatal("a definition being created in the same pass must not be swept")
 	}
 }
@@ -181,9 +181,9 @@ func TestSweepKeepsEntriesOfDeletingAndRefusedDefinitions(t *testing.T) {
 	e.seed("good", nil)
 	e.seed("bad", func(s map[string]any) { s["model"] = "gpt-9" })
 	e.pass(t)
-	e.gw.entries["bad"] = "sha256:left-from-before"
+	e.gw.entries["kagent.bad"] = "sha256:left-from-before"
 	e.pass(t)
-	if _, ok := e.gw.entries["bad"]; !ok {
+	if _, ok := e.gw.entries["kagent.bad"]; !ok {
 		t.Fatal("a listed definition's entry is not an orphan")
 	}
 	_ = api.Kind
@@ -207,6 +207,12 @@ func (e *env) bumpGeneration(name string, mut func(spec map[string]any)) {
 func (e *env) rawStatus(name string) map[string]any {
 	st, _ := e.raw(name)["status"].(map[string]any)
 	return st
+}
+
+// ctl is status.controller, the controller's own bookkeeping.
+func (e *env) ctl(name string) map[string]any {
+	c, _ := e.rawStatus(name)["controller"].(map[string]any)
+	return c
 }
 
 func (e *env) runLoop(t *testing.T) {
@@ -254,10 +260,10 @@ func TestEditedIntoRefusedKeepsThePreviousAgentWhenItStillPasses(t *testing.T) {
 	if cond(st, "Applied").ObservedGeneration != 1 || cond(st, "Ready").ObservedGeneration != 1 {
 		t.Fatalf("Applied and Ready describe generation 1: %+v %+v", cond(st, "Applied"), cond(st, "Ready"))
 	}
-	if st.A2AURL != before.A2AURL || st.A2AURL == "" || len(st.EffectiveTools) != 1 || st.AgentRef == nil || len(st.Violations) == 0 {
+	if endpointURL(st) != endpointURL(before) || endpointURL(st) == "" || len(st.EffectiveTools) != 1 || st.AgentRef == nil || len(st.Violations) == 0 {
 		t.Fatalf("status must still describe what runs: %+v", st)
 	}
-	if got := e.rawStatus("researcher")["appliedGeneration"]; got != float64(1) {
+	if got := e.ctl("researcher")["appliedGeneration"]; got != float64(1) {
 		t.Fatalf("appliedGeneration %v", got)
 	}
 	if len(e.srv.Matching("DELETE", "example.dev")) != 0 {
@@ -270,11 +276,11 @@ func TestPreviousAgentReadinessIsReadFromTheRuntimeWhileARefusalStands(t *testin
 	e.seed("researcher", nil)
 	e.pass(t)
 	e.bumpGeneration("researcher", func(s map[string]any) { s["model"] = "gpt-9" })
-	e.rt.ready = plan.Readiness{Reason: "DeploymentNotReady", Message: "pod restarting"}
+	e.rt.ready = plan.Readiness{Reason: "RuntimeNotReady", Message: "pod restarting"}
 	e.pass(t)
 	st := e.status("researcher")
 	wantCond(t, st, "Applied", "True", "PreviousGenerationRunning")
-	wantCond(t, st, "Ready", "False", "DeploymentNotReady")
+	wantCond(t, st, "Ready", "False", "RuntimeNotReady")
 }
 
 func TestPolicyTighteningRemovesTheRunningAgentAndSaysSo(t *testing.T) {
@@ -292,17 +298,17 @@ func TestPolicyTighteningRemovesTheRunningAgentAndSaysSo(t *testing.T) {
 	if _, ok := e.srv.Get("agentdefinitions", "kagent", "researcher"); !ok {
 		t.Fatal("the definition stays")
 	}
-	if _, ok := e.gw.entries["researcher"]; ok {
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
 		t.Fatal("the key hash goes with the agent")
 	}
 	st := e.status("researcher")
 	wantCond(t, st, "Accepted", "False", "PolicyViolation")
 	wantCond(t, st, "Applied", "False", "PolicyRemoved")
 	wantCond(t, st, "Ready", "False", "NotAccepted")
-	if st.A2AURL != "" || st.AgentRef != nil || len(st.EffectiveTools) != 0 || len(st.EffectiveEgress) != 0 || st.ToolServer != "" {
+	if endpointURL(st) != "" || st.AgentRef != nil || len(st.EffectiveTools) != 0 || len(st.EffectiveEgress) != 0 || st.Controller.ToolServer != "" {
 		t.Fatalf("status must not describe an agent that is not running: %+v", st)
 	}
-	if got := e.rawStatus("researcher")["appliedGeneration"]; got != float64(0) {
+	if got := e.ctl("researcher")["appliedGeneration"]; got != float64(0) {
 		t.Fatalf("appliedGeneration %v", got)
 	}
 	// the operator loosens the policy again: the agent comes back with a new key
@@ -310,7 +316,7 @@ func TestPolicyTighteningRemovesTheRunningAgentAndSaysSo(t *testing.T) {
 	e.mint = "vk-ffffffffffffffffffffffffffffffff"
 	e.pass(t)
 	wantCond(t, e.status("researcher"), "Ready", "True", "Ready")
-	if e.gw.entries["researcher"] != keys.Hash(e.mint) {
+	if e.gw.entries["kagent.researcher"] != keys.Hash(e.mint) {
 		t.Fatal("the key must be replaced after the removal")
 	}
 }
@@ -334,7 +340,7 @@ func TestRefusalWithUnknownLastAppliedRemovesTheAgent(t *testing.T) {
 	e.pass(t)
 	// a status written by an older controller: running, but no record of what was applied
 	e.srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) {
-		st := o["status"].(map[string]any)
+		st := o["status"].(map[string]any)["controller"].(map[string]any)
 		delete(st, "appliedSpec")
 		delete(st, "appliedGeneration")
 	})
@@ -415,7 +421,7 @@ func TestKeyFingerprintIsRecordedAndReachesTheObjects(t *testing.T) {
 	e.seed("researcher", nil)
 	e.pass(t)
 	fp := keys.Fingerprint(keys.Hash(e.mint))
-	st := e.rawStatus("researcher")
+	st := e.ctl("researcher")
 	if st["keyFingerprint"] != fp {
 		t.Fatalf("status keyFingerprint %v, want %s", st["keyFingerprint"], fp)
 	}
@@ -438,14 +444,14 @@ func TestARestoredOlderHashIsDetectedAndTheKeyReplaced(t *testing.T) {
 	e.seed("researcher", nil)
 	e.pass(t)
 	oldFP := keys.Fingerprint(keys.Hash(e.mint))
-	e.gw.entries["researcher"] = "sha256:0000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" // a backup restored
+	e.gw.entries["kagent.researcher"] = "sha256:0000000000000000deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef" // a backup restored
 	e.mint = "vk-ffffffffffffffffffffffffffffffff"
 	e.pass(t)
-	if e.gw.entries["researcher"] != keys.Hash(e.mint) {
+	if e.gw.entries["kagent.researcher"] != keys.Hash(e.mint) {
 		t.Fatalf("the key must be replaced: %v", e.gw.entries)
 	}
 	newFP := keys.Fingerprint(keys.Hash(e.mint))
-	if got := e.rawStatus("researcher")["keyFingerprint"]; got != newFP || newFP == oldFP {
+	if got := e.ctl("researcher")["keyFingerprint"]; got != newFP || newFP == oldFP {
 		t.Fatalf("fingerprint %v", got)
 	}
 	w, _ := e.srv.Get("widgets", "kagent", "researcher-w")
@@ -459,10 +465,10 @@ func TestALostEntryIsRegisteredAgain(t *testing.T) {
 	e, _ := newEnv(t)
 	e.seed("researcher", nil)
 	e.pass(t)
-	delete(e.gw.entries, "researcher")
+	delete(e.gw.entries, "kagent.researcher")
 	e.mint = "vk-eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 	e.pass(t)
-	if e.gw.entries["researcher"] != keys.Hash(e.mint) {
+	if e.gw.entries["kagent.researcher"] != keys.Hash(e.mint) {
 		t.Fatal("not registered again")
 	}
 }
@@ -530,7 +536,8 @@ func TestOverLongReadinessTextIsCutToTheCRDLimitsOnARuneBoundary(t *testing.T) {
 	e.seed("researcher", nil)
 	e.pass(t)
 	c := cond(e.status("researcher"), "Ready")
-	if r, m := []rune(c.Reason), []rune(c.Message); len(r) != 64 || len(m) != 1024 || strings.ContainsRune(c.Reason+c.Message, '�') {
+	// a reason outside the documented table is mapped into it (its own word goes to the message), which is cut to the CRD limit
+	if r, m := []rune(c.Reason), []rune(c.Message); c.Reason != "RuntimeNotReady" || len(r) > 64 || len(m) != 1024 || strings.ContainsRune(c.Reason+c.Message, '�') {
 		t.Fatalf("reason %d runes, message %d runes", len(r), len(m))
 	}
 }
@@ -641,7 +648,7 @@ func TestATransientReadErrorKeepsTheRunningStateAndSaysSoSeparately(t *testing.T
 			wantCond(t, st, "Applied", "True", "Applied")
 			wantCond(t, st, "Ready", "True", "Ready")
 			wantCond(t, st, "Synced", "False", "TransientError")
-			if st.A2AURL == "" || st.AgentRef == nil {
+			if endpointURL(st) == "" || st.AgentRef == nil {
 				t.Fatalf("the last known state must stay: %+v", st)
 			}
 			// it recovers

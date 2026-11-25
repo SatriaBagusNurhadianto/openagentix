@@ -1,26 +1,29 @@
 package toolhive
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/openagentix/openagentix/services/control-plane/internal/catalog"
 )
 
-func TestResolvesProfilesFromCatalog(t *testing.T) {
+func load(t *testing.T) *catalog.Catalog {
+	t.Helper()
 	cat, err := catalog.LoadCatalog("../../../testdata/catalog.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var r catalog.ToolResolver = New(cat)
+	return cat
+}
+
+func TestResolvesProfilesFromCatalog(t *testing.T) {
+	var r catalog.ToolResolver = New(load(t))
 	p, ok := r.Profile("lookup")
-	if !ok || p.ToolServer != "toolhive-vmcp-lookup" || len(p.Tools) != 4 {
+	if !ok || p.Backend != "toolhive-vmcp-lookup" || len(p.Tools) != 4 || p.Name != "lookup" {
 		t.Fatalf("%+v %v", p, ok)
 	}
 	if _, ok := r.Profile("nope"); ok {
 		t.Fatal("unknown profile must not resolve")
-	}
-	if r.SharedServer() != "toolhive-vmcp" {
-		t.Fatal(r.SharedServer())
 	}
 	if got := r.Profiles(); len(got) != 1 || got[0] != "lookup" {
 		t.Fatal(got)
@@ -28,10 +31,34 @@ func TestResolvesProfilesFromCatalog(t *testing.T) {
 }
 
 func TestProfileIsACopy(t *testing.T) {
-	cat := &catalog.Catalog{Profiles: []catalog.Profile{{Name: "a", Tools: []string{"x"}}}}
+	cat := &catalog.Catalog{Tools: catalog.ToolSections{Toolhive: &catalog.ToolhiveSettings{Profiles: []catalog.ToolhiveProfile{{Name: "a", Tools: []string{"x"}}}}}}
 	p, _ := New(cat).Profile("a")
 	p.Tools[0] = "changed"
-	if cat.Profiles[0].Tools[0] != "x" {
+	if cat.Tools.Toolhive.Profiles[0].Tools[0] != "x" {
 		t.Fatal("caller can change the catalog")
+	}
+}
+
+// The code-mode tool name and the wording about the aggregating server are this adapter's, not the policy's.
+func TestMissingExplainsWhyAToolIsNotOffered(t *testing.T) {
+	cat := load(t)
+	r := New(cat)
+	p, _ := r.Profile("lookup")
+	got := r.Missing(p, "fetch_fetch")
+	if !strings.Contains(got, `tool "fetch_fetch" which is not in profile "lookup"`) || !strings.Contains(got, "knowledge_kb_search") {
+		t.Fatal(got)
+	}
+	// a profile without code mode that is asked for the code-mode tool gets the specific hint
+	cat.Tools.Toolhive.Profiles[0].CodeMode = false
+	cat.Tools.Toolhive.Profiles[0].Tools = cat.Tools.Toolhive.Profiles[0].Tools[:3]
+	p, _ = New(cat).Profile("lookup")
+	got = New(cat).Missing(p, "execute_tool_script")
+	if !strings.Contains(got, `"execute_tool_script" but profile "lookup" has codeMode off`) {
+		t.Fatal(got)
+	}
+	// the name comes from the catalog
+	cat.Tools.Toolhive.CodeModeTool = "run_script"
+	if !strings.Contains(New(cat).Missing(p, "run_script"), "codeMode off") || strings.Contains(New(cat).Missing(p, "execute_tool_script"), "codeMode off") {
+		t.Fatal("the code-mode tool name is catalog data")
 	}
 }

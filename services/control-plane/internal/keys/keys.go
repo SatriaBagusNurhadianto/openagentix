@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/openagentix/openagentix/services/control-plane/internal/kube"
@@ -23,6 +24,7 @@ const (
 	Exists    Outcome = "exists"    // Secret exists (409) and the gateway has a hash for the user: adopted, nothing written
 	Replaced  Outcome = "replaced"  // Secret existed but its key is not the registered one: deleted, created again, hash written
 	Unchanged Outcome = "unchanged" // the registered hash is the known key's: no mint, no request
+	Relabeled Outcome = "relabeled" // as Unchanged, but the entry's labels were out of date and were rewritten
 )
 
 // AnnotationFingerprint carries the key fingerprint on the Secret and on the runtime objects that must roll when the key
@@ -66,7 +68,15 @@ func Hash(key string) string {
 // Registry is the model gateway's key store (writing side; the core reads the entries once per pass and hands the
 // current hash of the user to Ensure).
 type Registry interface {
-	Register(ctx context.Context, user, hash string) error
+	// Register sets the entry of user: the hash and the informational labels (the reserved label keys) that the gateway
+	// carries as metadata next to the user id. labels may be nil.
+	Register(ctx context.Context, user, hash string, labels map[string]string) error
+}
+
+// Entry is what the gateway holds for one user.
+type Entry struct {
+	Hash   string
+	Labels map[string]string
 }
 
 // Secrets is the write-only view of Secrets the controller has: create and delete, never get or list.
@@ -99,6 +109,13 @@ type Params struct {
 	// Registered is the hash the gateway holds for User now ("" when none). Known is the fingerprint of the key the
 	// controller minted last, as it recorded it in the definition's status ("" when unknown).
 	Registered, Known string
+	// EntryLabels are the labels the entry should carry; RegisteredLabels the ones it carries now. When they differ and the
+	// key is in order, the entry is rewritten with the same hash.
+	EntryLabels, RegisteredLabels map[string]string
+	// Adopted: Registered is an entry the previous controller made under another user id (the plain name). When the Secret
+	// exists it holds that entry's key, so the hash is written under User and nothing is replaced; when it does not, the hash
+	// belongs to nothing and a new key is made as usual.
+	Adopted bool
 }
 
 func (p Params) secret(key string) kube.Object {
@@ -129,6 +146,12 @@ func (p Params) secret(key string) kube.Object {
 func Ensure(ctx context.Context, p Params, sec Secrets, reg Registry, mint func() (string, error)) (Result, error) {
 	regFP := Fingerprint(p.Registered)
 	if regFP != "" && p.Known == regFP {
+		if !maps.Equal(p.EntryLabels, p.RegisteredLabels) && (len(p.EntryLabels) > 0 || len(p.RegisteredLabels) > 0) {
+			if err := reg.Register(ctx, p.User, p.Registered, p.EntryLabels); err != nil {
+				return Result{}, fmt.Errorf("update key entry for %s: %w", p.User, err)
+			}
+			return Result{Outcome: Relabeled, Fingerprint: regFP, Hash: p.Registered}, nil
+		}
 		return Result{Outcome: Unchanged, Fingerprint: regFP, Hash: p.Registered}, nil
 	}
 	replace := regFP != "" && p.Known != ""
@@ -146,7 +169,7 @@ func Ensure(ctx context.Context, p Params, sec Secrets, reg Registry, mint func(
 	}
 	register := func(key string, out Outcome) (Result, error) {
 		h := Hash(key)
-		if err := reg.Register(ctx, p.User, h); err != nil {
+		if err := reg.Register(ctx, p.User, h, p.EntryLabels); err != nil {
 			return Result{}, fmt.Errorf("register key hash for %s: %w", p.User, err)
 		}
 		return Result{Outcome: out, Fingerprint: Fingerprint(h), Hash: h}, nil
@@ -162,6 +185,11 @@ func Ensure(ctx context.Context, p Params, sec Secrets, reg Registry, mint func(
 	}
 	// 409: the Secret exists. Whether it is usable is known only from the gateway side.
 	if regFP != "" && !replace {
+		if p.Adopted {
+			if err := reg.Register(ctx, p.User, p.Registered, p.EntryLabels); err != nil {
+				return Result{}, fmt.Errorf("register key hash for %s: %w", p.User, err)
+			}
+		}
 		return Result{Outcome: Exists, Fingerprint: regFP, Hash: p.Registered}, nil
 	}
 	if err := sec.Delete(ctx, p.Namespace, p.SecretName); err != nil && !kube.IsNotFound(err) {

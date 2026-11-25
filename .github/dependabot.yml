@@ -25,6 +25,18 @@ updates:
       go-dependencies:
         patterns: ['*']
 
+  - package-ecosystem: docker
+    directories:
+      - /services/a2a-gate
+      - /services/control-plane
+      - /services/kb
+      - /services/notify
+    schedule:
+      interval: weekly
+    groups:
+      docker-base-images:
+        patterns: ['*']
+
   - package-ecosystem: npm
     directories:
       - /console

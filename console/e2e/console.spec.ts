@@ -87,8 +87,6 @@ test('the pages with no data source say so, and show nothing invented', async ({
         ['/knowledge', 'Knowledge'],
         ['/channels', 'Channels and triggers'],
         ['/schedules', 'Schedules'],
-        ['/traces', 'Traces'],
-        ['/costs', 'Costs'],
     ]) {
         await goTo(page, href!);
         await expect(page.getByRole('heading', { level: 1, name: title })).toBeVisible();
@@ -113,7 +111,11 @@ test('Overview shows real tiles and what needs attention', async ({ page }) => {
     await expect(att.getByRole('link', { name: 'release-notes' })).toBeVisible();
     await expect(page.getByRole('region', { name: /Platform health/ })).toContainText('A2A gate');
     await expect(page.getByRole('region', { name: 'Security posture' })).toBeVisible();
-    await expect(page.locator('body')).not.toContainText(/Spend today|Turns, last/);
+    // demo mode serves fixed, invented metrics (the page says "Demo data"): the metrics row and the per-agent spend show
+    const metrics = page.getByRole('group', { name: /Metrics/ });
+    await expect(metrics).toContainText('Spend today');
+    await expect(metrics.getByRole('img', { name: /Spend per step/ })).toBeVisible();
+    await expect(page.getByRole('list', { name: 'Spend per agent key' })).toContainText('assistant');
     await page.getByRole('link', { name: /Open Governance/ }).click();
     await expect(page.getByRole('heading', { level: 1, name: 'Governance' })).toBeVisible();
     await done();
@@ -151,6 +153,38 @@ test('Models, Skills and Memory show catalog data, and Governance shows the poli
     await page.getByRole('button', { name: 'View YAML' }).click();
     await expect(page.getByLabel('Platform policy YAML', { exact: true })).toContainText('maxAgents: 5');
     await expect(page.getByLabel('Platform policy YAML', { exact: true })).toContainText('registry.ci.svc:5000');
+    await done();
+});
+
+test('Costs shows the metrics for a window, and the table view', async ({ page }) => {
+    const done = await watch(page);
+    await signIn(page);
+    await goTo(page, '/costs');
+    await expect(page.getByRole('heading', { level: 1, name: 'Costs' })).toBeVisible();
+    const totals = page.getByRole('group', { name: 'Totals' });
+    await expect(totals).toContainText('Spend, last 24h');
+    await expect(totals).toContainText('$0.191');
+    await page.getByRole('radio', { name: 'Last 7 d' }).click();
+    await expect(totals).toContainText('Spend, last 7d');
+    await expect(totals).toContainText('$1.22');
+    await expect(page.getByRole('row', { name: /assistant/ })).toContainText('$');
+    await done();
+});
+
+test('Traces: recent turns and a waterfall with a span detail, no content', async ({ page }) => {
+    const done = await watch(page);
+    await signIn(page);
+    await goTo(page, '/traces');
+    await expect(page.getByRole('heading', { level: 1, name: 'Traces' })).toBeVisible();
+    const row = page.locator('tr[data-trace]').first();
+    await expect(row).toContainText('researcher');
+    await expect(row).toContainText('Completed');
+    await row.getByRole('button', { name: /Open trace/ }).click();
+    const wf = page.getByRole('list', { name: /Spans of the turn/ });
+    await expect(wf.getByRole('button')).toHaveCount(4);
+    await wf.getByRole('button', { name: /execute_tool osv_query_vulnerability/ }).click();
+    await expect(page.getByRole('complementary')).toContainText('gen_ai.tool.name');
+    await expect(page.getByRole('complementary')).not.toContainText(/gen_ai\.prompt|arguments/);
     await done();
 });
 

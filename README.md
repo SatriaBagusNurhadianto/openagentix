@@ -571,6 +571,17 @@ Paths that start with `spikes/` in the changelog, the decision records and the d
 
 The `NOTES.md` files record versions, deviations from upstream docs, failures and evidence.
 
+## Community
+
+OpenAgentix is Apache-2.0 and open to contributions. It is a young project with one maintainer, and it wants more.
+
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to build, test and send a change (every commit is signed off, `git commit -s`).
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md): the Contributor Covenant 2.1.
+- [SECURITY.md](SECURITY.md): report a vulnerability privately through the repository's Security tab ("Report a vulnerability"), not in a public issue.
+- [GOVERNANCE.md](GOVERNANCE.md) and [MAINTAINERS.md](MAINTAINERS.md): how decisions are made and how to become a maintainer.
+- [docs/roadmap.md](docs/roadmap.md): what is planned. [ADOPTERS.md](ADOPTERS.md): who uses it (empty so far). [THIRD-PARTY.md](THIRD-PARTY.md): upstream components and their licences.
+- Questions and ideas: GitHub Discussions.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE). This repository is the open core of OpenAgentix.

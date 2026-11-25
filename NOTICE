@@ -1,0 +1,16 @@
+OpenAgentix
+Copyright 2026 The OpenAgentix contributors
+
+This product is licensed under the Apache License, Version 2.0. See the
+LICENSE file.
+
+This product does not copy the source code of the upstream projects it
+installs. The installer downloads released versions of them at run time, and
+the chart references their container images. Each upstream project keeps its
+own licence and copyright. They are listed in THIRD-PARTY.md.
+
+Go modules that are compiled into the services in this repository
+(github.com/modelcontextprotocol/go-sdk, github.com/jackc/pgx,
+gopkg.in/yaml.v3 and others) are used under their own licences, listed in
+THIRD-PARTY.md. gopkg.in/yaml.v3 carries its own NOTICE: "Copyright
+2011-2016 Canonical Ltd." with parts derived from libyaml (MIT).

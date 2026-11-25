@@ -2,6 +2,21 @@
 
 Written 2026-11-25. It replaces nothing: the changelog says what exists, the diary how it was proven. This page says what is planned and why, measured against the managed agent platforms that OpenAgentix wants to be an alternative to.
 
+## Goal: adoption
+
+Set by the project owner on 2026-11-25: the first goal is the widest possible adoption. Work is ordered by what brings users, contributors and named adopters, not by feature count.
+
+What that means for every decision:
+
+1. **Time to first working agent** matters most: an install that works in minutes on the clusters people have (kind, k3s, GKE, EKS, AKS, OpenShift), with or without a paid model key.
+2. **A reason to try it today**: one clear use that it does better than the alternatives, shown in a demo anyone can run.
+3. **Meet people where they are**: adapters for the frameworks and runtimes they already use, so their agents run here without a rewrite.
+4. **Easy to contribute to**: small, well-marked places to add an adapter, a connector or a tool server, with tests that tell a contributor it works.
+5. **Proof over promise**: every claim in the README is something a visitor can reproduce.
+6. **Less, finished** beats more, half-built. A feature that does not serve adoption waits.
+
+Measured by: installs that reach a working agent, people outside the project who open issues and pull requests, organisations that agree to be named, agents and adapters contributed by others. Stars are a weak signal.
+
 ## Aim
 
 A Kubernetes-native agent platform that an organisation can run on its own clusters instead of Amazon Bedrock AgentCore, Microsoft Foundry Agent Service or Google's Gemini Enterprise Agent Platform (the former Vertex AI Agent Builder and Agent Engine).

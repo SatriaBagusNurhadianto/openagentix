@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openagentix/openagentix/services/control-plane/internal/api"
 	"github.com/openagentix/openagentix/services/control-plane/internal/keys"
@@ -85,19 +86,19 @@ func TestAnEntryOfThePreviousFormatMovesToTheNewUserWithoutReplacingTheKey(t *te
 	wantCond(t, st, "Ready", "True", "Ready")
 }
 
-func TestSweepKeepsEveryListedDefinitionsUserAndNoOther(t *testing.T) {
+func TestSweepKeepsEveryListedDefinitionsUserAndRemovesNoOtherOfItsOwn(t *testing.T) {
 	e, _ := newEnv(t)
 	e.seed("a", nil)
 	e.seed("b", nil)
 	e.gw.entries["kagent.gone"] = "sha256:dead"
-	e.gw.entries["other-ns.a"] = "sha256:dead" // a name of another namespace is not this definition's user
+	e.gw.entries["other-ns.a"] = "sha256:dead" // another namespace's entry is not this definition's user, and not ours to remove (one controller per gateway)
 	e.pass(t)
 	var got []string
 	for u := range e.gw.entries {
 		got = append(got, u)
 	}
 	slices.Sort(got)
-	if !slices.Equal(got, []string{"kagent.a", "kagent.b"}) {
+	if !slices.Equal(got, []string{"kagent.a", "kagent.b", "other-ns.a"}) {
 		t.Fatalf("%v", got)
 	}
 }
@@ -274,6 +275,7 @@ func TestRevisionChangesWithWhatWasAppliedAndNotWithTheDescription(t *testing.T)
 
 func TestSuspendKeepsTheDefinitionAcceptedAndRemovesOnlyTheAgent(t *testing.T) {
 	e, _ := newEnv(t)
+	clk := e.useClock()
 	e.seed("researcher", nil)
 	e.pass(t)
 	rev := e.status("researcher").Revision
@@ -296,8 +298,11 @@ func TestSuspendKeepsTheDefinitionAcceptedAndRemovesOnlyTheAgent(t *testing.T) {
 	if _, ok := e.srv.Get("gadgets", "kagent", "researcher-g"); !ok {
 		t.Fatal("the other objects stay")
 	}
-	if _, ok := e.srv.Get("secrets", "kagent", secret); !ok || e.gw.entries["kagent.researcher"] == "" {
-		t.Fatal("the key and its registration stay")
+	if _, ok := e.srv.Get("secrets", "kagent", secret); !ok {
+		t.Fatal("the key Secret stays")
+	}
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
+		t.Fatal("the registration is cut while suspended (see TestSuspendCutsModelAccess...)")
 	}
 	if len(e.srv.Matching("DELETE", "/secrets/")) != 0 {
 		t.Fatal("suspend must not delete the key")
@@ -309,6 +314,7 @@ func TestSuspendKeepsTheDefinitionAcceptedAndRemovesOnlyTheAgent(t *testing.T) {
 		t.Fatalf("status patched again while suspended: %d -> %d", patches, got)
 	}
 	// resume
+	clk.advance(10 * time.Minute)
 	e.srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) { o["spec"].(map[string]any)["suspend"] = false })
 	e.pass(t)
 	st = e.status("researcher")
@@ -323,6 +329,7 @@ func TestSuspendKeepsTheDefinitionAcceptedAndRemovesOnlyTheAgent(t *testing.T) {
 
 func TestSuspendAllOfThePolicyIsTheSameForEveryDefinition(t *testing.T) {
 	e, _ := newEnv(t)
+	clk := e.useClock()
 	e.seed("a", nil)
 	e.seed("b", nil)
 	e.pass(t)
@@ -346,6 +353,7 @@ func TestSuspendAllOfThePolicyIsTheSameForEveryDefinition(t *testing.T) {
 	if _, ok := e.srv.Get("widgets", "kagent", "c-w"); ok {
 		t.Fatal("a new definition must not start an agent")
 	}
+	clk.advance(10 * time.Minute)
 	e.pol.SuspendAll = false
 	e.pass(t)
 	wantCond(t, e.status("a"), "Ready", "True", "Ready")
@@ -534,4 +542,185 @@ func TestARuntimeReasonOutsideTheTableIsMappedIntoIt(t *testing.T) {
 	if c.Reason != "RuntimeNotReady" || !strings.Contains(c.Message, "SomethingTheRuntimeSaid") {
 		t.Fatalf("%+v", c)
 	}
+}
+
+// ---- I5 of the security review: suspend is a STOP that also cuts model access, and flapping is rate-limited ----
+
+// clock is a settable time source for the controller under test.
+type clock struct{ t time.Time }
+
+func (c *clock) Now() time.Time          { return c.t }
+func (c *clock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+func (e *env) useClock() *clock {
+	c := &clock{t: time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)}
+	e.c.cfg.Now = c.Now
+	return c
+}
+
+func (e *env) suspend(name string, on bool) {
+	e.srv.Modify("agentdefinitions", "kagent", name, func(o kubetest.Object) { o["spec"].(map[string]any)["suspend"] = on })
+}
+
+func TestSuspendCutsModelAccessAndResumeRestoresTheSameKeyWithoutMintingOne(t *testing.T) {
+	e, _ := newEnv(t)
+	clk := e.useClock()
+	e.seed("researcher", nil)
+	e.pass(t)
+	hash := e.gw.entries["kagent.researcher"]
+	secret := "researcher-virtual-key-" + uid8(e.raw("researcher"))
+	rev, fp := e.status("researcher").Revision, e.ctl("researcher")["keyFingerprint"]
+	posts, deletes := len(e.srv.Matching("POST", "/secrets")), len(e.srv.Matching("DELETE", "/secrets/"))
+
+	e.suspend("researcher", true)
+	e.pass(t)
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
+		t.Fatal("a suspended agent's key must not work at the gateway: its entry is removed")
+	}
+	if got := e.ctl("researcher")["heldKeyHash"]; got != hash {
+		t.Fatalf("the non-secret hash is kept in status.controller.heldKeyHash so the same key can come back: %v want %v", got, hash)
+	}
+	if _, ok := e.srv.Get("secrets", "kagent", secret); !ok {
+		t.Fatal("the key Secret stays")
+	}
+	st := e.status("researcher")
+	wantCond(t, st, "Ready", "False", "Suspended")
+	wantCond(t, st, "KeyReady", "False", "KeySuspended")
+	if _, ok := e.srv.Get("widgets", "kagent", "researcher-w"); ok {
+		t.Fatal("the runtime agent is removed: the runtime has no pause, so suspend is a stop")
+	}
+
+	// a steady state writes nothing
+	regs, patches := e.gw.registerCalls(), len(e.srv.Matching("PATCH", "/agentdefinitions/researcher/status"))
+	e.pass(t)
+	if e.gw.registerCalls() != regs || len(e.srv.Matching("PATCH", "/agentdefinitions/researcher/status")) != patches {
+		t.Fatal("a pass over a suspended definition must change nothing")
+	}
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
+		t.Fatal("the entry must stay cut")
+	}
+
+	// resume: the same hash is registered again; no key is minted, no Secret is written
+	clk.advance(10 * time.Minute)
+	e.suspend("researcher", false)
+	e.pass(t)
+	if e.gw.entries["kagent.researcher"] != hash {
+		t.Fatalf("resume must register the same hash: %q want %q", e.gw.entries["kagent.researcher"], hash)
+	}
+	if len(e.srv.Matching("POST", "/secrets")) != posts || len(e.srv.Matching("DELETE", "/secrets/")) != deletes {
+		t.Fatal("resume must not create or delete a key Secret")
+	}
+	st = e.status("researcher")
+	wantCond(t, st, "Ready", "True", "Ready")
+	wantCond(t, st, "KeyReady", "True", "KeyReady")
+	if st.Revision != rev || e.ctl("researcher")["keyFingerprint"] != fp || e.ctl("researcher")["heldKeyHash"] != "" {
+		t.Fatalf("same definition, key and revision: %+v %v", st, e.ctl("researcher"))
+	}
+	if _, ok := e.srv.Get("widgets", "kagent", "researcher-w"); !ok {
+		t.Fatal("the agent is back")
+	}
+}
+
+func TestAKeyThatIsHeldIsNeverRegisteredByAFreshDefinitionCreatedWhileSuspendAllIsOn(t *testing.T) {
+	e, _ := newEnv(t)
+	clk := e.useClock()
+	e.pol.SuspendAll = true
+	e.seed("c", nil)
+	e.pass(t)
+	if _, ok := e.gw.entries["kagent.c"]; ok || e.gw.registerCalls() != 0 {
+		t.Fatalf("a definition created while the stop switch is on never gets a registered key: %v", e.gw.entries)
+	}
+	if e.ctl("c")["heldKeyHash"] != "sha256:"+sha(e.mint) {
+		t.Fatalf("the key exists (its Secret) and its hash is held: %v", e.ctl("c"))
+	}
+	wantCond(t, e.status("c"), "Ready", "False", "Suspended")
+	clk.advance(time.Minute)
+	e.pol.SuspendAll = false
+	e.pass(t)
+	if e.gw.entries["kagent.c"] != "sha256:"+sha(e.mint) {
+		t.Fatalf("on resume the held hash is registered: %v", e.gw.entries)
+	}
+	wantCond(t, e.status("c"), "Ready", "True", "Ready")
+	if n := len(e.srv.Matching("POST", "/secrets")); n != 1 {
+		t.Fatalf("one key was ever minted, got %d Secret creates", n)
+	}
+}
+
+func TestSuspendAllCutsEveryDefinitionsKeyAndAnEditThatIsRefusedDoesNotKeepItOpen(t *testing.T) {
+	e, _ := newEnv(t)
+	e.useClock()
+	e.seed("a", nil)
+	e.seed("b", nil)
+	e.pass(t)
+	e.srv.Modify("agentdefinitions", "kagent", "b", func(o kubetest.Object) { o["spec"].(map[string]any)["model"] = "gpt-9" }) // b's edit is refused, its previous generation runs
+	e.pol.SuspendAll = true
+	e.pass(t)
+	for _, n := range []string{"a", "b"} {
+		if _, ok := e.gw.entries["kagent."+n]; ok {
+			t.Errorf("%s: the stop switch must cut the key too", n)
+		}
+		if e.ctl(n)["heldKeyHash"] == "" {
+			t.Errorf("%s: the hash must be held", n)
+		}
+		if _, ok := e.srv.Get("widgets", "kagent", n+"-w"); ok {
+			t.Errorf("%s: the agent must be gone", n)
+		}
+	}
+}
+
+func TestSuspendResumeLoopsAreRateLimitedPerDefinition(t *testing.T) {
+	e, _ := newEnv(t)
+	clk := e.useClock()
+	e.seed("researcher", nil)
+	e.pass(t)
+	hash := e.gw.entries["kagent.researcher"]
+
+	clk.advance(30 * time.Second)
+	e.suspend("researcher", true)
+	e.pass(t)
+	clk.advance(10 * time.Second)
+	e.suspend("researcher", false) // resumed 40 s after the agent was created: too soon
+	e.pass(t)
+	st := e.status("researcher")
+	wantCond(t, st, "Ready", "False", "ResumeDelayed")
+	if !strings.Contains(st.Condition("Ready").Message, "2m0s") || !strings.Contains(st.Condition("Ready").Message, "12:02:00") {
+		t.Fatalf("the message says the interval and when it ends: %q", st.Condition("Ready").Message)
+	}
+	if _, ok := e.srv.Get("widgets", "kagent", "researcher-w"); ok {
+		t.Fatal("no agent is created inside the interval")
+	}
+	if _, ok := e.gw.entries["kagent.researcher"]; ok {
+		t.Fatal("the key stays cut while the resume is delayed")
+	}
+	wantCond(t, st, "Accepted", "True", "Accepted")
+
+	clk.advance(81 * time.Second) // 12:02:01
+	e.pass(t)
+	wantCond(t, e.status("researcher"), "Ready", "True", "Ready")
+	if e.gw.entries["kagent.researcher"] != hash {
+		t.Fatal("the same key is back")
+	}
+
+	// the next cycle starts its own interval, from the re-creation
+	clk.advance(5 * time.Second)
+	e.suspend("researcher", true)
+	e.pass(t)
+	e.suspend("researcher", false)
+	e.pass(t)
+	wantCond(t, e.status("researcher"), "Ready", "False", "ResumeDelayed")
+}
+
+func TestAFirstStartIsNeverDelayedAndTheIntervalIsConfigurable(t *testing.T) {
+	e, _ := newEnv(t)
+	clk := e.useClock()
+	e.c.cfg.MinRecreateInterval = time.Second
+	e.seed("researcher", nil)
+	e.pass(t)
+	wantCond(t, e.status("researcher"), "Ready", "True", "Ready")
+	e.suspend("researcher", true)
+	e.pass(t)
+	clk.advance(2 * time.Second)
+	e.suspend("researcher", false)
+	e.pass(t)
+	wantCond(t, e.status("researcher"), "Ready", "True", "Ready")
 }

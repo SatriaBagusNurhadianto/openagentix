@@ -5,7 +5,6 @@ package policy
 
 import (
 	"fmt"
-	"net/netip"
 	"net/url"
 	"regexp"
 	"slices"
@@ -271,12 +270,12 @@ func Validate(in Input) []string {
 				add("egress.allow entry %q is not an origin: use https://host[:port] or http://host[:port], a lower case DNS name (a wildcard replaces exactly one leftmost label), no path, no query, no address", o)
 			case seen[o]:
 				add("egress.allow lists %q twice", o)
-			case inNamespace(o, c.Namespaces.Tools):
-				add("egress.allow entry %q is inside the tools namespace %q: that would reach a tool server around the profile (it can never be listed)", o, c.Namespaces.Tools)
+			case egressForbidden(o, c.Namespaces) != "":
+				add("egress.allow entry %q is %s (it can never be listed)", o, egressForbidden(o, c.Namespaces))
 			case p.InClusterAllowed(hostPort(o)):
-				// listed by the operator in egress.inClusterDestinations: the one exception to the rules below
-			case internalHost(o, c.Namespaces.Agents, c.Namespaces.Gateway):
-				add("egress.allow entry %q names a cluster-internal or local host (.svc, .cluster.local, a name without a dot, an address, or a platform namespace); the policy cannot allow it unless the operator lists exactly host:port in egress.inClusterDestinations", o)
+				// listed by the operator in egress.inClusterDestinations: the one exception to the rule below
+			case catalog.InternalEgressHost(egressHost(o)):
+				add("egress.allow entry %q names a cluster-internal or local host (an address, a name without a dot, .svc or .cluster.local, or a last label such as .internal, .local, .lan or .corp that only looks public); the policy cannot allow it unless the operator lists exactly host:port in egress.inClusterDestinations", o)
 			case !originAllowed(o, p.Egress.AllowedOrigins):
 				add("egress.allow entry %q is not matched by the platform policy", o)
 			}
@@ -322,42 +321,22 @@ func hostPort(origin string) string {
 	return strings.ToLower(u.Hostname()) + ":" + port
 }
 
-// internalHost reports whether the origin's host is something that is not on the public internet from the cluster's point
-// of view, whatever the policy patterns say: an IP literal, a name without a dot, .svc and .cluster.local names, and names
-// inside the given namespaces (short, .svc or full).
-func internalHost(origin string, namespaces ...string) bool {
+// egressHost is the origin's host in lower case, a leading "*." cut.
+func egressHost(origin string) string {
 	u, err := url.Parse(origin)
 	if err != nil {
-		return true
+		return ""
 	}
-	h := strings.TrimPrefix(u.Hostname(), "*.")
-	if _, err := netip.ParseAddr(h); err == nil {
-		return true
-	}
-	if !strings.Contains(h, ".") || h == "svc" || strings.HasSuffix(h, ".svc") || strings.HasSuffix(h, ".cluster.local") || strings.Contains(h, ".svc.") {
-		return true
-	}
-	for _, ns := range namespaces {
-		if ns != "" && inNamespace(origin, ns) {
-			return true
-		}
-	}
-	return false
+	return strings.TrimPrefix(strings.ToLower(u.Hostname()), "*.")
 }
 
-// inNamespace reports whether the origin's host is a name inside ns (short, .svc or full cluster name).
-func inNamespace(origin, ns string) bool {
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
+// egressForbidden says why the origin may never be used (catalog.ForbiddenEgressHost), "" when it may.
+func egressForbidden(origin string, ns catalog.Namespaces) string {
+	why, bad := catalog.ForbiddenEgressHost(egressHost(origin), ns)
+	if !bad {
+		return ""
 	}
-	h := strings.TrimPrefix(u.Hostname(), "*.")
-	for _, suf := range []string{ns, ns + ".svc", ns + ".svc.cluster.local"} {
-		if h == suf || strings.HasSuffix(h, "."+suf) {
-			return true
-		}
-	}
-	return false
+	return why
 }
 
 // originAllowed matches an origin against the policy patterns. A pattern is an origin; its host may start with one

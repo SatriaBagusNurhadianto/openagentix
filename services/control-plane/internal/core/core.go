@@ -92,19 +92,25 @@ type Config struct {
 	Backoff   time.Duration // first retry delay of a definition that failed or is not ready; doubles per failure up to 30 times this
 	// MinInterval is the shortest time between the starts of two passes of Run (1 s), however many events arrive.
 	MinInterval time.Duration
+	// MinRecreateInterval is the shortest time between two creations of one definition's runtime agent (2 minutes): a suspend
+	// and resume loop must not thrash the runtime's snapshots. A resume inside the interval waits (Ready=False, ResumeDelayed).
+	MinRecreateInterval time.Duration
 	// WatchOpenTimeout bounds opening the watch (30 s); the resync timer runs independently of it.
 	WatchOpenTimeout time.Duration
 }
 
 type Controller struct {
-	cfg   Config
-	mu    sync.Mutex // one reconcile at a time; also guards ps
-	ps    *passState
-	smu   sync.Mutex // guards seen, last and fails
-	seen  map[string]int64
-	last  map[string]string
-	fails map[string]*failure
-	ready atomic.Bool
+	cfg  Config
+	mu   sync.Mutex // one reconcile at a time; also guards ps
+	ps   *passState
+	smu  sync.Mutex // guards seen, seenLabels, last and fails
+	seen map[string]int64
+	// seenLabels is the team and project label of each definition at the last pass: a change of either starts a pass too
+	// (they reach the gateway entry and the objects, but they do not change the generation)
+	seenLabels map[string]string
+	last       map[string]string
+	fails      map[string]*failure
+	ready      atomic.Bool
 }
 
 // failure is the retry state of one definition.
@@ -138,13 +144,16 @@ func New(cfg Config) *Controller {
 	if cfg.MinInterval <= 0 {
 		cfg.MinInterval = time.Second
 	}
+	if cfg.MinRecreateInterval <= 0 {
+		cfg.MinRecreateInterval = 2 * time.Minute
+	}
 	if cfg.WatchOpenTimeout <= 0 {
 		cfg.WatchOpenTimeout = 30 * time.Second
 	}
 	if cfg.Log == nil {
 		cfg.Log = slog.New(slog.NewJSONHandler(discard{}, nil))
 	}
-	return &Controller{cfg: cfg, seen: map[string]int64{}, last: map[string]string{}, fails: map[string]*failure{}}
+	return &Controller{cfg: cfg, seen: map[string]int64{}, seenLabels: map[string]string{}, last: map[string]string{}, fails: map[string]*failure{}}
 }
 
 type discard struct{}
@@ -281,7 +290,7 @@ func (c *Controller) watch(ctx context.Context, rv string, wait time.Duration) {
 }
 
 // relevant filters out the events of the controller's own writes (status, finalizer): only a new definition, a changed
-// spec (generation) or a requested deletion starts a pass.
+// spec (generation), a changed team or project label or a requested deletion starts a pass.
 func (c *Controller) relevant(e kube.Event) bool {
 	if e.Type != "ADDED" && e.Type != "MODIFIED" {
 		return false
@@ -293,8 +302,20 @@ func (c *Controller) relevant(e kube.Event) bool {
 	g, _ := m["generation"].(float64)
 	c.smu.Lock()
 	defer c.smu.Unlock()
-	old, ok := c.seen[defKey(m.String("namespace"), m.String("name"))]
-	return !ok || old != int64(g)
+	k := defKey(m.String("namespace"), m.String("name"))
+	old, ok := c.seen[k]
+	return !ok || old != int64(g) || c.seenLabels[k] != labelsKey(m)
+}
+
+// labelsKey is the team and project label of an object's metadata as one string, "" when it has neither.
+func labelsKey(meta kube.Object) string {
+	l, _ := meta["labels"].(map[string]any)
+	team, _ := l[api.LabelTeam].(string)
+	project, _ := l[api.LabelProject].(string)
+	if team == "" && project == "" {
+		return ""
+	}
+	return team + "\x00" + project
 }
 
 // defKey identifies a definition in the controller's own maps: names are only unique within a namespace.
@@ -356,6 +377,7 @@ func (c *Controller) forget(name string) {
 	delete(c.last, name)
 	delete(c.fails, name)
 	delete(c.seen, name)
+	delete(c.seenLabels, name)
 	c.smu.Unlock()
 }
 
@@ -373,6 +395,14 @@ type item struct {
 	d           *api.AgentDefinition
 	raw         kube.Object
 	wasAccepted bool
+	// running: objects of this definition exist (an applied spec is on record, or Applied is True). It holds a place under
+	// maxAgents even when its latest edit is refused and only the previous generation runs.
+	running bool
+}
+
+// runs reports whether the last status says objects of this definition run.
+func runs(st api.Status) bool {
+	return st.Controller.AppliedSpec != "" || st.Condition(api.CondApplied).Status == "True"
 }
 
 func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string, error) {
@@ -387,6 +417,7 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 	live := map[string]bool{}  // by defKey
 	users := map[string]bool{} // gateway user ids of every listed definition
 	seen := map[string]int64{}
+	seenLabels := map[string]string{}
 	var items []item
 	for _, raw := range raws {
 		name, ns := kube.Meta(raw).String("name"), kube.Meta(raw).String("namespace")
@@ -394,16 +425,24 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 		users[plan.GatewayUser(ns, name)] = true
 		g, _ := kube.Meta(raw)["generation"].(float64)
 		seen[defKey(ns, name)] = int64(g)
+		seenLabels[defKey(ns, name)] = labelsKey(kube.Meta(raw))
 		d, err := api.FromObject(raw)
 		if err != nil {
 			c.cfg.Log.Warn("skipping an object that is not a valid AgentDefinition", "outcome", "undecodable", "agent", name, "err", err)
 			continue
 		}
-		items = append(items, item{d: d, raw: raw, wasAccepted: d.Status.Condition(api.CondAccepted).Status == "True"})
+		items = append(items, item{d: d, raw: raw, wasAccepted: d.Status.Condition(api.CondAccepted).Status == "True", running: runs(d.Status)})
 	}
-	// Order: definitions that are accepted now come first, so a definition that is fixed later never displaces one that
-	// already holds a place under maxAgents; then oldest first, by name for equal times.
+	// Order: definitions that run come first (a definition whose edit is refused but whose previous generation runs still holds
+	// its place), then those that are accepted now, so a definition that is fixed later or created later never displaces one
+	// that already holds a place under maxAgents; then oldest first, by name for equal times.
 	slices.SortStableFunc(items, func(a, b item) int {
+		if a.running != b.running {
+			if a.running {
+				return -1
+			}
+			return 1
+		}
 		if a.wasAccepted != b.wasAccepted {
 			if a.wasAccepted {
 				return -1
@@ -419,7 +458,7 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 		return strings.Compare(a.d.Metadata.Name, b.d.Metadata.Name)
 	})
 	c.smu.Lock()
-	c.seen = seen
+	c.seen, c.seenLabels = seen, seenLabels
 	for n := range c.last {
 		if !live[n] {
 			delete(c.last, n)
@@ -433,23 +472,24 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 	c.smu.Unlock()
 
 	var errs []error
-	// the definitions accepted so far in this pass, by namespace: they count against maxAgents, which is per namespace
+	// the definitions that hold a place so far in this pass (accepted, or refused with the previous generation still running),
+	// by namespace: they count against maxAgents, which is per namespace
 	earlier := map[string][]string{}
 	for _, it := range items {
 		d := it.d
 		ns, key := d.Metadata.Namespace, defKey(d.Metadata.Namespace, d.Metadata.Name)
 		if honourBackoff && c.backingOff(key, d.Metadata.Generation) {
-			if it.wasAccepted && !d.Deleting() {
+			if (it.wasAccepted || it.running) && !d.Deleting() {
 				earlier[ns] = append(earlier[ns], d.Metadata.Name)
 			}
 			continue
 		}
-		accepted, err := c.safeOne(ctx, it.raw, d, earlier[ns])
+		holds, err := c.safeOne(ctx, it.raw, d, earlier[ns])
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", key, err))
 			c.noteFailure(key, d.Metadata.Generation, true)
 		}
-		if accepted {
+		if holds {
 			earlier[ns] = append(earlier[ns], d.Metadata.Name)
 		}
 	}
@@ -460,10 +500,10 @@ func (c *Controller) reconcile(ctx context.Context, honourBackoff bool) (string,
 }
 
 // safeOne keeps a panic in one definition's reconcile from stopping the others.
-func (c *Controller) safeOne(ctx context.Context, raw kube.Object, d *api.AgentDefinition, earlier []string) (accepted bool, err error) {
+func (c *Controller) safeOne(ctx context.Context, raw kube.Object, d *api.AgentDefinition, earlier []string) (holds bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
-			accepted, err = false, fmt.Errorf("internal error: %v", r)
+			holds, err = false, fmt.Errorf("internal error: %v", r)
 			c.cfg.Log.Error("reconcile panicked", "agent", d.Metadata.Name, "outcome", "panic", "err", fmt.Sprint(r))
 		}
 	}()
@@ -482,16 +522,22 @@ func (c *Controller) gatewayEntries(ctx context.Context) (map[string]keys.Entry,
 // sweep removes the entries of the key ConfigMap that belong to no listed definition. live holds the gateway user id
 // (<namespace>.<name>) of every definition the list returned (decodable or not, deleting or not), so a definition created
 // in this pass is never swept; the list was complete, or reconcile would have returned before. An entry of the previous
-// format (the plain name) is nobody's user and goes too.
+// format (the plain name, no dot) is nobody's user and goes too. An entry with another namespace's prefix belongs to a
+// controller of that namespace and is left alone: there is ONE controller per gateway key ConfigMap (README), and the sweep
+// only ever removes what this controller could have written.
 func (c *Controller) sweep(ctx context.Context, live map[string]bool) error {
 	entries, err := c.gatewayEntries(ctx)
 	if err != nil {
 		return err
 	}
 	var errs []error
+	own := c.cfg.Namespace + "."
 	for user := range entries {
 		if live[user] {
 			continue
+		}
+		if strings.Contains(user, ".") && !strings.HasPrefix(user, own) {
+			continue // another namespace's entry
 		}
 		if err := c.cfg.Gateway.Unregister(ctx, user); err != nil {
 			errs = append(errs, err)
@@ -555,6 +601,23 @@ type attempt struct {
 	now     string
 	st      api.Status
 	running bool // the last status says objects of this definition run
+	// keptPrevious: the definition is refused and its previous generation keeps running (it holds a place under maxAgents)
+	keptPrevious bool
+	// delayedUntil is set when a resume falls inside MinRecreateInterval: the plan is then treated as suspended
+	delayedUntil time.Time
+	// starting: this pass creates the runtime agent (it was absent), recorded in status.controller.agentStartedAt
+	starting bool
+}
+
+// recreateDelay says whether creating the runtime agent now would come too soon after its last creation: only when the agent is
+// absent (a suspended or delayed definition), was created before (agentStartedAt) and the interval has not passed.
+func (a *attempt) recreateDelay() (time.Time, bool) {
+	started, err := time.Parse(time.RFC3339, a.st.Controller.AgentStartedAt)
+	if err != nil || a.st.AgentRef != nil {
+		return time.Time{}, false
+	}
+	until := started.Add(a.c.cfg.MinRecreateInterval)
+	return until, a.c.cfg.Now().Before(until)
 }
 
 // setGen sets a condition. Every reason the code passes here is a literal of the documented table (api.reasons), checked by
@@ -634,12 +697,13 @@ func (c *Controller) one(ctx context.Context, raw kube.Object, d *api.AgentDefin
 	a.st.ObservedGeneration = a.gen
 	caps := c.cfg.Runtime.Capabilities()
 	a.st.Capabilities = &caps
-	a.running = a.st.Controller.AppliedSpec != "" || a.st.Condition(api.CondApplied).Status == "True"
+	a.running = runs(a.st)
 
 	// 1. accept or refuse
 	violations := policy.Validate(policy.Input{Def: d, Catalog: c.cfg.Catalog, Policy: c.cfg.Policy, Tools: c.cfg.Tools, Earlier: earlier})
 	if len(violations) > 0 {
-		return false, a.refused(violations, earlier)
+		err := a.refused(violations, earlier)
+		return a.keptPrevious, err // the previous generation still runs: the definition keeps its place
 	}
 	a.st.Violations = nil
 	a.set(api.CondAccepted, "True", "Accepted", "")
@@ -733,6 +797,13 @@ func (a *attempt) apply() error {
 		a.set(api.CondReady, "False", "NotApplied", "")
 		return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
 	}
+	// A resume inside the minimum time between two creations of the runtime agent waits: the plan is treated as suspended
+	// (agent absent, key cut) until the interval has passed.
+	if !p.Suspended {
+		if until, delayed := a.recreateDelay(); delayed {
+			a.delayedUntil, p.Suspended = until, true
+		}
+	}
 	known := ""
 	if a.st.Controller.KeySecret == p.KeySecret {
 		known = a.st.Controller.KeyFingerprint
@@ -745,21 +816,53 @@ func (a *attempt) apply() error {
 	if old := entries[p.Name]; reg.Hash == "" && old.Hash != "" {
 		reg, adopted = old, true
 	}
-	res, err := keys.Ensure(ctx, keys.Params{
-		Namespace: p.Namespace, SecretName: p.KeySecret, DataKey: c.cfg.Runtime.KeyDataKey(), User: p.GatewayUserID,
-		Labels: labels, Owner: owner, Registered: reg.Hash, Known: known,
-		EntryLabels: p.Labels, RegisteredLabels: reg.Labels, Adopted: adopted,
-	}, c.cfg.Secrets, c.cfg.Gateway, c.cfg.Mint)
+	held := a.st.Controller.HeldKeyHash
+	if !p.Suspended && held != "" && reg.Hash == "" {
+		// resume: the hash that was held is registered again, so the same key works and no key is made
+		if err := c.cfg.Gateway.Register(ctx, p.GatewayUserID, held, p.Labels); err != nil {
+			a.set(api.CondKeyReady, "False", "KeyFailed", err.Error())
+			a.set(api.CondApplied, "False", "NotApplied", "waiting for the gateway key")
+			a.set(api.CondReady, "False", "NotApplied", "")
+			return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
+		}
+		reg, adopted = keys.Entry{Hash: held, Labels: p.Labels}, false
+		entries[p.GatewayUserID] = reg
+		known = keys.Fingerprint(held)
+	}
+	var res keys.Result
+	if p.Suspended && held != "" && reg.Hash == "" {
+		// suspended and nothing registered: the key is the held one, nothing to make (a new key would replace a good one)
+		res = keys.Result{Outcome: keys.Unchanged, Fingerprint: keys.Fingerprint(held), Hash: held}
+	} else {
+		res, err = keys.Ensure(ctx, keys.Params{
+			Namespace: p.Namespace, SecretName: p.KeySecret, DataKey: c.cfg.Runtime.KeyDataKey(), User: p.GatewayUserID,
+			Labels: labels, Owner: owner, Registered: reg.Hash, Known: known,
+			EntryLabels: p.Labels, RegisteredLabels: reg.Labels, Adopted: adopted, Hold: p.Suspended,
+		}, c.cfg.Secrets, c.cfg.Gateway, c.cfg.Mint)
+	}
 	if err != nil {
 		a.set(api.CondKeyReady, "False", "KeyFailed", err.Error())
 		a.set(api.CondApplied, "False", "NotApplied", "waiting for the gateway key")
 		a.set(api.CondReady, "False", "NotApplied", "")
 		return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
 	}
-	entries[p.GatewayUserID] = keys.Entry{Hash: res.Hash, Labels: p.Labels}
-	a.set(api.CondKeyReady, "True", "KeyReady", "Secret "+p.KeySecret)
 	a.st.Controller.KeySecret, a.st.Controller.KeyFingerprint = p.KeySecret, res.Fingerprint
+	if p.Suspended {
+		// the hash is remembered first, the entry cut second: an interruption in between loses nothing
+		if err := a.holdKey(p.GatewayUserID, res.Hash, entries); err != nil {
+			a.set(api.CondKeyReady, "False", "KeyFailed", err.Error())
+			a.set(api.CondApplied, "False", "NotApplied", "waiting for the gateway key")
+			a.set(api.CondReady, "False", "NotApplied", "")
+			return a.finish("key_failed", retryExp, "secret", p.KeySecret, "err", err)
+		}
+		a.set(api.CondKeyReady, "False", "KeySuspended", "Secret "+p.KeySecret+" exists; the gateway does not know its hash while the definition is suspended")
+	} else {
+		a.st.Controller.HeldKeyHash = ""
+		entries[p.GatewayUserID] = keys.Entry{Hash: res.Hash, Labels: p.Labels}
+		a.set(api.CondKeyReady, "True", "KeyReady", "Secret "+p.KeySecret)
+	}
 	// the objects carry the fingerprint (they must roll when the key is replaced), so they are rendered again with it
+	a.starting = !p.Suspended && a.st.AgentRef == nil
 
 	// 4. apply, then prune
 	p.KeyFingerprint = res.Fingerprint
@@ -786,6 +889,12 @@ func (a *attempt) apply() error {
 	// 5. suspended: the objects stay, the agent takes no work
 	if p.Suspended {
 		a.st.Endpoint, a.st.AgentRef = nil, nil
+		if !a.delayedUntil.IsZero() {
+			a.set(api.CondReady, "False", "ResumeDelayed", fmt.Sprintf("resume is delayed until %s: the runtime agent is created at most once per %s; the key stays cut until then",
+				a.delayedUntil.UTC().Format(time.RFC3339), c.cfg.MinRecreateInterval))
+			a.synced()
+			return a.finish("resume_delayed", retryFlat, "until", a.delayedUntil.UTC().Format(time.RFC3339), "objects", names)
+		}
 		a.set(api.CondReady, "False", "Suspended", a.suspendedBy(p))
 		a.synced()
 		return a.finish("suspended", retryNone, "objects", names)
@@ -830,16 +939,40 @@ func (a *attempt) setFacts(p plan.Plan) {
 	a.st.Controller.ToolServer = p.ToolBackend
 	a.st.Controller.AppliedGeneration = a.gen
 	a.st.Controller.AppliedSpec = specJSON(a.d.Spec)
+	if a.starting {
+		a.st.Controller.AgentStartedAt = a.now
+	}
+}
+
+// holdKey remembers hash in status.controller.heldKeyHash (a minimal merge patch, before anything is cut) and removes the gateway
+// entry of user when there is one, so that the key opens nothing while the definition is suspended.
+func (a *attempt) holdKey(user, hash string, entries map[string]keys.Entry) error {
+	c := a.c
+	if hash != "" && a.st.Controller.HeldKeyHash != hash {
+		patch := kube.Object{"status": kube.Object{"controller": kube.Object{"heldKeyHash": hash}}}
+		if err := c.cfg.Kube.PatchMerge(a.ctx, definitions, a.ns, a.name, "status", patch); err != nil {
+			return fmt.Errorf("remember the key hash: %w", err)
+		}
+		a.st.Controller.HeldKeyHash = hash
+	}
+	if _, ok := entries[user]; ok {
+		if err := c.cfg.Gateway.Unregister(a.ctx, user); err != nil {
+			return fmt.Errorf("remove the key entry: %w", err)
+		}
+		delete(entries, user)
+	}
+	return nil
 }
 
 func (a *attempt) suspendedBy(p plan.Plan) string {
+	const what = "the runtime agent is removed (running conversations end) and the key is cut; resume starts fresh with the same definition and key"
 	switch {
 	case a.c.cfg.Policy.SuspendAll && a.d.Spec.Suspend:
-		return "suspended: spec.suspend is true and the operator's stop switch (policy suspendAll) is on; the agent takes no new work"
+		return "suspended: spec.suspend is true and the operator's stop switch (policy suspendAll) is on; " + what
 	case a.c.cfg.Policy.SuspendAll:
-		return "suspended by the operator's stop switch (policy suspendAll); the agent takes no new work"
+		return "suspended by the operator's stop switch (policy suspendAll); " + what
 	default:
-		return "suspended: spec.suspend is true; the agent takes no new work"
+		return "suspended: spec.suspend is true; " + what
 	}
 }
 
@@ -876,21 +1009,46 @@ func (a *attempt) refused(violations []string, earlier []string) error {
 
 func (a *attempt) keepPrevious(pp plan.Plan, violations []string) error {
 	c := a.c
+	a.keptPrevious = true
 	pg := a.st.Controller.AppliedGeneration
 	a.setGen(api.CondApplied, "True", "PreviousGenerationRunning",
 		fmt.Sprintf("generation %d keeps running; generation %d is refused (see status.violations)", pg, a.gen), pg)
+	// The previous spec is rendered again against the current catalog and written, so what runs does not go stale (a new image,
+	// a new skill digest, a moved gateway) while the author's edit stands refused. The key is the one that runs: its fingerprint
+	// is the recorded one, so nothing rolls for nothing.
+	pp.KeyFingerprint = a.st.Controller.KeyFingerprint
+	if !pp.Suspended {
+		if until, delayed := a.recreateDelay(); delayed {
+			a.delayedUntil, pp.Suspended = until, true
+		}
+	}
+	if err := a.keyForPrevious(pp); err != nil {
+		a.transient("update the key registration of the previous generation", err)
+		return a.finish("transient", retryExp, "err", err)
+	}
+	a.starting = !pp.Suspended && a.st.AgentRef == nil
+	owner := keys.OwnerRef{APIVersion: api.APIVersion, Kind: api.Kind, Name: a.name, UID: a.d.Metadata.UID}
+	if _, oe := c.writeObjects(a.ctx, a.d, pp, definitionLabels(a.name, pp), owner); oe != nil {
+		a.transient("render the previous generation again", oe.err)
+		return a.finish("transient", retryExp, "err", oe.err)
+	}
 	if pp.Suspended {
 		// the operator's stop switch is on (or the previous spec was suspended): the previous generation is suspended too
-		pp.KeyFingerprint = a.st.Controller.KeyFingerprint
-		owner := keys.OwnerRef{APIVersion: api.APIVersion, Kind: api.Kind, Name: a.name, UID: a.d.Metadata.UID}
-		if _, oe := c.writeObjects(a.ctx, a.d, pp, definitionLabels(a.name, pp), owner); oe != nil {
-			a.transient("suspend the previous generation", oe.err)
-			return a.finish("transient", retryExp, "err", oe.err)
-		}
 		a.st.Endpoint, a.st.AgentRef = nil, nil
+		if !a.delayedUntil.IsZero() {
+			a.setGen(api.CondReady, "False", "ResumeDelayed", fmt.Sprintf("resume is delayed until %s: the runtime agent is created at most once per %s",
+				a.delayedUntil.UTC().Format(time.RFC3339), c.cfg.MinRecreateInterval), pg)
+			a.synced()
+			return a.finish("refused_previous_resume_delayed", retryFlat, "violations", len(violations))
+		}
 		a.setGen(api.CondReady, "False", "Suspended", a.suspendedBy(pp), pg)
 		a.synced()
 		return a.finish("refused_previous_suspended", retryNone, "violations", len(violations))
+	}
+	ref := c.cfg.Runtime.Ref(pp)
+	a.st.AgentRef, a.st.Endpoint = &ref, c.cfg.Runtime.Endpoint(pp)
+	if a.starting {
+		a.st.Controller.AgentStartedAt = a.now
 	}
 	rd, err := c.cfg.Runtime.Readiness(a.ctx, pp)
 	if err != nil {
@@ -905,6 +1063,28 @@ func (a *attempt) keepPrevious(pp plan.Plan, violations []string) error {
 	a.setReadyFromRuntime(rd, pg)
 	a.synced()
 	return a.finish("refused_previous_not_ready", retryFlat, "reason", rd.Reason)
+}
+
+// keyForPrevious is the key's half of suspend and resume for a refused definition whose previous generation keeps running: a suspended
+// generation has its gateway entry cut (the hash held), a generation that runs again has the held hash registered.
+func (a *attempt) keyForPrevious(pp plan.Plan) error {
+	entries, err := a.c.gatewayEntries(a.ctx)
+	if err != nil {
+		return err
+	}
+	if pp.Suspended {
+		return a.holdKey(pp.GatewayUserID, entries[pp.GatewayUserID].Hash, entries)
+	}
+	if held := a.st.Controller.HeldKeyHash; held != "" {
+		if entries[pp.GatewayUserID].Hash == "" {
+			if err := a.c.cfg.Gateway.Register(a.ctx, pp.GatewayUserID, held, pp.Labels); err != nil {
+				return err
+			}
+			entries[pp.GatewayUserID] = keys.Entry{Hash: held, Labels: pp.Labels}
+		}
+		a.st.Controller.HeldKeyHash = ""
+	}
+	return nil
 }
 
 func (a *attempt) removeRunning(violations []string) error {

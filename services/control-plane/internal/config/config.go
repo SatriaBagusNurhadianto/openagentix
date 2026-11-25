@@ -16,7 +16,10 @@ type Config struct {
 	Resync      time.Duration
 	Backoff     time.Duration
 	MinInterval time.Duration
-	LogLevel    string
+	// MinRecreateInterval is the shortest time between two creations of the runtime agent of one definition (2 minutes): a
+	// suspend and resume loop cannot thrash the runtime's snapshots.
+	MinRecreateInterval time.Duration
+	LogLevel            string
 }
 
 func or(v, d string) string {
@@ -60,6 +63,9 @@ func Load(getenv func(string) string) (Config, error) {
 		errs = append(errs, err)
 	}
 	if c.MinInterval, err = duration("CONTROL_PLANE_MIN_INTERVAL", getenv("CONTROL_PLANE_MIN_INTERVAL"), time.Second, time.Millisecond); err != nil {
+		errs = append(errs, err)
+	}
+	if c.MinRecreateInterval, err = duration("CONTROL_PLANE_MIN_RECREATE_INTERVAL", getenv("CONTROL_PLANE_MIN_RECREATE_INTERVAL"), 2*time.Minute, time.Second); err != nil {
 		errs = append(errs, err)
 	}
 	var lv slog.Level

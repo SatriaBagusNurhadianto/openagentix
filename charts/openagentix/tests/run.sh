@@ -1608,7 +1608,7 @@ eq "Secrets: exactly create and delete, one rule"      "$(q "$D" "$RA|[.rules[]|
 eq "Secrets rule has no resourceNames (create cannot have them)" "$(q "$D" "$RA|[.rules[]|select(.resources|index(\"secrets\"))|has(\"resourceNames\")]|any")" false
 eq "definitions: get, list, watch, update"             "$(q "$D" "$RA|.rules[]|select(.resources==[\"agentdefinitions\"])|.verbs|sort|join(\",\")")" get,list,update,watch
 eq "definitions/status: patch"                         "$(q "$D" "$RA|.rules[]|select(.resources==[\"agentdefinitions/status\"])|.verbs|join(\",\")")" patch
-eq "kagent kinds: get, list, watch, create, patch, delete" "$(q "$D" "$RA|.rules[]|select(.apiGroups==[\"api.kagent.dev\"])|[(.resources|sort|join(\",\")),(.verbs|sort|join(\",\"))]|join(\" \")")" "agents,agenttemplates,egresspolicies,harnesses,modelconfigs create,delete,get,list,patch,watch"
+eq "kagent kinds: get, list, create, patch, delete (no watch: the controller never watches them)" "$(q "$D" "$RA|.rules[]|select(.apiGroups==[\"api.kagent.dev\"])|[(.resources|sort|join(\",\")),(.verbs|sort|join(\",\"))]|join(\" \")")" "agents,agenttemplates,egresspolicies,harnesses,modelconfigs create,delete,get,list,patch"
 eq "the kagent Role has exactly four rules"            "$(q "$D" "$RA|.rules|length")" 4
 eq "gateway Role: one rule, ConfigMaps"                "$(q "$D" "$RG|.rules|length")" 1
 eq "gateway Role: only llm-api-keys-control-plane"     "$(q "$D" "$RG|.rules[0]|[(.resources|join(\",\")),(.resourceNames|join(\",\")),(.verbs|sort|join(\",\"))]|join(\" \")")" "configmaps llm-api-keys-control-plane get,patch"
@@ -1622,45 +1622,29 @@ eq "viewer Role names agentdefinitions"                "$(q "$D" '.[]|select(.ki
 eq "builder and viewer are rendered WITHOUT bindings"  "$(count "$D" '(.kind=="RoleBinding" or .kind=="ClusterRoleBinding") and (.roleRef.name|test("agent-builder|agent-viewer"))')" 0
 
 echo "# control plane: the output guard (ValidatingAdmissionPolicy)"
-VP='.[]|select(.kind=="ValidatingAdmissionPolicy" and .metadata.name=="openagentix-control-plane-output-guard")'
-VB='.[]|select(.kind=="ValidatingAdmissionPolicyBinding" and .metadata.name=="openagentix-control-plane-output-guard")'
+# The expressions are EXECUTED by hack/ci/guardtest (make test-guard, the CI job `guard`): this block checks the structure around them.
+GP='.[]|select(.kind=="ValidatingAdmissionPolicy" and (.metadata.name|startswith("openagentix-control-plane-guard-")))'
+GB='.[]|select(.kind=="ValidatingAdmissionPolicyBinding" and (.metadata.name|startswith("openagentix-control-plane-guard-")))'
 SAU="system:serviceaccount:$CPNS:openagentix-control-plane"
-eq "policy and binding exist"                          "$(count "$D" '(.kind=="ValidatingAdmissionPolicy" or .kind=="ValidatingAdmissionPolicyBinding") and .metadata.name=="openagentix-control-plane-output-guard"')" 2
-eq "binding refers to the policy and denies"           "$(q "$D" "$VB|[.spec.policyName,(.spec.validationActions|join(\",\"))]|join(\" \")")" "openagentix-control-plane-output-guard Deny"
-eq "policy fails closed"                               "$(q "$D" "$VP|.spec.failurePolicy")" Fail
-eq "policy applies to the controller's ServiceAccount only (matchCondition names the username)" "$(q "$D" "$VP|.spec.matchConditions|map(.expression)|join(\" \")|contains(\"$SAU\")")" true
-eq "policy matches secrets, configmaps and all five kagent kinds, not definitions" "$(q "$D" "$VP|[.spec.matchConstraints.resourceRules[].resources[]]|sort|join(\",\")")" "agents,agenttemplates,configmaps,egresspolicies,harnesses,modelconfigs,secrets"
-eq "the kagent kinds are matched for CREATE, UPDATE and DELETE" "$(q "$D" "$VP|.spec.matchConstraints.resourceRules[]|select(.apiGroups==[\"api.kagent.dev\"])|.operations|sort|join(\",\")")" CREATE,DELETE,UPDATE
-eq "Secrets are matched for UPDATE too (so that an UPDATE can be refused)" "$(q "$D" "$VP|.spec.matchConstraints.resourceRules[]|select(.resources|index(\"secrets\"))|.operations|sort|join(\",\")")" CREATE,DELETE,UPDATE
-eq "no wildcard operation in the policy's match rules" "$(q "$D" "$VP|[.spec.matchConstraints.resourceRules[].operations[]]|unique|join(\",\")")" CREATE,DELETE,UPDATE
-GEXPR=$(q "$D" "$VP|(.spec.variables+.spec.validations)|map(.expression)|join(\"\\n\")")
-gcount() { printf '%s' "$GEXPR" | command grep -c -F -- "$1"; }
-eq "guard: secret names must match <name>-virtual-key-<8 hex> (create and delete)" "$(gcount '^[a-z]([-a-z0-9]*[a-z0-9])?-virtual-key-[0-9a-f]{8}$')" 2
-eq "guard: the agent label must be the name's prefix before -virtual-key-" "$(gcount "name.substring(0, size(variables.subject.metadata.name) - 21)")" 1
-eq "guard: both labels are checked on create, delete and in the ownership variables" "$([ "$(gcount "'openagentix.io/agent-definition' in")" -ge 4 ] && [ "$(gcount "'app.kubernetes.io/managed-by' in")" -ge 4 ] && echo yes || echo no)" yes
-eq "guard: the owner reference is an AgentDefinition with controller true" "$([ "$(gcount "r.kind == 'AgentDefinition'")" -ge 2 ] && [ "$(gcount "r.controller == true")" -ge 2 ] && echo yes || echo no)" yes
-eq "guard: a Secret has exactly one owner reference"   "$([ "$(gcount "size(object.metadata.ownerReferences) == 1")" -ge 1 ] && echo yes || echo no)" yes
-eq "guard: a Secret is immutable, Opaque and has the one data key" "$(gcount "object.immutable == true")+$(gcount "object.type == 'Opaque'")+$(gcount "'OPENAI_API_KEY' in object.data")+$(gcount "size(object.data) == 1")+$(gcount "!has(object.stringData)")" 1+1+1+1+1
-eq "guard: a Secret DELETE reads oldObject, name and labels" "$(gcount "oldObject.metadata.name.matches(")" 1
-eq "guard: the kagent kinds need ownership in the new object and in the old one" "$([ "$(gcount "variables.ownedNew &&")" -ge 1 ] && [ "$(gcount "variables.ownedOld")" -ge 1 ] && echo yes || echo no)" yes
-eq "guard: ownedNew and ownedOld are variables"        "$(q "$D" "$VP|[.spec.variables[].name]|sort|join(\",\")")" "agent,del,ownedNew,ownedOld,res,secretAgent,subject"
-eq "guard: the only ConfigMap name, UPDATE only"       "$(gcount "request.operation == 'UPDATE' && request.namespace == \"agentgateway-system\" && request.name == \"llm-api-keys-control-plane\"")" 1
-eq "guard: the profile tool server is the only server" "$(gcount "toolhive-vmcp-lookup")" 1
-eq "guard: a tool server must be of kind RemoteMCPServer, always present" "$(gcount "t.mcp.server.kind == 'RemoteMCPServer'")" 1
-eq "guard: skills are the catalog's digest refs"       "$(gcount "registry.invalid:5000/skills/openagentix-canary@sha256:")" 1
-eq "guard: the template's modelConfig is gateway-<agent>" "$(gcount "object.spec.modelConfig.name == 'gateway-' + variables.agent")" 1
-eq "guard: gateway URL pinned"                         "$(gcount "http://model-gateway.agentgateway-system.svc.cluster.local/v1")" 1
-eq "guard: the ModelConfig key Secret is <agent>-virtual-key-<8 hex>" "$(gcount "object.spec.apiKeySecret.startsWith(variables.agent + '-virtual-key-')")+$(gcount "matches('^[0-9a-f]{8}$')")" 1+1
-eq "guard: the catalog harness image is pinned"        "$(gcount "ghcr.io/kagent-dev/kagent/golang-adk@sha256:")" 1
-eq "guard: worker pool and snapshot location are the catalog's" "$(gcount "workerPoolRef.name == \"kagent-default\"")+$(gcount "snapshotPolicy.location == \"s3://ate-snapshots/kagent/\"")" 1+1
-eq "guard: the memory ModelConfig is the catalog's"    "$(gcount "gateway-embed-memory")" 1
-eq "guard: the harness env is the catalog's list"      "$(gcount "e in []")" 1
-eq "guard: the Agent refs derive from its own name"    "$(gcount "object.spec.template.ref.name == variables.agent + '-template'")+$(gcount "object.spec.harnessRef.name == variables.agent + '-harness'")+$(gcount "r.name == variables.agent + '-egress'")" 1+1+1
-eq "guard: egress hosts: no .svc, .cluster.local, namespace, single label, IP" "$(gcount "host.endsWith('.svc')")+$(gcount "host.endsWith('.cluster.local')")+$(gcount "[\"kagent\", \"agentgateway-system\"]")+$(gcount "[\"mcp-tools\"]")+$(gcount "host.contains('.')")+$(gcount "'^[0-9.]+\$'")" 1+1+1+1+1+1
-eq "guard: every validation has a message"             "$(q "$D" "$VP|[.spec.validations[]|(.message//\"\")==\"\"]|any")" false
-eq "guard: 12 validations"                             "$(q "$D" "$VP|.spec.validations|length")" 12
+eq "no policy of the previous name is rendered"        "$(count "$D" '(.kind=="ValidatingAdmissionPolicy" or .kind=="ValidatingAdmissionPolicyBinding") and .metadata.name=="openagentix-control-plane-output-guard"')" 0
+eq "eight policies, one per kind, and the last rule"   "$(q "$D" "[$GP|.metadata.name|ltrimstr(\"openagentix-control-plane-guard-\")]|sort|join(\",\")")" "agents,agenttemplates,configmaps,egresspolicies,harnesses,modelconfigs,other,secrets"
+eq "one binding per policy, each refers to its policy"  "$(q "$D" "[$GB|select(.metadata.name==.spec.policyName)]|length")+$(q "$D" "[$GB]|length")" 8+8
+eq "every binding denies (and only denies)"           "$(q "$D" "[$GB|.spec.validationActions|join(\",\")]|unique|join(\" \")")" Deny
+eq "every policy fails closed"                         "$(q "$D" "[$GP|.spec.failurePolicy]|unique|join(\",\")")" Fail
+eq "every policy applies to the controller's ServiceAccount only (matchCondition names the username)" "$(q "$D" "[$GP|.spec.matchConditions|map(.expression)|join(\" \")|contains(\"$SAU\")]|unique|join(\",\")")" true
+eq "every validation has a message"                    "$(q "$D" "[$GP|.spec.validations[]|(.message//\"\")==\"\"]|any")" false
+eq "no policy matches CONNECT or names an operation of its own other than CREATE, UPDATE, DELETE (the last rule: all)" "$(q "$D" "[$GP|select(.metadata.name!=\"openagentix-control-plane-guard-other\")|.spec.matchConstraints.resourceRules[].operations[]]|unique|join(\",\")")" CREATE,DELETE,UPDATE
+eq "the five kagent kinds are one policy each"         "$(q "$D" "[$GP|select(.spec.matchConstraints.resourceRules[0].apiGroups==[\"api.kagent.dev\"])|.spec.matchConstraints.resourceRules[0].resources[0]]|sort|join(\",\")")" agents,agenttemplates,egresspolicies,harnesses,modelconfigs
+eq "Secrets are matched for UPDATE too (so that an UPDATE can be refused)" "$(q "$D" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-secrets\")|.spec.matchConstraints.resourceRules[0].operations|sort|join(\",\")")" CREATE,DELETE,UPDATE
+eq "the last rule matches everything and excludes Secrets, ConfigMaps, the kagent kinds and the definitions' UPDATE" "$(q "$D" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-other\")|[.spec.matchConstraints.resourceRules[0].resources[],(.spec.matchConstraints.excludeResourceRules|map(.resources|join(\"+\"))|join(\";\")),(.spec.validations|map(.expression)|join(\";\"))]|join(\" \")")" "*/* secrets+configmaps;modelconfigs+harnesses+agenttemplates+egresspolicies+agents;agentdefinitions+agentdefinitions/status false"
+eq "the guard states an ALLOWLIST: no blocklist wording is left, keys are listed with all(k, k in [...])" "$(q "$D" "[$GP|(.spec.validations|map(.expression)|join(\"\\n\"))]|join(\"\\n\")|[scan(\"all\\\\(k, k in \\\\[\")]|length>=40")" true
+eq "the EgressPolicy rule lists no authentication key (only origin)" "$(q "$D" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-egresspolicies\")|.spec.validations|map(.expression)|join(\"\\n\")|(contains(\"k in ['origin']\") and (contains(\"authentication\")|not))")" true
+eq "the EgressPolicy rule allows exactly the operator's in-cluster destinations (none by default)" "$(q "$D" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-egresspolicies\")|.spec.validations|map(.expression)|join(\"\\n\")|contains(\"hp in []\")")" true
 DKS=$(docs --set controlPlane.enabled=true --set kagent.namespace=ag2)
-eq "guard: the kagent namespace follows into the Secret rule" "$(q "$DKS" "$VP|(.spec.validations|map(.expression)|join(\"\\n\"))|contains(\"request.namespace == \\\"ag2\\\"\")")" true
+eq "the kagent namespace follows into the Secret rule"  "$(q "$DKS" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-secrets\")|.spec.validations[0].expression|contains(\"ag2\")")" true
+eq "...and into the names of the key ConfigMap's entries" "$(q "$DKS" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-configmaps\")|.spec.validations|map(.expression)|join(\" \")|contains(\"^ag2\")")" true
+DIC=$(docs "${CP9[@]}" --set 'controlPlane.policy.egress.inClusterDestinations={registry.ci.svc:5000,db.data.svc.cluster.local:5432}')
+eq "the operator's in-cluster destinations are the only exception in the guard" "$(q "$DIC" "$GP|select(.metadata.name==\"openagentix-control-plane-guard-egresspolicies\")|.spec.validations|map(.expression)|join(\"\\n\")|contains(\"hp in [\\\"registry.ci.svc:5000\\\",\\\"db.data.svc.cluster.local:5432\\\"]\")")" true
 
 echo "# control plane: the Deployment"
 eq "Deployment in the control plane namespace"         "$(q "$D" "$CPD|.metadata.namespace")" "$CPNS"
@@ -1678,6 +1662,8 @@ eq "the catalog and the policy are mounted as files"   "$(q "$D" "$CPC|.volumeMo
 eq "the file paths are passed by env"                  "$(q "$D" "$CPC|.env|map(select(.name|test(\"FILE\"))|.name+\"=\"+.value)|sort|join(\" \")")" "CONTROL_PLANE_CATALOG_FILE=/etc/control-plane/catalog/catalog.json CONTROL_PLANE_POLICY_FILE=/etc/control-plane/policy/policy.json"
 eq "CONTROL_PLANE_MIN_INTERVAL is not set by default"  "$(q "$D" "$CPC|[.env[]|select(.name==\"CONTROL_PLANE_MIN_INTERVAL\")]|length")" 0
 eq "controlPlane.minInterval sets CONTROL_PLANE_MIN_INTERVAL" "$(q "$(docs "${CP9[@]}" --set controlPlane.minInterval=2s)" "$CPC|.env[]|select(.name==\"CONTROL_PLANE_MIN_INTERVAL\")|.value")" 2s
+eq "CONTROL_PLANE_MIN_RECREATE_INTERVAL is not set by default" "$(q "$D" "$CPC|[.env[]|select(.name==\"CONTROL_PLANE_MIN_RECREATE_INTERVAL\")]|length")" 0
+eq "controlPlane.minRecreateInterval sets CONTROL_PLANE_MIN_RECREATE_INTERVAL" "$(q "$(docs "${CP9[@]}" --set controlPlane.minRecreateInterval=5m)" "$CPC|.env[]|select(.name==\"CONTROL_PLANE_MIN_RECREATE_INTERVAL\")|.value")" 5m
 eq "no env var has a secretKeyRef or a literal secret" "$(q "$D" "$CPC|[.env[]|select(has(\"valueFrom\"))]|length")" 0
 eq "volumes are the two ConfigMaps"                    "$(q "$D" "$CPP|.volumes|map(.name+\":\"+.configMap.name)|sort|join(\" \")")" "catalog:openagentix-control-plane-catalog policy:openagentix-control-plane-policy"
 eq "probes on the health port"                         "$(q "$D" "$CPC|[.livenessProbe.httpGet.path,.readinessProbe.httpGet.path,.livenessProbe.httpGet.port]|map(tostring)|join(\" \")")" "/healthz /readyz health"
@@ -1697,7 +1683,7 @@ DC=$(docs "${CP9[@]}" --set kagent.workerPool=other-pool)
 eq "a catalog change rolls the pod (checksum differs)" "$([ "$(q "$DC" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" != "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/catalog\"]")" ] && echo differs || echo same)" differs
 DN=$(docs "${CP9[@]}" --set controlPlane.namespace=cp-ns)
 eq "controlPlane.namespace moves the controller"       "$(q "$DN" "$CPD|.metadata.namespace")" cp-ns
-eq "...and the guard names the ServiceAccount there"   "$(q "$DN" "$VP|.spec.matchConditions[0].expression|contains(\"system:serviceaccount:cp-ns:openagentix-control-plane\")")" true
+eq "...and the guard names the ServiceAccount there"   "$(q "$DN" "[$GP|.spec.matchConditions[0].expression|contains(\"system:serviceaccount:cp-ns:openagentix-control-plane\")]|unique|join(\",\")")" true
 
 echo "# control plane: the NetworkPolicy"
 NP='.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-control-plane")'
@@ -1767,9 +1753,6 @@ DS=$(docs "${CP9[@]}" --set controlPlane.policy.suspendAll=true --set 'controlPl
 POLS=$(q "$DS" '.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-control-plane-policy")|.data["policy.json"]')
 eq "policy: suspendAll and inClusterDestinations reach the policy file" "$(jq -c '[.suspendAll,.egress.inClusterDestinations]' <<<"$POLS")" '[true,["registry.ci.svc:5000","db.data.svc.cluster.local:5432"]]'
 eq "a suspendAll change rolls the pod (checksum differs)" "$([ "$(q "$DS" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" != "$(q "$D" "$CPD|.spec.template.metadata.annotations[\"checksum/policy\"]")" ] && echo differs || echo same)" differs
-VPS=$(q "$DS" "$VP|(.spec.variables+.spec.validations)|map(.expression)|join(\"\\n\")")
-eq "guard: the EgressPolicy rule allows exactly the operator's in-cluster destinations (none by default)" "$(printf '%s' "$GEXPR" | command grep -c -F -- 'hp in []')+$(printf '%s' "$VPS" | command grep -c -F -- 'hp in ["registry.ci.svc:5000","db.data.svc.cluster.local:5432"]')" 1+1
-eq "guard: an in-cluster destination can never be one in the tools namespace (the rule keeps that check)" "$(printf '%s' "$VPS" | command grep -c -F -- '["mcp-tools"].exists(')" 1
 
 echo "# control plane: the controller accepts the rendered files"
 if command -v go >/dev/null 2>&1 && [ -d "$CPSVC/cmd/control-plane" ]; then
@@ -1815,6 +1798,12 @@ cpfail "inClusterDestinations with a wildcard fails"   --set 'controlPlane.polic
 cpfail "inClusterDestinations that is an IP fails"     --set 'controlPlane.policy.egress.inClusterDestinations={10.0.0.4:5000}'
 cpfail "inClusterDestinations without a namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={registry:5000}'
 cpfail "inClusterDestinations in the tools namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={vmcp.mcp-tools.svc:4483}'
+cpfail "inClusterDestinations in the agents namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={x.kagent.svc:80}'
+cpfail "inClusterDestinations in the gateway namespace fails" --set 'controlPlane.policy.egress.inClusterDestinations={model-gateway.agentgateway-system.svc:80}'
+cpfail "inClusterDestinations in kube-system fails"    --set 'controlPlane.policy.egress.inClusterDestinations={coredns.kube-system.svc:53}'
+cpfail "inClusterDestinations naming the Kubernetes API fails" --set 'controlPlane.policy.egress.inClusterDestinations={kubernetes.default.svc:443}'
+cpfail "inClusterDestinations naming the Kubernetes API (short) fails" --set 'controlPlane.policy.egress.inClusterDestinations={kubernetes.default:443}'
+cpfail "minRecreateInterval that is not a duration fails" --set controlPlane.minRecreateInterval=often
 cpfail "inClusterDestinations that is not a list fails" --set controlPlane.policy.egress.inClusterDestinations=registry.ci.svc:5000
 cpfail "memoryDefaultTtlDays below 1 fails"            --set controlPlane.memoryDefaultTtlDays=0
 cpfail "maxDefinitions below 1 fails"                  --set controlPlane.maxDefinitions=0

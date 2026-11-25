@@ -501,6 +501,10 @@ controlPlane:
   # The least time between two passes of the controller (a Go duration, e.g. 500ms, 2s). Empty: the controller's own default (1s).
   # Sets CONTROL_PLANE_MIN_INTERVAL only when given.
   minInterval: ""
+  # The least time between two creations of one definition's runtime agent (a Go duration, e.g. 90s, 5m). A suspend and resume loop waits
+  # (Ready=False, ResumeDelayed) instead of thrashing the runtime's snapshots. Empty: the controller's own default (2m).
+  # Sets CONTROL_PLANE_MIN_RECREATE_INTERVAL only when given.
+  minRecreateInterval: ""
   apiServerPorts: [443, 6443]         # 443 is the Service port, 6443 the endpoint port of kind and kubeadm clusters (policies may see either)
   # What kagent uses as the lifetime of a saved memory when a definition sets none (kagent default 15). The controller needs it to check
   # `ttlDays` against policy.memory.maxTtlDays.
@@ -527,10 +531,14 @@ controlPlane:
     egress:
       allowedOrigins: []              # https://host[:port]; a leading "*." stands for exactly one label. Empty: no egress
       # In-cluster destinations (exact host:port, a namespace-qualified service such as registry.ci.svc:5000) that a definition's egress may
-      # name. Every other in-cluster destination stays refused. Empty: none. Never a destination inside the tools namespace (mcp.namespace).
+      # name. Every other in-cluster destination stays refused, and so does a name that only looks public (a last label such as .internal, .local,
+      # .lan, .corp). Empty: none. NEVER a destination inside the tools namespace (mcp.namespace), the agents namespace (kagent.namespace), the gateway
+      # namespace (gateway.namespace) or kube-system, nor the Kubernetes API service (kubernetes.default...): the render fails, the controller refuses to
+      # start and the admission guard refuses them even if they were listed. DNS rebinding of an allowed public name is not handled here (the egress
+      # proxy has to refuse private addresses).
       inClusterDestinations: []
     reservedNames: []                 # more names a definition may not use: "name" in every namespace, "namespace/name" in one (the chart agents and kb, kb-extract, memory are always reserved in the agents namespace)
-    suspendAll: false                 # the operator's stop switch: every definition is treated as suspended (its agent object is removed, nothing else), see the README
+    suspendAll: false                 # the operator's stop switch: every definition is STOPPED: its agent object is removed (conversations end) and its gateway key is cut (resume: the same key, a fresh start), see the README
 
 # ---- Long-term memory (kagent memory + pgvector + local embedding model) ---------------------------------
 # Shared pieces for agents that opt in with `agents[].memory.enabled: true`. Rendered only when at least one agent

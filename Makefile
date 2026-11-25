@@ -15,7 +15,7 @@ define need
 @command -v $(1) >/dev/null || { echo "ERROR: '$(1)' is required$(if $(2), ($(2)))." >&2; exit 1; }
 endef
 
-.PHONY: help test test-go test-chart test-shell test-integration test-console e2e lint lint-go lint-shell secrets cover
+.PHONY: help test test-go test-chart test-shell test-integration test-console test-console-e2e e2e lint lint-go lint-shell secrets cover
 
 help: ## List the targets
 	@awk 'BEGIN{FS=":.*## "} /^[a-zA-Z_-]+:.*## /{printf "  %-18s %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -78,8 +78,26 @@ secrets: ## gitleaks over the whole git history, honouring .gitleaksignore
 	$(call need,gitleaks)
 	gitleaks git --no-banner --redact $(GITLEAKS_ARGS) .
 
-test-console: ## Svelte console unit tests (vitest): not built yet
-	@echo "test-console: not built yet. The console does not exist; see hack/ci/README.md for the job to enable." >&2; exit 1
+test-console: ## Console: pnpm install --frozen-lockfile, lint, svelte-check, vitest (needs Node 22 and pnpm); not the browser tests
+	$(call need,pnpm)
+	cd console && pnpm install --frozen-lockfile && pnpm lint && pnpm check && pnpm test
+
+test-console-e2e: ## Console end-to-end in Chromium against the Go binary in demo mode (needs Node 22, pnpm, Go; installs Chromium)
+	$(call need,pnpm)
+	$(call need,go)
+	services/console/build-web.sh
+	cd console && pnpm exec playwright install --with-deps chromium && pnpm test:e2e
 
 e2e: ## Keyless end-to-end install on kind: not built yet
 	@echo "e2e: not built yet. install.sh needs ANTHROPIC_API_KEY and TELEGRAM_BOT_TOKEN today; see hack/ci/E2E-PLAN.md." >&2; exit 1
+
+# ---- control plane guard tests (own targets: the heavy k8s.io/apiserver dependency stays in hack/ci/guardtest, not in any service module) ----
+.PHONY: test-guard test-apiserver
+
+test-guard: ## Execute the control plane's admission guard (rendered by helm) with the Kubernetes CEL code: hack/ci/guardtest (needs helm, go)
+	$(call need,go)
+	$(call need,helm)
+	cd hack/ci/guardtest && go test ./... -count=1
+
+test-apiserver: ## The CRD and the guard against a real API server in a throwaway kind cluster (oa-ci-test): hack/ci/apiserver-test.sh (needs kind, kubectl, helm, docker, jq, yq)
+	hack/ci/apiserver-test.sh

@@ -1,6 +1,7 @@
 package catalog
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -159,6 +160,34 @@ func TestReservedInNamespace(t *testing.T) {
 	} {
 		if got := ReservedIn(c, p, tc.ns, tc.name); got != tc.want {
 			t.Errorf("%s/%s: got %v want %v", tc.ns, tc.name, got, tc.want)
+		}
+	}
+}
+
+// An operator can list an in-cluster destination, but never one that reaches a platform service around its own controls: the
+// tools namespace, the agents namespace, the gateway namespace, kube-system or the Kubernetes API service (ADR 0012, M5).
+func TestPolicyRefusesPlatformNamespacesAndTheKubernetesAPIInClusterDestinations(t *testing.T) {
+	c, _ := LoadCatalog("../../testdata/catalog.json")
+	var tb struct{ ForbiddenInCluster []string }
+	b, err := os.ReadFile("../../testdata/egress-hosts.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &tb); err != nil {
+		t.Fatal(err)
+	}
+	if len(tb.ForbiddenInCluster) < 6 {
+		t.Fatalf("the table of forbidden destinations shrank: %v", tb.ForbiddenInCluster)
+	}
+	for _, d := range tb.ForbiddenInCluster {
+		p := &Policy{Egress: PolicyEgress{InClusterDestinations: []string{d}}}
+		if err := CheckPolicy(c, p); err == nil || !strings.Contains(err.Error(), "can never be listed") {
+			t.Errorf("%s must be refused at start-up with 'can never be listed', got %v", d, err)
+		}
+	}
+	for _, d := range []string{"registry.ci.svc:5000", "db.data.svc.cluster.local:5432", "docs.kagent.dev:443", "x.mcp-tools.dev:443"} {
+		if err := CheckPolicy(c, &Policy{Egress: PolicyEgress{InClusterDestinations: []string{d}}}); err != nil {
+			t.Errorf("%s is fine to list: %v", d, err)
 		}
 	}
 }

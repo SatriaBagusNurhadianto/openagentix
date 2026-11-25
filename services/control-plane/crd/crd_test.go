@@ -311,3 +311,36 @@ func TestCapabilityEnumsAreStrings(t *testing.T) {
 		}
 	}
 }
+
+// The API server refuses a CRD whose metadata schema says more than `type: object` ("metadata must not have a description":
+// Invalid value... only name and generateName may be specified). A chart that carries such a CRD fails to install, so the
+// schema is pinned here.
+func TestMetadataSchemaIsExactlyTypeObject(t *testing.T) {
+	v := dig(t, load(t), "spec", "versions").([]any)[0]
+	md := dig(t, v, "schema", "openAPIV3Schema", "properties", "metadata")
+	got, _ := json.Marshal(md)
+	if string(got) != `{"type":"object"}` {
+		t.Fatalf("the metadata schema must be exactly {type: object}, got %s", got)
+	}
+}
+
+// The instruction limit is one number, 16384, in bytes: the controller counts bytes, so the schema does too (a rule on the
+// bytes of the text, on top of the cheap maxLength in characters, which is never looser than the byte limit).
+func TestInstructionsLimitIsInBytesToo(t *testing.T) {
+	p := specProps(t)
+	ins := dig(t, p, "instructions").(map[string]any)
+	rules, _ := ins["x-kubernetes-validations"].([]any)
+	found := false
+	for _, r := range rules {
+		m := r.(map[string]any)
+		if m["rule"] == "bytes(self).size() <= 16384" && strings.Contains(m["message"].(string), "16384 bytes") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("instructions needs the rule bytes(self).size() <= 16384: %v", rules)
+	}
+	if ins["maxLength"] != float64(16384) {
+		t.Fatalf("maxLength stays 16384 characters: %v", ins["maxLength"])
+	}
+}

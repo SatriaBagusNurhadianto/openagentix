@@ -116,6 +116,9 @@ type Params struct {
 	// exists it holds that entry's key, so the hash is written under User and nothing is replaced; when it does not, the hash
 	// belongs to nothing and a new key is made as usual.
 	Adopted bool
+	// Hold: the definition is suspended. Ensure makes or finds the key but registers nothing (and rewrites no entry), and the
+	// Result carries the hash to hold. The caller removes an entry that exists.
+	Hold bool
 }
 
 func (p Params) secret(key string) kube.Object {
@@ -146,7 +149,7 @@ func (p Params) secret(key string) kube.Object {
 func Ensure(ctx context.Context, p Params, sec Secrets, reg Registry, mint func() (string, error)) (Result, error) {
 	regFP := Fingerprint(p.Registered)
 	if regFP != "" && p.Known == regFP {
-		if !maps.Equal(p.EntryLabels, p.RegisteredLabels) && (len(p.EntryLabels) > 0 || len(p.RegisteredLabels) > 0) {
+		if !p.Hold && !maps.Equal(p.EntryLabels, p.RegisteredLabels) && (len(p.EntryLabels) > 0 || len(p.RegisteredLabels) > 0) {
 			if err := reg.Register(ctx, p.User, p.Registered, p.EntryLabels); err != nil {
 				return Result{}, fmt.Errorf("update key entry for %s: %w", p.User, err)
 			}
@@ -169,8 +172,10 @@ func Ensure(ctx context.Context, p Params, sec Secrets, reg Registry, mint func(
 	}
 	register := func(key string, out Outcome) (Result, error) {
 		h := Hash(key)
-		if err := reg.Register(ctx, p.User, h, p.EntryLabels); err != nil {
-			return Result{}, fmt.Errorf("register key hash for %s: %w", p.User, err)
+		if !p.Hold {
+			if err := reg.Register(ctx, p.User, h, p.EntryLabels); err != nil {
+				return Result{}, fmt.Errorf("register key hash for %s: %w", p.User, err)
+			}
 		}
 		return Result{Outcome: out, Fingerprint: Fingerprint(h), Hash: h}, nil
 	}

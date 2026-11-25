@@ -202,7 +202,8 @@ jobs:
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
-          context: ${{ matrix.dir }}
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           platforms: linux/amd64
           push: false
           load: false
@@ -210,14 +211,150 @@ jobs:
           cache-to: type=gha,mode=max,scope=image-${{ matrix.name }}
 
   # ---------------------------------------------------------------------------------------------------------------
-  # Console jobs (Svelte): see the commented skeleton in hack/ci/README.md and enable it here when website-independent
-  # console sources exist. Add the job name to `ci-ok.needs` below.
+  guard:
+    # The control plane's admission guard is EXECUTED, not string-matched: the policy objects `helm template` renders for the demo values are
+    # evaluated with the Kubernetes admission CEL code (k8s.io/apiserver) over cases made from the kagent adapter's golden files. Own Go
+    # module (hack/ci/guardtest) so the heavy dependency never touches a service module. Local: `make test-guard`.
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15            # about 2 minutes (most of it compiling k8s.io/apiserver on a cold cache)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: hack/ci/guardtest/go.mod
+          cache: true
+          cache-dependency-path: hack/ci/guardtest/go.sum
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - run: make test-guard
+
+  # ---------------------------------------------------------------------------------------------------------------
+  apiserver:
+    # The AgentDefinition CRD and the admission guard against a real API server in a throwaway kind cluster (one control-plane node, no controller
+    # image, no model): server-side validation of the rendered objects, status.typeChecking of the policies, the example definition, invalid
+    # definitions, and impersonated writes as the controller's ServiceAccount. Local: `make test-apiserver`.
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20            # about 3-5 minutes (kind node image pull, then the cluster)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+      - run: hack/ci/install-tools.sh yq kind
+      - run: make test-apiserver
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Console (Svelte app in console/, Go service in services/console, tested by the `go` and `images` jobs above). Local: `make test-console`,
+  # `make test-console-e2e`.
+  console:
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15            # about 2-3 minutes
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: console/package.json      # the pnpm version is pinned by "packageManager"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm check
+      - run: pnpm test
+      - run: pnpm build
+
+  console-audit:
+    # Known-vulnerability check of the console's npm dependencies. Runtime (production) dependencies block; the full tree,
+    # which holds only build and test tools, is reported and does not.
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: console/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: pnpm audit --prod (blocking)
+        run: pnpm audit --prod
+      - name: pnpm audit, the whole tree (report only)
+        continue-on-error: true
+        run: |
+          pnpm audit 2>&1 | tee audit.txt
+          { echo "### pnpm audit (all dependencies, not blocking)"; echo '```'; tail -3 audit.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  console-e2e:
+    # Playwright (Chromium) against the Go binary in demo mode serving the built web app: no cluster, no model.
+    needs: changes
+    if: needs.changes.outputs.heavy == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20            # about 4-6 minutes (Chromium download, web build, go build)
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: services/console/go.mod
+          cache: true
+          cache-dependency-path: services/console/go.sum
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          package_json_file: console/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: console/pnpm-lock.yaml
+      - name: build the web app and copy it into the Go service (go:embed)
+        run: services/console/build-web.sh
+      - name: install Chromium with its system libraries
+        working-directory: console
+        run: pnpm exec playwright install --with-deps chromium
+      - name: end-to-end tests
+        working-directory: console
+        run: pnpm test:e2e
+      - name: upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: console-playwright-report
+          path: |
+            console/playwright-report
+            console/test-results
+          retention-days: 14
 
   # ---------------------------------------------------------------------------------------------------------------
   ci-ok:
     # The one required status check. Skipped jobs (docs-only change) count as passing; failed or cancelled ones do not.
     if: always()
-    needs: [changes, go, chart, shell, integration, secrets, images]
+    needs: [changes, go, chart, shell, integration, secrets, images, guard, apiserver, console, console-audit, console-e2e]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

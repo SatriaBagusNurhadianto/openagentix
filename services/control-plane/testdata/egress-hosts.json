@@ -1,0 +1,343 @@
+{
+ "about": "Egress hosts the Go check (internal/policy) and the guard's CEL (hack/ci/guardtest) must judge identically. allow: the controller may write the origin; every other origin is refused. Both tests read this file.",
+ "namespaces": {
+  "agents": "kagent",
+  "gateway": "agentgateway-system",
+  "tools": "mcp-tools"
+ },
+ "inCluster": [
+  "registry.ci.svc:5000"
+ ],
+ "forbiddenInCluster": [
+  "kubernetes.default.svc:443",
+  "kubernetes.default:443",
+  "kubernetes.default.svc.cluster.local:443",
+  "x.kube-system.svc:80",
+  "x.kagent.svc:80",
+  "x.agentgateway-system.svc:80",
+  "x.mcp-tools.svc:80",
+  "x.kagent:80"
+ ],
+ "cases": [
+  {
+   "origin": "https://api.osv.dev",
+   "allow": true,
+   "why": "public name"
+  },
+  {
+   "origin": "https://api.osv.dev:8443",
+   "allow": true,
+   "why": "port"
+  },
+  {
+   "origin": "http://example.com",
+   "allow": true,
+   "why": "http, real TLD"
+  },
+  {
+   "origin": "https://*.example.com",
+   "allow": true,
+   "why": "wildcard replaces one label"
+  },
+  {
+   "origin": "https://docs.kagent.dev",
+   "allow": true,
+   "why": "contains the label kagent but is not inside the namespace (M5)"
+  },
+  {
+   "origin": "https://kagent.example.com",
+   "allow": true,
+   "why": "namespace name as the first label of a public name"
+  },
+  {
+   "origin": "https://svc.example.com",
+   "allow": true,
+   "why": "svc is only the first label"
+  },
+  {
+   "origin": "https://my-kagent.example.org",
+   "allow": true,
+   "why": "namespace name inside a label"
+  },
+  {
+   "origin": "https://a.b.c.example.com:443",
+   "allow": true,
+   "why": "deep name"
+  },
+  {
+   "origin": "https://example.org",
+   "allow": true,
+   "why": "example.org is a real name"
+  },
+  {
+   "origin": "https://foo.example.net",
+   "allow": true,
+   "why": "example.net is a real name"
+  },
+  {
+   "origin": "https://mcp-tools.example.com",
+   "allow": true,
+   "why": "tools namespace name as a label of a public name"
+  },
+  {
+   "origin": "https://x.mcp-tools.dev",
+   "allow": true,
+   "why": "namespace name as the second last label"
+  },
+  {
+   "origin": "https://a.agentgateway-system.example.com",
+   "allow": true,
+   "why": "namespace name inside a public domain"
+  },
+  {
+   "origin": "https://registry.ci.svc:5000",
+   "allow": true,
+   "why": "listed by the operator (inClusterDestinations)"
+  },
+  {
+   "origin": "http://registry.ci.svc:5000",
+   "allow": true,
+   "why": "listed host:port, other scheme"
+  },
+  {
+   "origin": "https://foo.svc",
+   "allow": false,
+   "why": "ends in .svc"
+  },
+  {
+   "origin": "https://x.kagent",
+   "allow": false,
+   "why": "short name in the agents namespace"
+  },
+  {
+   "origin": "https://x.y.kagent:8443",
+   "allow": false,
+   "why": "short name in the agents namespace, with a port"
+  },
+  {
+   "origin": "https://x.kagent.svc",
+   "allow": false,
+   "why": "agents namespace, .svc form"
+  },
+  {
+   "origin": "https://x.kagent.svc.cluster.local",
+   "allow": false,
+   "why": "agents namespace, full cluster name"
+  },
+  {
+   "origin": "https://x.agentgateway-system",
+   "allow": false,
+   "why": "gateway namespace"
+  },
+  {
+   "origin": "https://y.agentgateway-system.svc",
+   "allow": false,
+   "why": "gateway namespace, .svc form"
+  },
+  {
+   "origin": "https://x.agentgateway-system.svc:80",
+   "allow": false,
+   "why": "gateway namespace, listed ports do not matter"
+  },
+  {
+   "origin": "https://x.mcp-tools",
+   "allow": false,
+   "why": "tools namespace"
+  },
+  {
+   "origin": "https://x.mcp-tools.svc:4483",
+   "allow": false,
+   "why": "tools namespace, .svc form"
+  },
+  {
+   "origin": "https://x.kube-system",
+   "allow": false,
+   "why": "kube-system"
+  },
+  {
+   "origin": "https://x.kube-system.svc",
+   "allow": false,
+   "why": "kube-system, .svc form"
+  },
+  {
+   "origin": "https://coredns.kube-system.svc.cluster.local",
+   "allow": false,
+   "why": "kube-system, full cluster name"
+  },
+  {
+   "origin": "https://kubernetes.default.svc",
+   "allow": false,
+   "why": "the Kubernetes API service"
+  },
+  {
+   "origin": "https://kubernetes.default",
+   "allow": false,
+   "why": "the Kubernetes API service, short"
+  },
+  {
+   "origin": "https://kubernetes.default.svc.cluster.local",
+   "allow": false,
+   "why": "the Kubernetes API service, full name"
+  },
+  {
+   "origin": "https://kubernetes",
+   "allow": false,
+   "why": "single label"
+  },
+  {
+   "origin": "https://internal.cluster.local",
+   "allow": false,
+   "why": "cluster.local"
+  },
+  {
+   "origin": "https://foo.svc.example.com",
+   "allow": false,
+   "why": "a .svc. label inside the name"
+  },
+  {
+   "origin": "https://metadata",
+   "allow": false,
+   "why": "single label"
+  },
+  {
+   "origin": "https://localhost",
+   "allow": false,
+   "why": "single label"
+  },
+  {
+   "origin": "https://metadata.google.internal",
+   "allow": false,
+   "why": "internal suffix"
+  },
+  {
+   "origin": "https://x.internal",
+   "allow": false,
+   "why": "internal suffix"
+  },
+  {
+   "origin": "https://printer.local",
+   "allow": false,
+   "why": "local suffix"
+  },
+  {
+   "origin": "https://x.localhost",
+   "allow": false,
+   "why": "localhost suffix"
+  },
+  {
+   "origin": "https://nas.lan",
+   "allow": false,
+   "why": "lan suffix"
+  },
+  {
+   "origin": "https://router.home",
+   "allow": false,
+   "why": "home suffix"
+  },
+  {
+   "origin": "https://wiki.corp",
+   "allow": false,
+   "why": "corp suffix"
+  },
+  {
+   "origin": "https://x.test",
+   "allow": false,
+   "why": "test suffix"
+  },
+  {
+   "origin": "https://x.invalid",
+   "allow": false,
+   "why": "invalid suffix"
+  },
+  {
+   "origin": "https://x.example",
+   "allow": false,
+   "why": "example as the last label"
+  },
+  {
+   "origin": "https://x.cluster",
+   "allow": false,
+   "why": "cluster suffix"
+  },
+  {
+   "origin": "https://x.svc",
+   "allow": false,
+   "why": "svc suffix"
+  },
+  {
+   "origin": "http://10.0.0.1",
+   "allow": false,
+   "why": "an address is not an origin"
+  },
+  {
+   "origin": "https://169.254.169.254",
+   "allow": false,
+   "why": "an address is not an origin"
+  },
+  {
+   "origin": "https://127.1",
+   "allow": false,
+   "why": "an address is not an origin"
+  },
+  {
+   "origin": "https://[::1]",
+   "allow": false,
+   "why": "an address is not an origin"
+  },
+  {
+   "origin": "https://API.OSV.DEV",
+   "allow": false,
+   "why": "upper case is not an origin"
+  },
+  {
+   "origin": "https://API.KAGENT.SVC",
+   "allow": false,
+   "why": "upper case is not an origin"
+  },
+  {
+   "origin": "ftp://x.example.com",
+   "allow": false,
+   "why": "scheme"
+  },
+  {
+   "origin": "file:///etc/passwd",
+   "allow": false,
+   "why": "scheme"
+  },
+  {
+   "origin": "api.osv.dev",
+   "allow": false,
+   "why": "no scheme"
+  },
+  {
+   "origin": "https://user@evil.example.com",
+   "allow": false,
+   "why": "userinfo"
+  },
+  {
+   "origin": "https://evil.example.com/path",
+   "allow": false,
+   "why": "path"
+  },
+  {
+   "origin": "https://example.org.",
+   "allow": false,
+   "why": "trailing dot"
+  },
+  {
+   "origin": "https://registry.ci.svc",
+   "allow": false,
+   "why": "port 443 is not the listed port"
+  },
+  {
+   "origin": "https://registry.ci.svc:5001",
+   "allow": false,
+   "why": "another port"
+  },
+  {
+   "origin": "https://other.ci.svc:5000",
+   "allow": false,
+   "why": "another service"
+  }
+ ]
+}

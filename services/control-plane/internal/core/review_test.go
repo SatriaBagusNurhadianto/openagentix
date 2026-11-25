@@ -684,3 +684,125 @@ func TestPerNameStateIsDroppedWhenADefinitionIsDeleted(t *testing.T) {
 		t.Fatalf("state left behind: last=%v fails=%v seen=%v", e.c.last, e.c.fails, e.c.seen)
 	}
 }
+
+// ---- I4 of the security review: a definition whose edit is refused but whose previous generation runs still holds its place ----
+
+func TestARunningDefinitionWhoseEditIsRefusedStillHoldsItsPlaceUnderMaxAgents(t *testing.T) {
+	e, _ := newEnv(t)
+	e.pol.MaxAgents = 2
+	e.seed("a", nil)
+	e.seed("b", nil)
+	e.pass(t)
+	wantCond(t, e.status("a"), "Ready", "True", "Ready")
+	wantCond(t, e.status("b"), "Ready", "True", "Ready")
+
+	e.bumpGeneration("a", func(s map[string]any) { s["model"] = "gpt-9" }) // A's edit is refused; its previous generation keeps running
+	c := defObj("c", nil)
+	c["metadata"].(map[string]any)["creationTimestamp"] = "2026-11-25T09:00:00Z" // older than both, so only the rule below keeps it out
+	e.srv.Seed("agentdefinitions", c)
+
+	for i := 0; i < 3; i++ { // the verdicts must be stable over passes
+		e.pass(t)
+		sa, sc := e.status("a"), e.status("c")
+		wantCond(t, sa, "Applied", "True", "PreviousGenerationRunning")
+		wantCond(t, sa, "Ready", "True", "Ready")
+		wantCond(t, sc, "Accepted", "False", "PolicyViolation")
+		if len(sc.Violations) != 1 || !strings.Contains(sc.Violations[0], "at most 2 agents") {
+			t.Fatalf("pass %d: c must be refused for capacity: %q", i, sc.Violations)
+		}
+		if _, ok := e.srv.Get("widgets", "kagent", "c-w"); ok {
+			t.Fatalf("pass %d: c must not run", i)
+		}
+		if _, ok := e.srv.Get("widgets", "kagent", "a-w"); !ok {
+			t.Fatalf("pass %d: a keeps running", i)
+		}
+		if _, ok := e.srv.Get("widgets", "kagent", "b-w"); !ok {
+			t.Fatalf("pass %d: b keeps running", i)
+		}
+	}
+}
+
+// ---- M12: the previous generation that keeps running is re-rendered against the current catalog ----
+
+func TestKeepPreviousRendersThePreviousSpecAgainstTheCurrentCatalog(t *testing.T) {
+	e, _ := newEnv(t)
+	e.seed("researcher", nil)
+	e.pass(t)
+	gw := func() any {
+		o, ok := e.srv.Get("widgets", "kagent", "researcher-w")
+		if !ok {
+			t.Fatal("the agent object is gone")
+		}
+		return o["spec"].(map[string]any)["gw"]
+	}
+	before := gw()
+	e.bumpGeneration("researcher", func(s map[string]any) { s["model"] = "gpt-9" }) // refused: the previous generation keeps running
+	e.cat.GatewayBaseURL = "http://new-gateway.example/v1"                          // the platform moves while the refusal stands (the image or a digest would do the same)
+	e.pass(t)
+	wantCond(t, e.status("researcher"), "Applied", "True", "PreviousGenerationRunning")
+	if got := gw(); got == before || got != "http://new-gateway.example/v1" {
+		t.Fatalf("the kept objects are stale: gw was %v and is %v (want the current catalog's)", before, got)
+	}
+	// the objects keep the key fingerprint of the running key (they must not roll for nothing)
+	o, _ := e.srv.Get("widgets", "kagent", "researcher-w")
+	if fp := o["spec"].(map[string]any)["fp"]; fp == "" || fp != e.ctl("researcher")["keyFingerprint"] {
+		t.Fatalf("fingerprint %v, recorded %v", fp, e.ctl("researcher")["keyFingerprint"])
+	}
+}
+
+// ---- M13: a change of the team or project label starts a pass without waiting for the resync ----
+
+func TestALabelChangeStartsAPassWithoutWaitingForTheResync(t *testing.T) {
+	e, _ := newEnv(t)
+	e.c.cfg.Resync = time.Hour // the resync must not be what notices
+	o := defObj("researcher", nil)
+	kube.Meta(o)["labels"] = map[string]any{api.LabelTeam: "payments"}
+	e.srv.Seed("agentdefinitions", o)
+	e.runLoop(t)
+	eventually(t, "ready", 5*time.Second, func() bool { return e.status("researcher").Condition("Ready").Status == "True" })
+	time.Sleep(50 * time.Millisecond) // the loop is now waiting on the watch
+
+	// a label the controller never reads changes: no pass is needed
+	passes := e.gw.registerCalls()
+	e.srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) { kube.Meta(o)["labels"].(map[string]any)["unrelated"] = "x" })
+	time.Sleep(100 * time.Millisecond)
+	if e.gw.registerCalls() != passes {
+		t.Fatal("an unrelated label must not cause a write")
+	}
+	// the team label does
+	e.srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) { kube.Meta(o)["labels"].(map[string]any)[api.LabelTeam] = "risk" })
+	eventually(t, "the gateway entry carries the new team", 3*time.Second, func() bool {
+		e.gw.mu.Lock()
+		defer e.gw.mu.Unlock()
+		return e.gw.labels["kagent.researcher"][api.LabelTeam] == "risk"
+	})
+	// ... and so does the project label, also when it is removed
+	e.srv.Modify("agentdefinitions", "kagent", "researcher", func(o kubetest.Object) { kube.Meta(o)["labels"].(map[string]any)[api.LabelProject] = "ledger" })
+	eventually(t, "the gateway entry carries the project", 3*time.Second, func() bool {
+		e.gw.mu.Lock()
+		defer e.gw.mu.Unlock()
+		return e.gw.labels["kagent.researcher"][api.LabelProject] == "ledger"
+	})
+}
+
+// ---- M14: one controller per gateway; the sweep leaves another namespace's entries alone ----
+
+func TestSweepOnlyTouchesItsOwnNamespacePrefixAndTheDotlessOldFormat(t *testing.T) {
+	e, _ := newEnv(t)
+	e.gw.entries["other-ns.agent"] = "sha256:foreign"       // a controller of another agents namespace wrote it: not ours to remove
+	e.gw.entries["kagent.ghost"] = "sha256:ours-but-orphan" // ours, and nobody lists it
+	e.gw.entries["ghost"] = "sha256:previous-format"        // the previous controller's plain name
+	e.seed("researcher", nil)
+	e.pass(t)
+	if _, ok := e.gw.entries["other-ns.agent"]; !ok {
+		t.Fatal("an entry of another namespace must be left alone")
+	}
+	for _, gone := range []string{"kagent.ghost", "ghost"} {
+		if _, ok := e.gw.entries[gone]; ok {
+			t.Fatalf("%s is ours and an orphan: it must be swept", gone)
+		}
+	}
+	if _, ok := e.gw.entries["kagent.researcher"]; !ok {
+		t.Fatal("the live definition keeps its entry")
+	}
+}

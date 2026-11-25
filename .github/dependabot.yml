@@ -17,8 +17,20 @@ updates:
       - /services/notify
       - /bridges/telegram
       - /tools/a2a-call
+      - /services/console
+      - /hack/ci/guardtest
     schedule:
       interval: weekly
     groups:
       go-dependencies:
+        patterns: ['*']
+
+  - package-ecosystem: npm
+    directories:
+      - /console
+      - /website
+    schedule:
+      interval: weekly
+    groups:
+      npm-dependencies:
         patterns: ['*']

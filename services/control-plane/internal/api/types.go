@@ -168,6 +168,12 @@ type ControllerState struct {
 	AppliedSpec       string `json:"appliedSpec"`       // that spec as JSON; a string so a merge patch replaces it whole
 	GatewayUserID     string `json:"gatewayUserId"`     // opaque: "<namespace>.<name>" today
 	ToolServer        string `json:"toolServer"`        // the tool backend the profile resolved to
+	// HeldKeyHash is the registered hash of the agent's key while the definition is suspended and its gateway entry is removed
+	// (so a leaked key is useless meanwhile); it is registered again on resume, so the same key comes back. A hash is not a
+	// secret (it is what the gateway's ConfigMap holds), and the controller never reads Secrets, so status is where it can read it back.
+	HeldKeyHash string `json:"heldKeyHash"`
+	// AgentStartedAt is when the controller last (re)created the runtime agent, RFC 3339. It rate-limits a suspend and resume loop.
+	AgentStartedAt string `json:"agentStartedAt"`
 }
 
 // Status is the status contract (ADR 0012, change 5): the public fields below are what products may read; everything

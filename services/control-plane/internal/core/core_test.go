@@ -83,7 +83,7 @@ func (f *fakeRuntime) Desired(p plan.Plan) ([]kube.Manifest, error) {
 	time.Sleep(f.delay)
 	f.inDesired.Add(-1)
 	mk := func(kind, name string) kube.Object {
-		return kube.Object{"apiVersion": "example.dev/v1", "kind": kind, "metadata": kube.Object{"name": name, "namespace": p.Namespace}, "spec": kube.Object{"model": p.Model, "prompt": p.Prompt, "key": p.KeySecret, "fp": p.KeyFingerprint}}
+		return kube.Object{"apiVersion": "example.dev/v1", "kind": kind, "metadata": kube.Object{"name": name, "namespace": p.Namespace}, "spec": kube.Object{"model": p.Model, "prompt": p.Prompt, "key": p.KeySecret, "fp": p.KeyFingerprint, "gw": p.GatewayBaseURL}}
 	}
 	// like a real runtime adapter with no suspend field: a suspended plan has no "agent" object (the widget) but keeps the rest
 	out := []kube.Manifest{{Resource: gadgets, Object: mk("Gadget", p.Name+"-g")}}

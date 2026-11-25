@@ -1,0 +1,446 @@
+{{- /* the part every policy of the guard shares: fail closed, and look at the controller only */ -}}
+{{- define "oa.cpGuardHead" }}
+  failurePolicy: Fail
+  matchConditions:
+    # Only the controller's ServiceAccount (username system:serviceaccount:<namespace>:<name>).
+    - name: only-the-controller
+      expression: {{ printf "request.userInfo.username == %s" (printf "system:serviceaccount:%s:%s" .ns .sa | toJson) | toJson }}
+{{- end }}
+{{- if include "oa.cpOn" . }}
+{{- $ns := include "oa.cpNamespace" . }}
+{{- $kns := .Values.kagent.namespace }}
+{{- $gns := .Values.gateway.namespace }}
+{{- $sa := "openagentix-control-plane" }}
+{{- $keyCM := "llm-api-keys-control-plane" }}
+{{- $cat := include "oa.cpCatalog" . | fromJson }}
+{{- $rk := $cat.runtime.kagent }}
+{{- $pol := .Values.controlPlane.policy | default dict }}
+{{- $mem := $pol.memory | default dict }}
+{{- $inCluster := ($pol.egress | default dict).inClusterDestinations | default list }}
+{{- /* each tool server of the profiles and the tools it serves: an AgentTemplate's tool list must be a subset of the server's own */ -}}
+{{- $serverTools := dict }}{{ range $cat.tools.toolhive.profiles }}{{ $_ := set $serverTools .toolServer .tools }}{{ end }}
+{{- $servers := keys $serverTools | sortAlpha }}
+{{- $skillRefs := $cat.skills | default dict | values | sortAlpha }}
+{{- $internalSuffixes := list "internal" "local" "localhost" "svc" "cluster" "lan" "home" "corp" "test" "invalid" "example" }}
+{{- $originRE := "^https?://(\\*\\.([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+|([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)*)[a-z]([-a-z0-9]{0,61}[a-z0-9])?(:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?$" }}
+{{- /* the two labels and an AgentDefinition owner reference of the control plane; %[1]s is the object that is judged */ -}}
+{{- $own := "has(%[1]s.metadata) && has(%[1]s.metadata.labels) && 'app.kubernetes.io/managed-by' in %[1]s.metadata.labels && %[1]s.metadata.labels['app.kubernetes.io/managed-by'] == 'openagentix-control-plane' && 'openagentix.io/agent-definition' in %[1]s.metadata.labels && has(%[1]s.metadata.ownerReferences) && %[1]s.metadata.ownerReferences.exists(r, has(r.apiVersion) && r.apiVersion.startsWith('openagentix.io/') && has(r.kind) && r.kind == 'AgentDefinition' && has(r.name) && r.name == %[1]s.metadata.labels['openagentix.io/agent-definition'] && has(r.controller) && r.controller == true)" }}
+{{- /* the same field of the old and the new object is equal, or absent in both */ -}}
+{{- $same := "(has(variables.cur.metadata.%[1]s) ? (has(variables.prev.metadata.%[1]s) && variables.cur.metadata.%[1]s == variables.prev.metadata.%[1]s) : !has(variables.prev.metadata.%[1]s))" }}
+{{- /* every key of an owner reference the API knows; another controller may add an owner reference of its own to a kagent object */ -}}
+{{- $refKeys := "['apiVersion', 'kind', 'name', 'uid', 'controller', 'blockOwnerDeletion']" }}
+{{- /* what the API server (and another controller, for kagent's own objects) may add to metadata of an object the control plane applies */ -}}
+{{- $metaKeys := "['name', 'namespace', 'labels', 'annotations', 'ownerReferences', 'uid', 'resourceVersion', 'generation', 'creationTimestamp', 'deletionTimestamp', 'deletionGracePeriodSeconds', 'finalizers', 'managedFields']" }}
+{{- $labelValue := "^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$" }}
+{{- /* ---- one policy per kind: [name, resource group, apiVersions, resources, short description] ---- */ -}}
+{{- $kagentKinds := list
+      (dict "id" "modelconfigs" "kind" "ModelConfig")
+      (dict "id" "harnesses" "kind" "Harness")
+      (dict "id" "agenttemplates" "kind" "AgentTemplate")
+      (dict "id" "egresspolicies" "kind" "EgressPolicy")
+      (dict "id" "agents" "kind" "Agent") }}
+{{- /* the annotations the kagent adapter puts on each kind (ModelConfig: the agent it belongs to; Harness and Agent: the key fingerprint) */ -}}
+{{- $annotationRule := dict
+      "modelconfigs" "!has(variables.cur.metadata.annotations) || (variables.cur.metadata.annotations.all(k, k == 'openagentix.io/agent') && variables.cur.metadata.annotations.all(k, variables.cur.metadata.annotations[k] == variables.agent))"
+      "harnesses" "!has(variables.cur.metadata.annotations) || variables.cur.metadata.annotations.all(k, k == 'openagentix.io/key-fingerprint' && type(variables.cur.metadata.annotations[k]) == string && variables.cur.metadata.annotations[k].matches('^[0-9a-f]{1,16}$'))"
+      "agents" "!has(variables.cur.metadata.annotations) || variables.cur.metadata.annotations.all(k, k == 'openagentix.io/key-fingerprint' && type(variables.cur.metadata.annotations[k]) == string && variables.cur.metadata.annotations[k].matches('^[0-9a-f]{1,16}$'))"
+      "agenttemplates" "!has(variables.cur.metadata.annotations)"
+      "egresspolicies" "!has(variables.cur.metadata.annotations)" }}
+# The output guard: limits what even a compromised controller can write. EIGHT policies, each with its own binding (Deny), all evaluated for the
+# controller's ServiceAccount only (matchConditions); every other user is unaffected. failurePolicy Fail: if a policy cannot be evaluated the write is
+# refused, never allowed. One policy per kind, so that each one matches one resource and its expressions read fields without guessing the kind.
+#
+# AN ALLOWLIST AT EVERY LEVEL. For each of the five kagent kinds, the key set of the object, of metadata, of spec and of every nested object is the set the
+# controller's kagent adapter really writes (internal/adapters/kagent; the golden files services/control-plane/testdata/golden-*.json), plus what the
+# API server and kagent add on their own (server-set metadata, status, finalizers). A key the adapter does not set is REFUSED, whatever its value:
+# that is how fields nobody thought of (a Harness command, a ModelConfig header, an EgressPolicy authentication.secretKeyRef, an AgentTemplate plugin)
+# stay out. On top of the keys, the values that matter are pinned to the platform catalog: the model, the tool servers and each server's own tools, the
+# skills, the harness image, worker pool, snapshot location and memory ModelConfig, the gateway URL, the key Secret, the names derived from the
+# agent's own name, and the egress hosts.
+#   guard-secrets        Secrets: create and delete only, in the agents namespace; the key Secret has one exact shape; delete only the own Secrets
+#   guard-configmaps     the key ConfigMap at the gateway: update only, entries <agents namespace>.<name> of one exact JSON shape, nothing else changes
+#   guard-modelconfigs   guard-harnesses   guard-agenttemplates   guard-egresspolicies   guard-agents    the five kagent kinds
+#   guard-other          the last rule: any other resource, verb or subresource the controller's ServiceAccount reaches is refused (its RBAC says the same;
+#                        this holds even if a Role is widened). Its own definitions (finalizer, status) are excluded.
+# The tests that EXECUTE these expressions are in hack/ci/guardtest (make test-guard) and, against a real API server, hack/ci/apiserver-test.sh.
+# Notes on the CEL, valid for every expression below:
+#  - `object` and `oldObject` are read through the variables cur and prev, which are dyn: a field is read only behind has(...), a missing field makes the
+#    expression false (refused) or an error (also refused, the policy fails closed), never allowed;
+#  - on DELETE `object` is null and the old state is `oldObject`; on CREATE `oldObject` is null. variables.subject picks the one that exists;
+#  - `a || b` is true when one side is true even if the other side errors, so a rule starts with "this is not my operation";
+#  - o.all(k, k in [...]) over an object is "every key of o is one of these": the allowlist idiom. A dyn map iterates over its keys.
+{{- /* ---- Secrets ---- */}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openagentix-control-plane-guard-secrets
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  matchConstraints:
+    resourceRules:
+      # UPDATE is matched so that the policy can REFUSE it: the key Secret is immutable, replaced and never edited
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [secrets]
+  {{- include "oa.cpGuardHead" (dict "ns" $ns "sa" $sa) }}
+  variables:
+    - name: cur
+      expression: "dyn(object)"
+    - name: prev
+      expression: "dyn(oldObject)"
+    - name: del
+      expression: "request.operation == 'DELETE'"
+    # The state that is judged: the new object, or on DELETE the old one (object is null then).
+    - name: subject
+      expression: "variables.del ? variables.prev : variables.cur"
+    # The agent a key Secret belongs to: its name without the 21 characters of "-virtual-key-" and the 8 hex characters ('' for a shorter name).
+    - name: secretAgent
+      expression: "has(variables.subject.metadata.name) && size(variables.subject.metadata.name) > 21 ? variables.subject.metadata.name.substring(0, size(variables.subject.metadata.name) - 21) : ''"
+  validations:
+    # Only create and delete, only in the agents namespace (an UPDATE is refused: the key Secret is immutable and replaced, never edited).
+    - message: {{ printf "the control plane may only create or delete Secrets, in the namespace %s" $kns | quote }}
+      expression: {{ printf "request.operation in ['CREATE', 'DELETE'] && request.namespace == %s" ($kns | toJson) | toJson }}
+    # CREATE: name <agent>-virtual-key-<8 hex>; both labels and nothing else, the agent-definition label equal to the name's prefix; exactly one owner
+    # reference (AgentDefinition, controller true, named like the label); immutable; Opaque; a single data key OPENAI_API_KEY (the API server has merged
+    # stringData into data before admission; a stringData that is still there is refused with every key outside the allowlist below).
+    - message: "a Secret created by the control plane must be <name>-virtual-key-<8 hex>, labelled and owned by that AgentDefinition, immutable, Opaque, with the single key OPENAI_API_KEY, and carry nothing else"
+      expression: |-
+        request.operation != 'CREATE' || (
+          variables.cur.all(k, k in ['apiVersion', 'kind', 'metadata', 'type', 'immutable', 'data']) &&
+          has(variables.cur.metadata.name) && variables.cur.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?-virtual-key-[0-9a-f]{8}$') &&
+          variables.cur.metadata.all(k, k in {{ $metaKeys }}) &&
+          has(variables.cur.metadata.labels) && variables.cur.metadata.labels.all(k, k in ['app.kubernetes.io/managed-by', 'openagentix.io/agent-definition']) &&
+          'app.kubernetes.io/managed-by' in variables.cur.metadata.labels && variables.cur.metadata.labels['app.kubernetes.io/managed-by'] == 'openagentix-control-plane' &&
+          'openagentix.io/agent-definition' in variables.cur.metadata.labels && variables.cur.metadata.labels['openagentix.io/agent-definition'] == variables.secretAgent &&
+          (!has(variables.cur.metadata.annotations) || variables.cur.metadata.annotations.all(k, k == 'openagentix.io/key-fingerprint' && type(variables.cur.metadata.annotations[k]) == string && variables.cur.metadata.annotations[k].matches('^[0-9a-f]{1,16}$'))) &&
+          has(variables.cur.metadata.ownerReferences) && size(variables.cur.metadata.ownerReferences) == 1 &&
+          variables.cur.metadata.ownerReferences.all(r, r.all(k, k in {{ $refKeys }}) && has(r.apiVersion) && r.apiVersion.startsWith('openagentix.io/') && has(r.kind) && r.kind == 'AgentDefinition' &&
+            has(r.name) && r.name == variables.secretAgent && has(r.controller) && r.controller == true) &&
+          has(variables.cur.immutable) && variables.cur.immutable == true &&
+          has(variables.cur.type) && variables.cur.type == 'Opaque' &&
+          has(variables.cur.data) && size(variables.cur.data) == 1 && 'OPENAI_API_KEY' in variables.cur.data && size(variables.cur.data['OPENAI_API_KEY']) <= 64)
+    # DELETE: the EXISTING Secret has the name pattern and both labels (agent-definition = the name's prefix). This is the real bound of the delete
+    # right: kagent's database Secrets, the provider keys and every other Secret of the namespace can never be deleted by the controller.
+    - message: "the control plane may only delete Secrets named <name>-virtual-key-<8 hex> that carry both labels of the control plane"
+      expression: |-
+        request.operation != 'DELETE' || (
+          has(variables.prev.metadata.name) && variables.prev.metadata.name.matches('^[a-z]([-a-z0-9]*[a-z0-9])?-virtual-key-[0-9a-f]{8}$') &&
+          has(variables.prev.metadata.labels) &&
+          'app.kubernetes.io/managed-by' in variables.prev.metadata.labels && variables.prev.metadata.labels['app.kubernetes.io/managed-by'] == 'openagentix-control-plane' &&
+          'openagentix.io/agent-definition' in variables.prev.metadata.labels && variables.prev.metadata.labels['openagentix.io/agent-definition'] == variables.secretAgent)
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openagentix-control-plane-guard-secrets
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  policyName: openagentix-control-plane-guard-secrets
+  validationActions: [Deny]
+{{- /* ---- the key ConfigMap ---- */}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openagentix-control-plane-guard-configmaps
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [configmaps]
+  {{- include "oa.cpGuardHead" (dict "ns" $ns "sa" $sa) }}
+  variables:
+    - name: cur
+      expression: "dyn(object)"
+    - name: prev
+      expression: "dyn(oldObject)"
+  validations:
+    # Only an UPDATE (the controller PATCHes single entries; the chart creates the ConfigMap) of its own key ConfigMap at the gateway.
+    # RBAC says the same by resourceNames and verbs; this holds even if a Role is widened.
+    - message: {{ printf "the control plane may only update the ConfigMap %s/%s" $gns $keyCM | quote }}
+      expression: {{ printf "request.operation == 'UPDATE' && request.namespace == %s && request.name == %s" ($gns | toJson) ($keyCM | toJson) | toJson }}
+    # Nothing but the entries changes: the labels (the gateway's key policy selects this ConfigMap by one of them), the annotations, the owner references and the
+    # finalizers are the ones the ConfigMap already has; there is no binaryData and it does not become immutable.
+    - message: "the control plane may only change the data of its key ConfigMap, not its labels, annotations, owner references, finalizers, binaryData or immutable flag"
+      expression: |-
+        request.operation != 'UPDATE' || (
+          variables.cur.all(k, k in ['apiVersion', 'kind', 'metadata', 'data']) &&
+          variables.cur.metadata.all(k, k in {{ $metaKeys }}) &&
+          {{ printf $same "labels" }} && {{ printf $same "annotations" }} && {{ printf $same "ownerReferences" }} && {{ printf $same "finalizers" }})
+    # The entries: the key is <agents namespace>.<definition name>, the value is exactly {"keyHash":"sha256:<64 hex>","metadata":{"user_id":"<key>"[,"team":..][,"project":..]}},
+    # the text the gateway adapter writes (no whitespace, the key order fixed, team and project the shape of a label value). An entry that was there before and is
+    # unchanged is kept as it is (the previous controller's plain-name entries stay until the sweep removes them); one that is NEW or CHANGED must be of that shape.
+    # So a compromised controller cannot register a key for any other user id.
+    - message: {{ printf "an entry of the key ConfigMap must be named %s.<name> and hold exactly {\"keyHash\":\"sha256:<64 hex>\",\"metadata\":{\"user_id\":<its name>[,\"team\":..][,\"project\":..]}}" $kns | quote }}
+      expression: |-
+        request.operation != 'UPDATE' || !has(variables.cur.data) || variables.cur.data.all(k,
+          (k.matches({{ printf "^%s\\.[a-z]([-a-z0-9]*[a-z0-9])?$" $kns | toJson }}) && size(k) <= {{ add (len $kns) 41 }} &&
+           type(variables.cur.data[k]) == string &&
+           variables.cur.data[k].matches('^\\{"keyHash":"sha256:[0-9a-f]{64}","metadata":\\{"user_id":"[a-z0-9.-]+"(,"team":"[A-Za-z0-9._-]{1,63}")?(,"project":"[A-Za-z0-9._-]{1,63}")?\\}\\}$') &&
+           variables.cur.data[k].contains('"user_id":"' + k + '"')) ||
+          (has(variables.prev.data) && k in variables.prev.data && variables.prev.data[k] == variables.cur.data[k]))
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openagentix-control-plane-guard-configmaps
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  policyName: openagentix-control-plane-guard-configmaps
+  validationActions: [Deny]
+{{- /* ---- the five kagent kinds ---- */}}
+{{- range $k := $kagentKinds }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ printf "openagentix-control-plane-guard-%s" $k.id }}
+  labels:
+    app: control-plane
+    {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [api.kagent.dev]
+        apiVersions: ["*"]
+        operations: [CREATE, UPDATE, DELETE]
+        resources: [{{ $k.id }}]
+  {{- include "oa.cpGuardHead" (dict "ns" $ns "sa" $sa) }}
+  variables:
+    # The new and the old object as dyn: the allowlists below iterate over keys, which a typed schema would not allow.
+    - name: cur
+      expression: "dyn(object)"
+    - name: prev
+      expression: "dyn(oldObject)"
+    - name: del
+      expression: "request.operation == 'DELETE'"
+    # The state that is judged: the new object, or on DELETE the old one (object is null then).
+    - name: subject
+      expression: "variables.del ? variables.prev : variables.cur"
+    # The definition the object claims to belong to (its agent-definition label), '' when it has none. Every other check compares against it
+    # and the ownership rule below makes sure an owner reference to a definition of that very name stands behind it.
+    - name: agent
+      expression: "has(variables.subject.metadata.labels) && 'openagentix.io/agent-definition' in variables.subject.metadata.labels ? variables.subject.metadata.labels['openagentix.io/agent-definition'] : ''"
+    # Ownership of the NEW object (not judged on DELETE): both labels and an owner reference of kind AgentDefinition with controller true whose name is the
+    # label's value. exists(): another controller may add an owner reference of its own to a kagent object.
+    - name: ownedNew
+      expression: {{ printf $own "variables.cur" | printf "variables.del || (%s)" | toJson }}
+    # Ownership of the EXISTING object (not judged on CREATE) and the same definition as the new object: the controller may not update or delete an object it
+    # does not own, nor move one to another definition.
+    - name: ownedOld
+      expression: {{ printf $own "variables.prev" | printf "request.operation == 'CREATE' || ((%s) && variables.prev.metadata.labels['openagentix.io/agent-definition'] == variables.agent)" | toJson }}
+  validations:
+    # In the agents namespace, owned (new and existing), and a definition name that is a DNS label of at most 40 characters.
+    - message: "the control plane may only write kagent objects that it owns (labels managed-by and agent-definition, and an owner reference to that AgentDefinition), in the agents namespace"
+      expression: {{ printf "request.namespace == %s && variables.ownedNew && variables.ownedOld && variables.agent.matches('^[a-z]([-a-z0-9]*[a-z0-9])?$') && size(variables.agent) <= 40" ($kns | toJson) | toJson }}
+    # Allowlist of metadata: the keys, the labels (the two of the control plane and the reserved team and project), the annotations the adapter sets on this kind,
+    # the owner reference keys. Nothing else: no generateName, no other label or annotation.
+    - message: "a {{ $k.kind }} written by the control plane may carry only the metadata the controller writes (name, namespace, its labels, its annotations, owner references) and what the API server adds"
+      expression: |-
+        variables.del || (
+          variables.cur.all(k, k in ['apiVersion', 'kind', 'metadata', 'spec', 'status']) &&
+          has(variables.cur.metadata) && variables.cur.metadata.all(k, k in {{ $metaKeys }}) &&
+          has(variables.cur.metadata.name) && variables.cur.metadata.labels.all(k, k in ['app.kubernetes.io/managed-by', 'openagentix.io/agent-definition', 'openagentix.io/team', 'openagentix.io/project']) &&
+          variables.cur.metadata.labels.all(k, !(k in ['openagentix.io/team', 'openagentix.io/project']) || (type(variables.cur.metadata.labels[k]) == string && size(variables.cur.metadata.labels[k]) <= 63 && variables.cur.metadata.labels[k].matches({{ $labelValue | toJson }}))) &&
+          ({{ index $annotationRule $k.id }}) &&
+          variables.cur.metadata.ownerReferences.all(r, r.all(k, k in {{ $refKeys }})) &&
+          (!has(variables.cur.metadata.finalizers) || variables.cur.metadata.finalizers.all(f, type(f) == string && size(f) <= 253)))
+{{- /* the spec rules of each kind */}}
+{{- if eq $k.id "modelconfigs" }}
+    # ModelConfig gateway-<agent>: provider OpenAI, a model of the catalog, base URL the model gateway (so the provider key behind default-model-config is out of
+    # reach), the data key OPENAI_API_KEY and the key Secret of its own agent: <agent>-virtual-key-<8 hex> (a prefix, a length and a hex test; no agent text goes
+    # into a regex). Keys: provider, model, apiKeySecret, apiKeySecretKey, stream (false), openAI.baseUrl, openAI.apiFormat (the CRD default). NOT: defaultHeaders,
+    # tls, actorJwt, tokenPassthrough, allowedNamespaces, any other provider block, any other openAI field.
+    - message: "a ModelConfig written by the control plane may only have the keys provider, model, apiKeySecret, apiKeySecretKey, stream and openAI.{baseUrl, apiFormat}"
+      expression: |-
+        variables.del || (has(variables.cur.spec) && variables.cur.spec.all(k, k in ['provider', 'model', 'apiKeySecret', 'apiKeySecretKey', 'stream', 'openAI']) &&
+          has(variables.cur.spec.openAI) && variables.cur.spec.openAI.all(k, k in ['baseUrl', 'apiFormat']))
+    - message: {{ printf "a ModelConfig written by the control plane must be gateway-<agent>, use provider OpenAI, a model of the platform catalog, the gateway URL %s and its own <agent>-virtual-key-<8 hex> Secret" $cat.gatewayBaseUrl | quote }}
+      expression: |-
+        variables.del || (
+          variables.cur.metadata.name == 'gateway-' + variables.agent &&
+          has(variables.cur.spec.provider) && variables.cur.spec.provider == 'OpenAI' &&
+          has(variables.cur.spec.model) && variables.cur.spec.model in {{ $cat.models | toJson }} &&
+          (!has(variables.cur.spec.stream) || variables.cur.spec.stream == false) &&
+          has(variables.cur.spec.openAI.baseUrl) && variables.cur.spec.openAI.baseUrl == {{ $cat.gatewayBaseUrl | toJson }} &&
+          (!has(variables.cur.spec.openAI.apiFormat) || variables.cur.spec.openAI.apiFormat == 'chatCompletions') &&
+          has(variables.cur.spec.apiKeySecretKey) && variables.cur.spec.apiKeySecretKey == 'OPENAI_API_KEY' &&
+          has(variables.cur.spec.apiKeySecret) && variables.cur.spec.apiKeySecret.startsWith(variables.agent + '-virtual-key-') &&
+          size(variables.cur.spec.apiKeySecret) == size(variables.agent) + 21 &&
+          variables.cur.spec.apiKeySecret.substring(size(variables.agent) + 13).matches('^[0-9a-f]{8}$'))
+{{- else if eq $k.id "harnesses" }}
+    # Harness <agent>-harness. Keys: kagent.memory.{modelConfigRef.{name,namespace}, ttlDays}, workload.image, substrate.{workerPoolRef.name, snapshotPolicy.location},
+    # env[].{name,value}. NOT: workload.command or args, byo, claude, codex, kagent.compaction (its summarizer names a ModelConfig), any other key at any depth.
+    - message: "a Harness written by the control plane may only have the keys kagent.memory{modelConfigRef{name, namespace}, ttlDays}, workload.image, substrate{workerPoolRef.name, snapshotPolicy.location} and env[]{name, value}"
+      expression: |-
+        variables.del || (has(variables.cur.spec) && variables.cur.spec.all(k, k in ['kagent', 'workload', 'substrate', 'env']) &&
+          has(variables.cur.spec.workload) && variables.cur.spec.workload.all(k, k in ['image']) &&
+          has(variables.cur.spec.substrate) && variables.cur.spec.substrate.all(k, k in ['workerPoolRef', 'snapshotPolicy']) &&
+          (!has(variables.cur.spec.substrate.workerPoolRef) || variables.cur.spec.substrate.workerPoolRef.all(k, k in ['name'])) &&
+          (!has(variables.cur.spec.substrate.snapshotPolicy) || variables.cur.spec.substrate.snapshotPolicy.all(k, k in ['location'])) &&
+          (!has(variables.cur.spec.kagent) || variables.cur.spec.kagent.all(k, k in ['memory'])) &&
+          (!has(variables.cur.spec.kagent) || !has(variables.cur.spec.kagent.memory) || variables.cur.spec.kagent.memory.all(k, k in ['modelConfigRef', 'ttlDays'])) &&
+          (!has(variables.cur.spec.kagent) || !has(variables.cur.spec.kagent.memory) || !has(variables.cur.spec.kagent.memory.modelConfigRef) || variables.cur.spec.kagent.memory.modelConfigRef.all(k, k in ['name', 'namespace'])) &&
+          (!has(variables.cur.spec.env) || variables.cur.spec.env.all(e, e.all(k, k in ['name', 'value']))))
+    # The catalog image, worker pool and snapshot location (no other code, pool or store); a memory only when the policy allows it, only on the catalog's memory
+    # ModelConfig in the agents namespace, with a ttlDays within the policy maximum; env entries only exactly those of the catalog's harnessEnv (an entry with a
+    # valueFrom is not equal to one).
+    - message: "a Harness written by the control plane must use the image, worker pool, snapshot location, memory ModelConfig and env of the platform catalog"
+      expression: |-
+        variables.del || (
+          variables.cur.metadata.name == variables.agent + '-harness' &&
+          has(variables.cur.spec.workload.image) && variables.cur.spec.workload.image == {{ $rk.harnessImage | toJson }} &&
+          has(variables.cur.spec.substrate.workerPoolRef) && has(variables.cur.spec.substrate.workerPoolRef.name) &&
+          variables.cur.spec.substrate.workerPoolRef.name == {{ $rk.workerPool | toJson }} &&
+          has(variables.cur.spec.substrate.snapshotPolicy) && has(variables.cur.spec.substrate.snapshotPolicy.location) &&
+          variables.cur.spec.substrate.snapshotPolicy.location == {{ $rk.snapshotLocation | toJson }} &&
+{{- if $mem.allowed }}
+          (!has(variables.cur.spec.kagent) || !has(variables.cur.spec.kagent.memory) ||
+            (has(variables.cur.spec.kagent.memory.modelConfigRef) && has(variables.cur.spec.kagent.memory.modelConfigRef.name) &&
+             variables.cur.spec.kagent.memory.modelConfigRef.name == {{ $rk.memoryModelConfig | toJson }} &&
+             (!has(variables.cur.spec.kagent.memory.modelConfigRef.namespace) || variables.cur.spec.kagent.memory.modelConfigRef.namespace == {{ $kns | toJson }}) &&
+             (!has(variables.cur.spec.kagent.memory.ttlDays) || (type(variables.cur.spec.kagent.memory.ttlDays) == int && variables.cur.spec.kagent.memory.ttlDays >= 1 && variables.cur.spec.kagent.memory.ttlDays <= {{ int $mem.maxTtlDays }}))) ) &&
+{{- else }}
+          (!has(variables.cur.spec.kagent) || !has(variables.cur.spec.kagent.memory)) &&
+{{- end }}
+          (!has(variables.cur.spec.env) || variables.cur.spec.env.all(e, has(e.name) && has(e.value) && e in {{ $rk.harnessEnv | toJson }})))
+{{- else if eq $k.id "agenttemplates" }}
+    # AgentTemplate <agent>-template. Keys: description, systemPrompt, modelConfig.name, tools[].mcp.{server.{kind,name}, tools}, skills[].{name, source.oci}.
+    # NOT: plugins, promptTemplate (dataSources), systemPromptFrom, outputSchema, outputSchemaFrom, a modelConfig or server namespace or apiGroup, requireApproval,
+    # a subAgent tool, a skill source other than an OCI reference.
+    - message: "an AgentTemplate written by the control plane may only have the keys description, systemPrompt, modelConfig.name, tools[].mcp{server{kind, name}, tools} and skills[]{name, source.oci}"
+      expression: |-
+        variables.del || (has(variables.cur.spec) && variables.cur.spec.all(k, k in ['description', 'systemPrompt', 'modelConfig', 'tools', 'skills']) &&
+          has(variables.cur.spec.modelConfig) && variables.cur.spec.modelConfig.all(k, k in ['name']) &&
+          (!has(variables.cur.spec.tools) || variables.cur.spec.tools.all(t, t.all(k, k in ['mcp']) && has(t.mcp) && t.mcp.all(k, k in ['server', 'tools']) && has(t.mcp.server) && t.mcp.server.all(k, k in ['kind', 'name']))) &&
+          (!has(variables.cur.spec.skills) || variables.cur.spec.skills.all(s, s.all(k, k in ['name', 'source']) && has(s.source) && s.source.all(k, k in ['oci']))))
+    # Every tool entry is an MCP tool of a profile's RemoteMCPServer, and its tool list is a subset of THAT server's own tools (the profile's), never absent (absent
+    # means every tool of the server). kagent-tool-server (which holds a cluster-admin token), kagent-api and the shared vMCP are not on the list. The skills are the
+    # digest-pinned references of the catalog (a skill is code that runs in the agent's sandbox).
+    - message: "an AgentTemplate written by the control plane may only use the tool servers of the tool profiles, with a subset of that profile's tools, and the skills of the platform catalog"
+      expression: |-
+        variables.del || (
+          (!has(variables.cur.spec.tools) || variables.cur.spec.tools.all(t, has(t.mcp.server.kind) && t.mcp.server.kind == 'RemoteMCPServer' && has(t.mcp.server.name) && t.mcp.server.name in {{ $servers | toJson }} &&
+            has(t.mcp.tools) && type(t.mcp.tools) == list && t.mcp.tools.all(n, type(n) == string && n in {{ $serverTools | toJson }}[t.mcp.server.name]))) &&
+          (!has(variables.cur.spec.skills) || variables.cur.spec.skills.all(s, has(s.source.oci) && s.source.oci in {{ $skillRefs | toJson }})))
+    # <agent>-template, on the agent's own ModelConfig gateway-<agent> (the adapter writes spec.modelConfig.name, never a namespace).
+    - message: "an AgentTemplate written by the control plane must be named <agent>-template and use the ModelConfig gateway-<agent>"
+      expression: |-
+        variables.del || (
+          variables.cur.metadata.name == variables.agent + '-template' && has(variables.cur.spec.modelConfig.name) &&
+          variables.cur.spec.modelConfig.name == 'gateway-' + variables.agent)
+{{- else if eq $k.id "egresspolicies" }}
+    # EgressPolicy <agent>-egress. Keys: destinations[].origin. NOT authentication (the egress gateway injects the value of the Secret it names as a header
+    # towards the origin: a compromised controller could send any Secret of the namespace to an outside host), nor any other key.
+    - message: "an EgressPolicy written by the control plane may only have destinations[]{origin}: no authentication, no header, no other key"
+      expression: |-
+        variables.del || (
+          variables.cur.metadata.name == variables.agent + '-egress' && has(variables.cur.spec) && variables.cur.spec.all(k, k in ['destinations']) &&
+          has(variables.cur.spec.destinations) && variables.cur.spec.destinations.all(d, d.all(k, k in ['origin'])))
+    # The origin has the shape the chart and the controller accept (https://host[:port], lower case DNS name, one leading *. label, no path, no user, no address).
+    # The host rules, identical to the Go check (internal/policy, catalog.ForbiddenEgressHost and InternalEgressHost; one table of cases drives both tests):
+    #  - NEVER, whatever the operator listed: a host inside the tools, agents or gateway namespace or kube-system (ends with .<ns>, .<ns>.svc or .<ns>.svc.cluster.local),
+    #    or the Kubernetes API service (kubernetes, kubernetes.default and its .svc forms);
+    #  - only when the operator listed exactly its host:port (the scheme's default port when it names none; none by default): a host that is not public from the
+    #    cluster's point of view: no dot, an IP address, a .svc. label, or a last label in the internal list (internal, local, localhost, svc, cluster, lan, home, corp, test,
+    #    invalid, example: names that only look public; example.org, example.com and example.net are real names and stay allowed).
+    # DNS rebinding of an allowed public name is not handled here: it needs enforcement at the egress proxy. ([x].all(h, ...) binds a value once.)
+    - message: "an EgressPolicy written by the control plane may not name a host inside the cluster (.svc, .cluster.local, a namespace of the platform or kube-system, the Kubernetes API, an IP address, a name without a dot, a name that ends in .internal, .local, .lan, .corp ...), except the exact host:port entries the operator lists (never a platform namespace)"
+      expression: |-
+        variables.del || (has(variables.cur.spec.destinations) && variables.cur.spec.destinations.all(d, has(d.origin) && type(d.origin) == string && size(d.origin) <= 270 && d.origin.matches({{ $originRE | toJson }}) &&
+          [d.origin.split('://')[1]].all(authority, [authority.split(':')[0]].all(h0, [h0.startsWith('*.') ? h0.substring(2) : h0].all(host,
+            [authority.contains(':') ? authority : authority + (d.origin.startsWith('https://') ? ':443' : ':80')].all(hp,
+              !{{ list $cat.namespaces.tools $cat.namespaces.agents $cat.namespaces.gateway "kube-system" | toJson }}.exists(n, host.endsWith('.' + n) || host.endsWith('.' + n + '.svc') || host.endsWith('.' + n + '.svc.cluster.local')) &&
+              host != 'kubernetes' && host != 'kubernetes.default' && !host.startsWith('kubernetes.default.') &&
+              ((host.contains('.') && !host.matches('^[0-9.]+$') && !host.contains('.svc.') && !({{ $internalSuffixes | toJson }}.exists(s, host.endsWith('.' + s)))) ||
+               hp in {{ $inCluster | toJson }})))))))
+{{- else if eq $k.id "agents" }}
+    # Agent <agent>: its template, harness and egress policy are the ones of its own name (it cannot be pointed at another agent's objects), and nothing else is set:
+    # no inline template, no namespace on a reference.
+    - message: "an Agent written by the control plane may only have template.ref.name, harnessRef.name and egressPolicyRefs[].name"
+      expression: |-
+        variables.del || (has(variables.cur.spec) && variables.cur.spec.all(k, k in ['template', 'harnessRef', 'egressPolicyRefs']) &&
+          has(variables.cur.spec.template) && variables.cur.spec.template.all(k, k in ['ref']) && has(variables.cur.spec.template.ref) && variables.cur.spec.template.ref.all(k, k in ['name']) &&
+          has(variables.cur.spec.harnessRef) && variables.cur.spec.harnessRef.all(k, k in ['name']) &&
+          (!has(variables.cur.spec.egressPolicyRefs) || variables.cur.spec.egressPolicyRefs.all(r, r.all(k, k in ['name']))))
+    - message: "an Agent written by the control plane must reference <agent>-template, <agent>-harness and <agent>-egress only"
+      expression: |-
+        variables.del || (
+          variables.cur.metadata.name == variables.agent &&
+          has(variables.cur.spec.template.ref.name) && variables.cur.spec.template.ref.name == variables.agent + '-template' &&
+          has(variables.cur.spec.harnessRef.name) && variables.cur.spec.harnessRef.name == variables.agent + '-harness' &&
+          (!has(variables.cur.spec.egressPolicyRefs) || (size(variables.cur.spec.egressPolicyRefs) <= 1 && variables.cur.spec.egressPolicyRefs.all(r, has(r.name) && r.name == variables.agent + '-egress'))))
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ printf "openagentix-control-plane-guard-%s" $k.id }}
+  labels:
+    app: control-plane
+    {{- include "oa.labels" $ | nindent 4 }}
+spec:
+  policyName: {{ printf "openagentix-control-plane-guard-%s" $k.id }}
+  validationActions: [Deny]
+{{- end }}
+{{- /* ---- the last rule ---- */}}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: openagentix-control-plane-guard-other
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  matchConstraints:
+    resourceRules:
+      # every resource, every subresource, every verb ("*/*" is the one entry that matches main resources and subresources; the API refuses "*" next to others)
+      - apiGroups: ["*"]
+        apiVersions: ["*"]
+        operations: ["*"]
+        resources: ["*/*"]
+    # ... except what the other policies of the guard judge, and the controller's own definitions: the finalizer (an UPDATE) and the status (a patch on the subresource)
+    excludeResourceRules:
+      - apiGroups: [""]
+        apiVersions: ["*"]
+        operations: ["*"]
+        resources: [secrets, configmaps]
+      - apiGroups: [api.kagent.dev]
+        apiVersions: ["*"]
+        operations: ["*"]
+        resources: [modelconfigs, harnesses, agenttemplates, egresspolicies, agents]
+      - apiGroups: [openagentix.io]
+        apiVersions: ["*"]
+        operations: [UPDATE]
+        resources: [agentdefinitions, agentdefinitions/status]
+  {{- include "oa.cpGuardHead" (dict "ns" $ns "sa" $sa) }}
+  validations:
+    # The controller's ServiceAccount writes Secrets, one ConfigMap, the five kagent kinds and its own definitions, and nothing else.
+    - message: "the control plane may only write Secrets, its key ConfigMap, the kagent kinds it owns and the status and finalizer of its AgentDefinitions; this write is refused"
+      expression: "false"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: openagentix-control-plane-guard-other
+  labels:
+    app: control-plane
+    {{- include "oa.labels" . | nindent 4 }}
+spec:
+  policyName: openagentix-control-plane-guard-other
+  validationActions: [Deny]
+{{- end }}

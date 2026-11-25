@@ -18,6 +18,7 @@ var reasons = map[string][]Reason{
 	CondKeyReady: {
 		{"KeyReady", "True", "the agent's gateway key exists and its hash is registered"},
 		{"KeyFailed", "False", "the key could not be created or registered; the message says why"},
+		{"KeySuspended", "False", "the definition is suspended: the key exists but the gateway does not know it, so it opens nothing; it is registered again on resume"},
 		{"NotAccepted", "Unknown", "the definition is refused, so no key is made"},
 		{"NotApplied", "Unknown", "an earlier step (the name check) stopped the pass before the key"},
 	},
@@ -36,7 +37,8 @@ var reasons = map[string][]Reason{
 	},
 	CondReady: {
 		{"Ready", "True", "the agent is callable at status.endpoint at status.revision"},
-		{"Suspended", "False", "suspended by spec.suspend or by the operator (policy suspendAll): the agent takes no new work; nothing is wrong"},
+		{"Suspended", "False", "suspended by spec.suspend or by the operator (policy suspendAll): the runtime agent is removed (running conversations end) and the key is cut; nothing is wrong"},
+		{"ResumeDelayed", "False", "resumed too soon after the runtime agent was created: it stays stopped until the minimum time between two creations has passed; the message says until when"},
 		{"NotAccepted", "False", "the definition is refused (or its objects were removed)"},
 		{"NotApplied", "False", "the objects of this generation are not written yet or could not be"},
 		{"ReadinessUnknown", "False", "the runtime's state could not be read"},

@@ -87,7 +87,7 @@ func run(ctx context.Context, getenv func(string) string, d deps) error {
 		Namespace: cat.Namespaces.Agents, Catalog: cat, Policy: pol,
 		Kube: cl, Secrets: &keys.KubeSecrets{C: cl},
 		Runtime: kagent.New(cat, cl), Gateway: agentgateway.New(cl, cat.Namespaces.Gateway), Tools: toolhive.New(cat),
-		Log: d.Log, Mint: d.Mint, Resync: cfg.Resync, Backoff: cfg.Backoff, MinInterval: cfg.MinInterval,
+		Log: d.Log, Mint: d.Mint, Resync: cfg.Resync, Backoff: cfg.Backoff, MinInterval: cfg.MinInterval, MinRecreateInterval: cfg.MinRecreateInterval,
 	})
 
 	mux := http.NewServeMux()

@@ -1,2 +1,3 @@
 # Go modules CI does not build (one directory per line). Modules whose go.mod replaces a module with a path outside this
 # repository are skipped automatically; list anything else here, with a reason.
+hack/ci/guardtest   # own module with the heavy k8s.io/apiserver dependency, run by `make test-guard` and the `guard` CI job (kept out of the service-module matrix and out of `make test-go`)

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"regexp"
@@ -259,7 +260,7 @@ type PolicyMemory struct {
 type PolicyEgress struct {
 	AllowedOrigins []string `json:"allowedOrigins"`
 	// InClusterDestinations are the only in-cluster destinations (exact host:port) a definition's egress may name; the rule
-	// that refuses every in-cluster destination has exactly this exception. Default none. Never the tools namespace.
+	// that refuses every in-cluster destination has exactly this exception. Default none. Never the tools, agents or gateway namespace, kube-system or the Kubernetes API (CheckPolicy).
 	InClusterDestinations []string `json:"inClusterDestinations"`
 }
 
@@ -307,18 +308,66 @@ func ReservedIn(c *Catalog, p *Policy, ns, name string) bool {
 	return slices.Contains(p.ReservedNames, name) || slices.Contains(p.ReservedNames, ns+"/"+name)
 }
 
-// CheckPolicy checks the policy against the catalog: an in-cluster destination may never be inside the tools namespace
-// (that would reach a tool server around its profile).
+// InternalSuffixes are the last labels of names that only look public: nothing offline can tell whether `printer.local` or
+// `wiki.corp` resolves inside the cluster's network, so a host that ends in one of them is treated as internal. `example` is
+// there on purpose and `example.org`, `example.com` and `example.net` are not: those are real names.
+var InternalSuffixes = []string{"internal", "local", "localhost", "svc", "cluster", "lan", "home", "corp", "test", "invalid", "example"}
+
+// HostInNamespace reports whether host (lower case, no port) is a name inside the Kubernetes namespace ns: it ends with
+// ".<ns>", ".<ns>.svc" or ".<ns>.svc.cluster.local". A name that merely contains the namespace as a label
+// (docs.kagent.dev) is not inside it.
+func HostInNamespace(host, ns string) bool {
+	if ns == "" {
+		return false
+	}
+	for _, suf := range []string{ns, ns + ".svc", ns + ".svc.cluster.local"} {
+		if strings.HasSuffix(host, "."+suf) {
+			return true
+		}
+	}
+	return false
+}
+
+// ForbiddenEgressHost reports whether host may never be an egress destination, listed by the operator or not, and says why:
+// a name inside the tools, agents or gateway namespace or kube-system (it would reach a platform service around that
+// service's own controls), or the Kubernetes API service (kubernetes.default and its .svc forms).
+func ForbiddenEgressHost(host string, ns Namespaces) (string, bool) {
+	for _, n := range []struct{ what, name string }{{"tools", ns.Tools}, {"agents", ns.Agents}, {"gateway", ns.Gateway}, {"kube-system", "kube-system"}} {
+		if HostInNamespace(host, n.name) {
+			if n.what == "tools" {
+				return fmt.Sprintf("inside the tools namespace %q: that would reach a tool server around its profile", n.name), true
+			}
+			return fmt.Sprintf("inside the %s namespace %q: that would reach a platform service around its own controls", n.what, n.name), true
+		}
+	}
+	if host == "kubernetes" || host == "kubernetes.default" || strings.HasPrefix(host, "kubernetes.default.") {
+		return "the Kubernetes API service", true
+	}
+	return "", false
+}
+
+// InternalEgressHost reports whether host (lower case, no port, a leading "*." already cut) is not a public name from the
+// cluster's point of view: an address, a name without a dot, a name whose last label is an InternalSuffixes entry, or a name
+// with a ".svc." label (a cluster name under any cluster domain). Such a host is refused unless the operator lists exactly its host:port.
+func InternalEgressHost(host string) bool {
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	i := strings.LastIndexByte(host, '.')
+	if i < 0 {
+		return true
+	}
+	return slices.Contains(InternalSuffixes, host[i+1:]) || strings.Contains(host, ".svc.")
+}
+
+// CheckPolicy checks the policy against the catalog: an in-cluster destination may never be one that reaches a platform
+// service around its own controls (see ForbiddenEgressHost).
 func CheckPolicy(c *Catalog, p *Policy) error {
 	var errs []error
 	for _, d := range p.Egress.InClusterDestinations {
 		h, _, _ := strings.Cut(d, ":")
-		ns := c.Namespaces.Tools
-		for _, suf := range []string{ns, ns + ".svc", ns + ".svc.cluster.local"} {
-			if h == suf || strings.HasSuffix(h, "."+suf) {
-				errs = append(errs, fmt.Errorf("egress.inClusterDestinations entry %q is inside the tools namespace %q and can never be listed", d, ns))
-				break
-			}
+		if why, bad := ForbiddenEgressHost(h, c.Namespaces); bad {
+			errs = append(errs, fmt.Errorf("egress.inClusterDestinations entry %q is %s and can never be listed", d, why))
 		}
 	}
 	return errors.Join(errs...)

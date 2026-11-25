@@ -524,8 +524,11 @@ the users from the render and fails if one is missing. */ -}}
 {{- if not (and (kindIs "string" $x) (regexMatch "^[a-z]([-a-z0-9]{0,61}[a-z0-9])?([.][a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?)+:([1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5])$" $x)) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v must be host:port with a namespace-qualified service name (service.namespace.svc:5000) and a numeric port: no scheme, no wildcard, no address" $x) }}{{ end }}
 {{- $h := first (splitList ":" $x) }}
 {{- if regexMatch "^[0-9.]+$" $h }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is an address, not a service name" $x) }}{{ end }}
-{{- $tn := $.Values.mcp.namespace }}
-{{- if or (hasSuffix (printf ".%s" $tn) $h) (hasSuffix (printf ".%s.svc" $tn) $h) (hasSuffix (printf ".%s.svc.cluster.local" $tn) $h) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is inside the tools namespace %q: that would reach a tool server around its profile and can never be listed" $x $tn) }}{{ end }}
+{{- /* never listable, whatever the operator wants: a name inside the tools, agents or gateway namespace or kube-system (it would reach a platform service around its own controls), or the Kubernetes API service. The controller refuses the same at start-up and the admission guard refuses them too. */ -}}
+{{- range $what, $fn := (dict "tools" $.Values.mcp.namespace "agents" $.Values.kagent.namespace "gateway" $.Values.gateway.namespace "kube-system" "kube-system") }}
+{{- if or (hasSuffix (printf ".%s" $fn) $h) (hasSuffix (printf ".%s.svc" $fn) $h) (hasSuffix (printf ".%s.svc.cluster.local" $fn) $h) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is inside the %s namespace %q: that would reach a platform service around its own controls and can never be listed" $x $what $fn) }}{{ end }}
+{{- end }}
+{{- if or (eq $h "kubernetes") (eq $h "kubernetes.default") (hasPrefix "kubernetes.default." $h) }}{{ fail (printf "controlPlane.policy.egress.inClusterDestinations entry %v is the Kubernetes API service and can never be listed" $x) }}{{ end }}
 {{- end }}
 {{- if ne (len $ic) (len (uniq $ic)) }}{{ fail "controlPlane.policy.egress.inClusterDestinations lists an entry twice" }}{{ end -}}
 {{- if and $p.allowNotify (not (and .Values.notify.enabled .Values.mcp.enabled)) }}{{ fail "controlPlane.policy.allowNotify needs notify.enabled=true and mcp.enabled=true: the catalog has no notify tools, so every definition asking for notify would be refused" }}{{ end -}}
@@ -539,6 +542,7 @@ the users from the render and fails if one is missing. */ -}}
 {{- end }}
 {{- if not (or (kindIs "float64" $c.maxDefinitions) (kindIs "int64" $c.maxDefinitions) (kindIs "int" $c.maxDefinitions)) }}{{ fail "controlPlane.maxDefinitions must be a whole number" }}{{ end -}}
 {{- if lt (int $c.maxDefinitions) 1 }}{{ fail (printf "controlPlane.maxDefinitions must be at least 1, got %v" $c.maxDefinitions) }}{{ end -}}
+{{- if and $c.minRecreateInterval (not (regexMatch "^([0-9]+(\\.[0-9]+)?(ms|s|m|h))+$" (toString $c.minRecreateInterval))) }}{{ fail (printf "controlPlane.minRecreateInterval must be a duration with a unit, such as 90s or 5m (empty: the controller's default, 2m), got %v" $c.minRecreateInterval) }}{{ end -}}
 {{- if and $c.minInterval (not (regexMatch "^([0-9]+(\\.[0-9]+)?(ms|s|m|h))+$" (toString $c.minInterval))) }}{{ fail (printf "controlPlane.minInterval must be a duration with a unit, such as 500ms or 2s (empty: the controller's default), got %v" $c.minInterval) }}{{ end -}}
 {{- if not (kindIs "slice" $c.apiServerPorts) }}{{ fail "controlPlane.apiServerPorts must be a list of port numbers" }}{{ end -}}
 {{- range $x := $c.apiServerPorts }}

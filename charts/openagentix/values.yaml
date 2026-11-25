@@ -540,6 +540,27 @@ controlPlane:
     reservedNames: []                 # more names a definition may not use: "name" in every namespace, "namespace/name" in one (the chart agents and kb, kb-extract, memory are always reserved in the agents namespace)
     suspendAll: false                 # the operator's stop switch: every definition is STOPPED: its agent object is removed (conversations end) and its gateway key is cut (resume: the same key, a fresh start), see the README
 
+# ---- Console (ADR 0007, slice 3): the web console for the control plane --------------------------------------------------
+# Opt-in. It needs controlPlane.enabled (the CRD, the catalog and the policy it shows). One replica, no Ingress and nobody may connect to it
+# in the cluster (the NetworkPolicy admits no ingress): reach it with `kubectl port-forward -n <namespace> svc/openagentix-console 8080:8080`
+# and sign in with the token in the Secret below (install.sh creates it, 48 random characters, only when absent, never printed).
+# Its ServiceAccount may read and write AgentDefinitions in the agents namespace (viewer: read only) and list four kagent kinds; no Secret.
+console:
+  enabled: false
+  image: {repository: openagentix/console, tag: dev, pullPolicy: IfNotPresent}   # built from services/console (context: the repository root) by install.sh
+  sourceHash: ""                      # install.sh sets it to a hash of services/console and console (the tag stays "dev")
+  namespace: ""                       # empty = the release namespace. It must be the control plane's namespace: the console mounts the two ConfigMaps that live there
+  tokenSecret: {name: console-token, key: token}   # the login token (at least 32 characters, the console refuses a weaker one); created by install.sh, mounted as a file
+  viewer: false                       # true: every write is refused and the Role has no write verb
+  allowedHosts: []                    # more Host names the console answers (an Ingress name); localhost, 127.0.0.1 and [::1] are always accepted. The probes send Host: localhost
+  # The API server addresses the console may reach (NetworkPolicy egress), set by install.sh like controlPlane.apiServerCIDRs. Empty: the
+  # API server ports towards ANY address (a closed policy would cut the console off).
+  apiServerCIDRs: []
+  apiServerPorts: [443, 6443]
+  resources:
+    requests: {cpu: 10m, memory: 32Mi}
+    limits: {cpu: 250m, memory: 128Mi}
+
 # ---- Long-term memory (kagent memory + pgvector + local embedding model) ---------------------------------
 # Shared pieces for agents that opt in with `agents[].memory.enabled: true`. Rendered only when at least one agent
 # does. kagent stores every memory as a vector(768) row in its own PostgreSQL (install.sh / components/runtime turn pgvector

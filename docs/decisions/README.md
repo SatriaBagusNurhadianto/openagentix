@@ -18,7 +18,7 @@ Bug fixes, tests, documentation and changes that follow an accepted ADR do not n
 
 1. **Issue.** Open an issue with the `kind/design` label (use the "Design proposal" template). It states the problem, not the solution. Triage adds `status/needs-design` while the question is open.
 2. **Draft.** Copy [`0000-template.md`](0000-template.md) to the next free number, `NNNN-short-title.md`, set the status to `Proposed`, and open a pull request. One ADR per pull request. Link the issue.
-3. **Discussion.** Review happens in the pull request. Objections give a reason and, if possible, an alternative. The pull request stays open at least 7 days for a change to a public resource, a default or the security model (see [GOVERNANCE.md](../../GOVERNANCE.md)).
+3. **Discussion.** Review happens in the pull request. Objections give a reason and, if possible, an alternative. The pull request stays open at least 7 days for a change to a public resource, a default or the security model (see [GOVERNANCE.md](https://github.com/openagentix/openagentix/blob/main/GOVERNANCE.md)).
 4. **Decision.** A maintainer merges the pull request with the status set to one of:
    - `Accepted`: the direction is decided. Slices are then built, each with tests.
    - `Rejected`: kept in the repository, with the reasons, so the question is not asked again from scratch.

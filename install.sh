@@ -27,6 +27,9 @@
 #   SKIP_NOTIFY_IMAGE=1  do not build/load the notify image (services/notify); it is only built when notify.enabled is true
 #   SKIP_A2A_GATE_IMAGE=1  do not build/load the A2A gate image (services/a2a-gate); it is only built when governance.a2a.enabled is true
 #   SKIP_CONTROL_PLANE_IMAGE=1  do not build/load the control plane image (services/control-plane); it is only built when controlPlane.enabled is true
+#   SKIP_CONSOLE_IMAGE=1  do not build/load the console image (services/console + console); it is only built when console.enabled is true
+#   CONSOLE_APISERVER_CIDRS="10.0.0.0/24 ..."  the API server addresses the console's NetworkPolicy allows (comma or space separated);
+#                        default: derived like the control plane's, unless console.apiServerCIDRs is set in a values file
 #   CONTROL_PLANE_APISERVER_CIDRS="10.0.0.0/24 ..."  the API server addresses the control plane's NetworkPolicy allows (comma or space separated);
 #                        default: derived like Agent Kourier's (components/channels/apiserver-cidrs.sh), unless controlPlane.apiServerCIDRs is set in a values file
 #   VALUES_FILE="a.yaml b.yaml"  extra values files for the chart, space-separated, applied in order (maps are merged, lists
@@ -56,6 +59,12 @@
 # the hash of its source and the API server addresses to the chart, and waits for the Deployment. It does nothing per agent: an AgentDefinition
 # (components/control-plane/researcher.yaml) is applied by you, and the controller makes its key, its objects and its registration. The installer never touches
 # the controller's key ConfigMap (llm-api-keys-control-plane) nor the Secrets of built agents; the CRD stays when the release is uninstalled.
+# The web console (ADR 0007, slice 3) is opt-in too: the ONE switch is the chart value console.enabled (components/console/demo-values.yaml, which needs the control plane).
+# When the chart renders it, this script builds its image with the REPOSITORY ROOT as the build context (docker build -f services/console/Dockerfile .: the
+# Dockerfile builds the web app, so Docker and network access are needed), loads it into kind, passes the hash of both sources and the API server addresses to the
+# chart, creates the login token Secret console-token (48 random characters, only when absent, never printed, kept on re-runs), waits for the Deployment and tells
+# you how to open it (kubectl port-forward; the token is read with a command it prints, never echoed by the installer). Nobody can connect to the console
+# inside the cluster, and there is no Ingress.
 # Long-term memory (agents[].memory.enabled): needs pgvector in kagent's PostgreSQL; step 3b below enables it. The embedding
 # ModelConfig's gateway key (Secret memory-virtual-key in the kagent namespace) is created like the agents' keys.
 # The knowledge block creates (only when absent, never overwritten, so they stay stable across re-runs) the Secrets
@@ -145,6 +154,7 @@ KB_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="kb")' <<<"$RENDE
 NOTIFY_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="notify")' <<<"$RENDERED")   # empty when notify.enabled=false
 A2A_GATE_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="a2a-gate")' <<<"$RENDERED")   # empty when governance.a2a.enabled=false
 CP_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="openagentix-control-plane")' <<<"$RENDERED")   # empty when controlPlane.enabled=false
+CN_DEP=$(jq -c 'select(.kind=="Deployment" and .metadata.name=="openagentix-console")' <<<"$RENDERED")   # empty when console.enabled=false
 # A Deployment asks for one key per annotation SET: openagentix.io/gateway-user<sfx> (the user id), gateway-key-secret<sfx> (the Secret) and,
 # optionally, gateway-key-name<sfx> (the Secret key, default OPENAI_API_KEY); <sfx> is empty for the first set, "-extract" for the kb's
 # extraction key. Annotation names are unique per object, so a second key on one Deployment needs a second suffix: the earlier one-pair lookup
@@ -380,6 +390,17 @@ if [ -n "$A2A_GATE_DEP" ]; then
   echo "Secret $GATE_NS/$GATE_KEYS_S: $GATE_KEYS_N key hash(es) (one per Kourier binding)"
 fi
 
+# --- 4e. console login token (only when the chart renders the console) ----------------------------------------------------
+# Secret <console ns>/<tokenSecret.name> key <tokenSecret.key>: 48 random characters (the console refuses fewer than 32), created only when absent, so a re-run
+# never signs anybody out. The value never reaches output, argv or disk.
+if [ -n "$CN_DEP" ]; then
+  log "console token"
+  CN_NS=$(jq -r '.metadata.namespace' <<<"$CN_DEP")
+  CN_TOKEN_S=$(jq -r '.spec.template.spec.volumes[]|select(.name=="token")|.secret.secretName' <<<"$CN_DEP")
+  CN_TOKEN_K=$(jq -r '.spec.template.spec.volumes[]|select(.name=="token")|.secret.items[0].key' <<<"$CN_DEP")
+  mk_random_secret "$CN_NS" "$CN_TOKEN_S" "$CN_TOKEN_K" 24
+fi
+
 # --- 5. images ----------------------------------------------------------------------------------------------
 SET=()
 if [ "${SKIP_BRIDGE_IMAGE:-0}" != 1 ] && [[ "$BRIDGE_IMAGE" == openagentix/telegram-bridge:* ]]; then
@@ -418,6 +439,12 @@ if [ "${SKIP_CONTROL_PLANE_IMAGE:-0}" != 1 ] && [[ "$CP_IMAGE" == openagentix/co
   log "control-plane image $CP_IMAGE"
   docker build -q -t "$CP_IMAGE" services/control-plane >/dev/null
   kind load docker-image "$CP_IMAGE" --name "$CLUSTER"
+fi
+CN_IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"${CN_DEP:-null}" 2>/dev/null || true)
+if [ "${SKIP_CONSOLE_IMAGE:-0}" != 1 ] && [[ "$CN_IMAGE" == openagentix/console:* ]]; then
+  log "console image $CN_IMAGE (build context: the repository root; it builds the web app inside Docker)"
+  docker build -q -t "$CN_IMAGE" -f services/console/Dockerfile . >/dev/null
+  kind load docker-image "$CN_IMAGE" --name "$CLUSTER"
 fi
 if [ -n "$BRIDGE_IMAGE" ]; then
   # Same for the bridge (image tag "dev"): the pod template carries a hash of bridges/telegram, so changed code replaces the pod.
@@ -463,6 +490,26 @@ if [ -n "$CP_DEP" ]; then
     CP_CIDRS=$(kourier_apiserver_cidrs "${CONTROL_PLANE_APISERVER_CIDRS:-}" "$CP_EPS" "$CP_NODES") || die "could not find the API server address for the control plane's NetworkPolicy; set CONTROL_PLANE_APISERVER_CIDRS"
     echo "control plane: its NetworkPolicy lets it reach the API server at $CP_CIDRS"
     SET+=(--set-json "controlPlane.apiServerCIDRs=$CP_CIDRS")
+  fi
+fi
+if [ -n "$CN_DEP" ]; then
+  # Same for the console: a hash of services/console AND console (the web app) rolls the pod on a code change although the tag stays "dev".
+  # Build outputs (node_modules, console/build, .svelte-kit, web/dist) are left out: they follow from the sources.
+  CN_HASH=$( {
+    (cd services/console && find . -type f ! -path './bin/*' ! -path './web/dist/*' ! -name '*.md' ! -name '*.test' ! -name '*_test.go' ! -name 'coverage*' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256); \
+    (cd console && find . -type f ! -path './node_modules/*' ! -path './build/*' ! -path './.svelte-kit/*' ! -path './test-results/*' ! -path './playwright-report/*' ! -path './.vite/*' ! -name '*.md' -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256); } | shasum -a 256 | cut -c1-16)
+  SET+=(--set-string "console.sourceHash=$CN_HASH")
+  if jq -e -s 'any(.[]; .kind=="NetworkPolicy" and .metadata.name=="openagentix-console" and ([.spec.egress[]?.to[]?|select(has("ipBlock"))]|length)==0)' <<<"$RENDERED" >/dev/null; then
+    # shellcheck source=components/channels/apiserver-cidrs.sh
+    . components/channels/apiserver-cidrs.sh
+    CN_EPS=""; CN_NODES=""
+    if [ -z "$(printf '%s' "${CONSOLE_APISERVER_CIDRS:-}" | tr -d '[:space:],')" ]; then
+      CN_EPS=$($K get endpointslices.discovery.k8s.io -n default -l kubernetes.io/service-name=kubernetes -o json)
+      CN_NODES=$($K get nodes -o json 2>/dev/null || echo '{"items":[]}')   # only used to recognise kind
+    fi
+    CN_CIDRS=$(kourier_apiserver_cidrs "${CONSOLE_APISERVER_CIDRS:-}" "$CN_EPS" "$CN_NODES") || die "could not find the API server address for the console's NetworkPolicy; set CONSOLE_APISERVER_CIDRS"
+    echo "console: its NetworkPolicy lets it reach the API server at $CN_CIDRS"
+    SET+=(--set-json "console.apiServerCIDRs=$CN_CIDRS")
   fi
 fi
 if [ "${SKIP_SKILL:-0}" != 1 ] && jq -e 'select(.kind=="AgentTemplate")|.spec.skills[]?|select(.source.oci|test("/skills/openagentix-canary@"))' <<<"$RENDERED" >/dev/null; then
@@ -554,6 +601,18 @@ if [ -n "$CP_DEP" ]; then
   log "control plane"
   $K rollout status deployment/openagentix-control-plane -n "$(jq -r '.metadata.namespace' <<<"$CP_DEP")" --timeout=180s
   echo "AgentDefinitions: kubectl apply -f components/control-plane/researcher.yaml (the controller does the rest); $K get agentdefinitions -n $KAGENT_NS"
+fi
+
+if [ -n "$CN_DEP" ]; then
+  log "console"
+  $K rollout status deployment/openagentix-console -n "$CN_NS" --timeout=180s
+  CN_VIEWER=""; jq -e '.spec.template.spec.containers[0].env[]?|select(.name=="CONSOLE_VIEWER")' <<<"$CN_DEP" >/dev/null 2>&1 && CN_VIEWER=" (read-only: console.viewer is true)"
+  cat <<EOT
+Console$CN_VIEWER: nobody can connect to it inside the cluster; open it from your machine:
+  $K port-forward -n $CN_NS svc/openagentix-console 8080:8080        then open http://127.0.0.1:8080
+Sign in with the token in Secret $CN_NS/$CN_TOKEN_S. This script does not print it; read it yourself (it lands in your terminal only):
+  $K get secret -n $CN_NS $CN_TOKEN_S -o jsonpath='{.data.$CN_TOKEN_K}' | base64 -d; echo
+EOT
 fi
 
 # Tool profiles (mcp.profiles, ADR 0006 round 2): each is one more vMCP pod; an agent on a profile finds no tools until its vMCP is Ready.

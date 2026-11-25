@@ -60,6 +60,9 @@ Planned kinds, one per slice, in this order:
 | `ToolServer` and `ToolProfile` | `mcp.servers`, `mcp.profiles` | ToolHive MCPServer or MCPServerEntry, VirtualMCPServer, RemoteMCPServer | a new server image is a supply-chain decision: digest required, operator approval |
 | `KnowledgeCollection` and `KnowledgeSource` | `hack/kb-ingest.sh`, `hack/kb-graph-load.sh` | kb collections, ingest jobs, graph settings, fact sets | connectors (Git, web, object storage) are sources with a sync schedule |
 | `Skill` | `skills` map of digests in values | entry in the organisation's skill registry | see "Skill registry" |
+| `ObservabilitySettings` | the `observability` values block | gateway tracing, vMCP telemetry, runtime and channel OTLP settings, scrape targets | content capture stays off unless the operator's policy allows it |
+| `NotifyDestination` | the destinations Secret created by the installer | notify service destinations | creating a way to message a person stays an explicit opt-in |
+| `PlatformPolicy` | `controlPlane.policy`, gate caller rules, egress limits | the policy the controllers enforce | written by operators only; the console shows it and, later, edits it under a separate role |
 
 Each kind gets its own short decision record when its slice starts, because each has its own security questions (who may add a provider key, who may add a tool server image, what a connector may fetch). The mechanism is the one decided here: schema, policy, narrow controller, status, admission guard.
 
@@ -87,6 +90,13 @@ So the `openagentix.io` kinds are the platform's own contract and carry no upstr
 | `Scheduler` | timed runs | Kubernetes CronJob with `a2a-call` | a workflow engine |
 | `Knowledge` | collections, sources, graph | `services/kb` | an external knowledge service |
 | `SkillStore` | stores and resolves skill artifacts | in-cluster OCI registry | an external registry |
+| `Observability` | where traces and metrics go, and where the console reads turns, cost and usage from | bundled VictoriaMetrics and Jaeger, or an OTLP endpoint | Prometheus, Tempo, Grafana, a vendor backend |
+| `Memory` | long-term memory settings, expiry, a user's list and forget | kagent memory in PostgreSQL with pgvector | another memory service |
+| `Sandbox` | isolation, per-session identity, egress rules | Agent Substrate (gVisor) | another sandbox runtime |
+| `Notify` | destinations an agent may message | `services/notify` | another notification service |
+| `Governance` | who may call an agent, audit | the A2A gate | a service mesh or API gateway policy |
+
+The list is open: a new area of the platform comes with its kind and its adapter interface.
 
 The platform catalog names the active adapter of each interface (`runtime: kagent`, and so on). One adapter per interface is active in a cluster in this version; running two runtimes side by side is not a goal now.
 

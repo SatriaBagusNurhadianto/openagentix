@@ -2,6 +2,8 @@
 
 Status: Accepted as direction (2026-11-25). The licence text of the enterprise edition and the pricing are business decisions that need legal review; this record fixes the technical split and the rules, so that code can be written on the right side from now on.
 
+> **Changed by [ADR 0011](0011-foundation-readiness.md) (2026-11-25).** The project aims at a foundation, which will own the name OpenAgentix. So in this record read "community edition" as **OpenAgentix, the project**, and "enterprise edition" as **the commercial product built on OpenAgentix**, under its own brand (not yet chosen), in the company's own GitHub organisation, with its resource kinds in an API group under the company's own domain, not `enterprise.openagentix.io`. The product is named in the form "`<name>` for OpenAgentix". After acceptance the project's roadmap is decided by its maintainers in the open; the commitments below (security is never commercial-only, no limits by count, nothing moves out of the project) are then rules of the project, not promises of one company.
+
 ## Context
 
 The product brief asks for an open-source core with an enterprise version and a revenue model around it. The roadmap (`docs/roadmap.md`) now lists far more than one edition can sensibly gate. The project owner asked for the split to be decided and is ready to build both editions at the same time.
@@ -39,7 +41,7 @@ Three consequences, which are commitments:
 ## How the two editions are built
 
 - **Two repositories.** The community edition is this repository. The enterprise edition is a private repository that depends on community releases. It contains no fork of community code.
-- **Enterprise adds, never patches.** Enterprise features are extra kinds in the API group `enterprise.openagentix.io`, extra controllers, extra adapters and extra console pages. If an enterprise feature needs a change in community code, that change is a general extension point and lands in community first.
+- **Enterprise adds, never patches.** Enterprise features are extra kinds in an API group under the company's own domain (see the note at the top), extra controllers, extra adapters and extra console pages. If an enterprise feature needs a change in community code, that change is a general extension point and lands in community first.
 - **Extension points in community**, built when the first enterprise feature needs each one:
 
 | Extension point | Used by |

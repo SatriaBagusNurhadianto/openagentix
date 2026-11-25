@@ -8,7 +8,7 @@ description: What OpenAgentix is, how its parts fit together, and where to read 
 
 OpenAgentix is a Kubernetes-native platform for running AI agents. It puts existing open-source projects behind one installer and one Helm chart. The aim in the original product brief is a replacement for the managed agent services of the large clouds, running on your own cluster.
 
-This diary records what was built, how each part was proven, and what is still missing. The current state is release `v0.2.0` (2026-11-25): the MVP of `v0.1.0` plus the knowledge base and graph, memory, channels, schedules, notifications, observability and governance. It runs on one kind node. Read [what works](./what-works.md) before you rely on anything.
+This diary records what was built, how each part was proven, and what is still missing. The current state is release `v0.2.0` (2026-11-25): the MVP of `v0.1.0` plus the knowledge base and graph, memory, channels, schedules, notifications, observability and governance. After that release, and not yet in a release, come the control plane and the console (both off by default). It runs on one kind node. Read [what works](./what-works.md) before you rely on anything.
 
 ## Component map
 
@@ -77,7 +77,9 @@ Two layers. `install.sh` creates the kind cluster, installs the upstream release
 | [Notify](./features/notify.md) | Agents deliver a result to a named chat |
 | [Observability](./features/observability.md) | Cost per agent, one trace per turn, audit |
 | [Security](./features/security.md) | Identity, network policies, what is not protected |
+| [Control plane](./features/control-plane.md) | `AgentDefinition`, the controller, policy and the admission guard |
+| [Console](./features/console.md) | The web console and the agent builder |
 | [Install](./features/install.md) | install.sh, values files, uninstall, demo values |
 | [Maintainer notes](https://github.com/openagentix/openagentix/blob/main/docs/diary/README.md) | How to keep this diary current |
 
-Decision records are in `docs/decisions/`: ADR 0001 (runtime), ADR 0002 (schedules and delivery), ADR 0003 (observability).
+Decision records are in `docs/decisions/`: ADR 0001 (runtime), ADR 0002 (schedules and delivery), ADR 0003 (observability), ADR 0004 (knowledge graph), ADR 0005 (runtime speed), ADR 0006 (governance), ADR 0007 (control plane and console), ADR 0008 to 0013 (routing, FinOps, project structure, foundation readiness, platform primitives, focus).

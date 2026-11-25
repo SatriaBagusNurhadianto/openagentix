@@ -500,6 +500,27 @@ VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-valu
 
 The demo file ships exactly one profile (the 6 CPU / 8 GB node carries one) and must come last, because it restates the `agents` list. Each profile costs one more vMCP pod: about 30 MB and a few millicores idle, 100m CPU and 128 MiB of requests. Cedar `toolAccess` applies to the shared vMCP only. `bash` stays on. Evidence and findings: ADR 0006, "Round 2 results".
 
+## Control plane and agent builder
+
+An agent can also be made from one small resource, `AgentDefinition` (`openagentix.io/v1alpha1`, short name `oad`). A controller (`services/control-plane`) turns it into the runtime agent, a gateway key and a status. A catalog says what exists and a policy says what is allowed. A definition that breaks the policy is refused with one sentence per rule, and nothing is created. An admission guard of 8 policies lets only the controller write the objects it owns. The controller never reads a Secret. It is off by default (`controlPlane.enabled`), and the default render does not change.
+
+```sh
+VALUES_FILE="components/channels/demo-values.yaml components/schedules/demo-values.yaml components/notify/demo-values.yaml components/observability/demo-values.yaml components/knowledge/graph-demo-values.yaml components/governance/demo-values.yaml components/governance/profiles-demo-values.yaml components/governance/memory-demo-values.yaml components/control-plane/demo-values.yaml components/console/demo-values.yaml" ./install.sh
+kubectl apply -f components/control-plane/researcher.yaml
+```
+
+Proven on the kind demo cluster (2026-11-25): a definition became a Ready agent in 13 to 31 s, the agent answered with a tool from its tool profile, and the gateway recorded the call under the agent's own user. Not done yet: chart agents (`agents[]`) are not migrated to definitions; schedules, Kourier bindings and the Telegram bridge cannot point at built agents; nobody can call a built agent through the A2A gate until an operator adds a caller rule; suspend is a stop, not a pause; bring your own agent is planned for 0.3. Details: [Control plane](docs/diary/features/control-plane.md), `services/control-plane/README.md`, ADR 0007, 0012 and 0013.
+
+## Console
+
+The console is a web page for the agent builder: an agents registry, a builder whose options follow the policy, a YAML view, pause and delete. Other areas say "not available yet". It is a small Go API with a bearer token and a strict Content-Security-Policy, plus a Svelte app in one image. It needs the control plane and is off by default (`console.enabled`). It has no ingress. The installer creates the token Secret `console-token`; open the console with a port-forward:
+
+```sh
+kubectl port-forward -n openagentix-system svc/openagentix-console 8080:8080    # then http://127.0.0.1:8080
+```
+
+Proven on the kind demo cluster: without a token the API answers 401; an agent created through the API became Ready in 25 s; the console's ServiceAccount cannot read Secrets. Not verified: the browser UI against the real cluster (only the API was used there; the UI was exercised in demo mode); the Playground does not exist yet. Details: [Console](docs/diary/features/console.md), `services/console/README.md`, `docs/console/UI-SPEC.md`.
+
 ## Security
 
 What is protected, what is not. Checked on kind (kindnet enforces NetworkPolicy) with kagent 1.0.1, Substrate 1.0.1 and ToolHive 0.67.1.
@@ -550,6 +571,11 @@ charts/openagentix/             the Helm chart (values.yaml, templates/, tests/r
 bridges/telegram/               Go Telegram -> A2A bridge, Dockerfile, deploy/ reference manifests
 services/kb/                    Go knowledge base service (tests, Dockerfile, reference manifests in deploy/)
 services/notify/                Go notify service: agents deliver a result to a named chat (tests, Dockerfile, reference manifests in deploy/)
+services/control-plane/         Go controller for AgentDefinition (core, kagent, gateway and ToolHive adapters, admission guard tests)
+services/console/               Go API of the web console, with the built app embedded
+console/                        SvelteKit single-page app of the console
+components/control-plane/       demo values and an example AgentDefinition
+components/console/             demo values for the console
 components/knowledge/sample/    sample corpus install.sh ingests
 hack/kb-ingest.sh               ingest a directory of markdown into a kb collection
 hack/trace-turn.sh              follow one turn (contextId or trace id) through Jaeger or the egress log; read-only
@@ -562,7 +588,7 @@ components/schedules/           a demo values file with one suspended schedule
 components/notify/              a demo values file: notify on, `assistant` opted in
 components/observability/       a demo values file: observability on with the bundled VictoriaMetrics + Jaeger
 tools/a2a-call/                 Go A2A caller run by the schedule CronJobs (tests, Dockerfile)
-docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented, 0003 observability: accepted for the MVP slice)
+docs/decisions/                 decision records (0001 runtime, 0002 schedules and trigger delivery: accepted, schedules implemented, 0003 observability: accepted for the MVP slice, 0004 to 0013 more; see the folder)
 components/runtime/             kagent + Substrate bring-up (up.sh, pgvector.sh, kagent-helm.sh, values, manifests) and NOTES
 components/bench/               kagent versus AX speed benchmark (harness in compare/, results)
 ```

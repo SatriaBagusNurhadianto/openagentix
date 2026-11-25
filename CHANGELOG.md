@@ -4,6 +4,45 @@ All notable changes to OpenAgentix are documented here. The format follows [Keep
 
 ## [Unreleased]
 
+No default changed for users who leave the new `controlPlane` and `console` blocks off. The default chart render is the same as in 0.2.0.
+
+### Added
+- Control plane (ADR 0007 slice 1, ADR 0012 contract), off by default (`controlPlane.enabled`). A new resource kind `AgentDefinition` (`openagentix.io/v1alpha1`, short name `oad`) and a controller in `services/control-plane` (Go, standard library only; a core plus adapters for the kagent runtime, the agentgateway keys and the ToolHive tool profiles). A definition becomes a runtime agent, a gateway key and a status with conditions, an endpoint and a revision. Platform catalog and policy ConfigMaps decide what a definition may use. Demo values: `components/control-plane/demo-values.yaml`, example `components/control-plane/researcher.yaml`.
+- Suspend and resume: `spec.suspend` stops the agent, removes the runtime agent and the gateway key entry, and sets `Ready=False` with reason `Suspended`. Resume restores the same key.
+- Web console (ADR 0007 slice 3), off by default (`console.enabled`): `services/console` (Go API with fixed routes, bearer token, Content-Security-Policy, Host allowlist, login throttling, extension points for authentication, authorization and audit) and `console/` (SvelteKit single-page app: shell, agents registry, agent builder with options that follow the policy, YAML view, pause, delete). Other areas show "not available yet". Design contract `docs/console/UI-SPEC.md`, approved mockup `docs/console/mockup.html`. Demo values: `components/console/demo-values.yaml`. The installer creates the token Secret `console-token`. There is no ingress: use `kubectl port-forward`.
+- API conventions for all resource kinds (`docs/api-conventions.md`).
+- Decision records: ADR 0007 (control plane and console), 0008 (model routing), 0009 (FinOps and tracing direction), 0010 (project structure), 0011 (foundation readiness), 0012 (platform primitives for products built on top), 0013 (one focus, bring your own agent, adopted identity, postponed work).
+- Project process: governance and community files, DCO sign-off on commits, issue templates, a decision process, and a roadmap with milestones 0.3 to 0.6 and a Backlog (68 issues).
+- CI on every push: Go per module, chart tests, shell tests, integration, the admission guard, an API-server test, console unit and end-to-end tests, image builds and a secret scan (`hack/ci/README.md`).
+- The install command now takes ten demo values files. The two new ones, `components/control-plane/demo-values.yaml` and `components/console/demo-values.yaml`, go last, in that order.
+
+### Changed
+- The `AgentDefinition` contract follows ADR 0012: `spec.knowledge` and `spec.notify` are objects (`enabled` plus a reserved list), `spec.skills` is a list of `{name, version}`, the gateway user of a built agent is `<namespace>.<name>` (for example `kagent.researcher`), and the status has public fields (`conditions`, `endpoint`, `revision`, `effectiveTools`, `effectiveEgress`) and a private `status.controller` part.
+- The control plane's admission guard is an allowlist: 8 ValidatingAdmissionPolicies that allow only the fields the controller writes.
+
+### Fixed
+- The API server refuses a CRD schema that describes `metadata`. The schema no longer does, and an API-server test covers it. This was found only by a live upgrade.
+- Two independent reviews found problems, all fixed test-first. First review: no critical, 7 important, 12 minor. Second review, after the console: 1 critical, 6 important, 17 minor.
+- The console embed placeholder is now committed, so a clean checkout builds.
+
+### Security
+- The controller never reads a Secret and has namespaced Roles only. The console's ServiceAccount cannot read Secrets and cannot write kagent resources.
+- Critical finding of the second review: the guard checked egress hosts but not the field of an egress policy that injects a Secret into outbound requests. The guard was rewritten as an allowlist. It is now run in CI with the Kubernetes admission code (406 cases) and against a real API server (71 checks).
+- Suspend cuts the agent's access to the model, not only its runtime agent.
+- A `ResourceQuota` limits the number of definition objects (`controlPlane.maxDefinitions`).
+- Console review findings fixed: strict token length, Host allowlist against DNS rebinding, errors from the cluster are never sent to the browser.
+
+### Known limits
+- Proven on one single-node kind cluster and one namespace only.
+- Chart agents (`agents[]`) are not migrated to definitions and are read-only in the console.
+- Schedules, Kourier bindings and the Telegram bridge cannot point at built agents yet.
+- Nobody can call a built agent through the A2A gate until an operator adds a caller rule.
+- Suspend is a stop, not a pause.
+- Memory for built agents needs a chart agent with memory, so that the memory stack is installed.
+- Bring your own agent is planned for 0.3, not built.
+- The end-to-end install in CI does not work yet.
+- The browser UI was not driven against the real cluster in the live run, only through the API. The Playground does not exist yet.
+
 ## [0.2.0] - 2026-11-25
 
 Everything built after the MVP: knowledge base and knowledge graph, long-term memory, channels and triggers, schedules, notifications, observability, tool-layer identity, and the governance rounds of ADR 0006 (A2A gate, tool profiles and per-agent egress, memory governance). Runs on one kind node; read `docs/diary/what-works.md` before relying on anything.

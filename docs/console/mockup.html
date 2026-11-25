@@ -1,0 +1,1184 @@
+<title>OpenAgentix Console Mockup</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Public+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: app shell = sidebar (240px, groups by area) | main column (sticky top bar, page header, content, optional 380px detail panel).
+   Tokens mirror docs/console/UI-SPEC.md section 3. "Instrument panel": mineral greys, one petrol accent, mono for every identifier. */
+:root{
+  --canvas:#F1F3F5; --surface:#FFFFFF; --sunken:#F6F7F9; --raised:#FFFFFF; --sidebar:#E9EDF0; --hover:#E6EAEE; --selected:#E4F0F5;
+  --t1:#121A22; --t2:#3C4854; --t3:#5B6774; --border:#DDE2E7; --bctl:#7D8A97;
+  --accent:#0A6283; --on-accent:#FFFFFF; --accent-soft:#E4F0F5;
+  --ready:#13653A; --ready-bg:#E3F3E9; --pending:#855000; --pending-bg:#FCF0D6; --refused:#9A1B57; --refused-bg:#FAE6EF;
+  --error:#B0261C; --error-bg:#FCE9E6; --paused:#46525F; --paused-bg:#ECEFF2;
+  --c1:#2A78D6; --c2:#EB6834; --c3:#1BAF7A; --grid:#E6EAEE;
+  --sh-md:0 6px 20px rgb(16 24 32 / .10),0 1px 3px rgb(16 24 32 / .08); --sh-lg:0 18px 48px rgb(16 24 32 / .18); --scrim:rgb(16 24 32 / .35);
+  --sans:"Public Sans",system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  --r-sm:4px; --r-md:6px; --r-lg:10px; --fast:120ms; --base:180ms; --slow:260ms; --ease:cubic-bezier(.2,0,0,1);
+  --sbw:240px;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --canvas:#0D1115; --surface:#151B21; --sunken:#11161B; --raised:#1B232B; --sidebar:#10151A; --hover:#1C242C; --selected:#10242D;
+  --t1:#E5EAEF; --t2:#B3BECA; --t3:#8C99A6; --border:#252E37; --bctl:#64727F;
+  --accent:#5DB8DB; --on-accent:#071319; --accent-soft:#10242D;
+  --ready:#71D59D; --ready-bg:#11271B; --pending:#F0B65A; --pending-bg:#2B2110; --refused:#F28DBE; --refused-bg:#2D1522;
+  --error:#FF8F84; --error-bg:#301614; --paused:#A9B4C0; --paused-bg:#1F272F;
+  --c1:#3987E5; --c2:#D95926; --c3:#199E70; --grid:#222B33;
+  --sh-md:0 6px 20px rgb(0 0 0 / .5); --sh-lg:0 18px 48px rgb(0 0 0 / .6); --scrim:rgb(0 0 0 / .55); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --canvas:#0D1115; --surface:#151B21; --sunken:#11161B; --raised:#1B232B; --sidebar:#10151A; --hover:#1C242C; --selected:#10242D;
+  --t1:#E5EAEF; --t2:#B3BECA; --t3:#8C99A6; --border:#252E37; --bctl:#64727F;
+  --accent:#5DB8DB; --on-accent:#071319; --accent-soft:#10242D;
+  --ready:#71D59D; --ready-bg:#11271B; --pending:#F0B65A; --pending-bg:#2B2110; --refused:#F28DBE; --refused-bg:#2D1522;
+  --error:#FF8F84; --error-bg:#301614; --paused:#A9B4C0; --paused-bg:#1F272F;
+  --c1:#3987E5; --c2:#D95926; --c3:#199E70; --grid:#222B33;
+  --sh-md:0 6px 20px rgb(0 0 0 / .5); --sh-lg:0 18px 48px rgb(0 0 0 / .6); --scrim:rgb(0 0 0 / .55); color-scheme:dark}
+
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--canvas);color:var(--t1);font-family:var(--sans);font-size:13.5px;line-height:20px;-webkit-font-smoothing:antialiased}
+.mono,code,kbd,pre{font-family:var(--mono);font-size:12px;line-height:18px}
+code{color:var(--t1)}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:3px}
+button{font:inherit;color:inherit}
+h1,h2,h3{margin:0;text-wrap:balance}
+h1{font-size:18px;line-height:26px;font-weight:650}
+h2{font-size:15px;line-height:22px;font-weight:600}
+h3{font-size:13.5px;font-weight:600}
+p{margin:0}
+.num{font-variant-numeric:tabular-nums}
+.t2{color:var(--t2)} .t3{color:var(--t3)} .sm{font-size:12px;line-height:18px} .xs{font-size:11px;line-height:16px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.skip{position:absolute;left:8px;top:-40px;background:var(--accent);color:var(--on-accent);padding:6px 10px;border-radius:var(--r-md);z-index:50}
+.skip:focus{top:8px}
+svg.i{width:16px;height:16px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+
+/* shell */
+.app{display:grid;grid-template-columns:var(--sbw) minmax(0,1fr);min-height:100vh}
+.app.collapsed{--sbw:56px}
+.sb{background:var(--sidebar);border-right:1px solid var(--border);position:sticky;top:0;height:100vh;overflow-y:auto;display:flex;flex-direction:column;padding:12px 10px}
+.brand{display:flex;align-items:center;gap:10px;padding:4px 6px 12px}
+.mark{width:22px;height:22px;border-radius:5px;background:var(--accent);display:grid;place-items:center;flex:none}
+.mark svg{width:14px;height:14px;stroke:var(--on-accent);fill:none;stroke-width:1.8}
+.word{font-size:15px;letter-spacing:-.01em;white-space:nowrap}.word b{font-weight:650}.word span{color:var(--t2);font-weight:500}
+.ctx{font-family:var(--mono);font-size:11px;color:var(--t3);padding:0 6px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.grp{font-size:11px;line-height:16px;letter-spacing:.06em;text-transform:uppercase;color:var(--t3);font-weight:600;padding:14px 8px 4px}
+.nav{display:flex;flex-direction:column;gap:1px}
+.ni{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:var(--r-md);color:var(--t2);cursor:pointer;border:0;background:none;text-align:left;width:100%;white-space:nowrap}
+.ni:hover{background:var(--hover);color:var(--t1);text-decoration:none}
+.ni[aria-current="page"]{background:var(--selected);color:var(--t1);font-weight:600}
+.ni[aria-current="page"] svg.i{color:var(--accent)}
+.ni .lock{margin-left:auto;width:12px;height:12px;color:var(--t3)}
+.sub{display:flex;flex-direction:column;margin:1px 0 4px 26px;border-left:1px solid var(--border)}
+.sub a{padding:4px 10px;color:var(--t3);font-size:12.5px}
+.sub a:hover{color:var(--t1);text-decoration:none}
+.sub a.on{color:var(--t1);font-weight:600;box-shadow:inset 2px 0 0 var(--accent)}
+.sb-foot{margin-top:auto;padding-top:12px;display:flex;flex-direction:column;gap:1px}
+.app.collapsed .word,.app.collapsed .ctx,.app.collapsed .ni span,.app.collapsed .ni .lock,.app.collapsed .sub{display:none}
+.app.collapsed .grp{font-size:0;padding:6px 0;border-top:1px solid var(--border);margin:8px 6px 4px}
+.app.collapsed .ni{justify-content:center}
+
+.main{min-width:0;display:flex;flex-direction:column}
+.top{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:var(--canvas);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;padding:8px 24px;min-height:48px}
+.crumb{display:flex;gap:6px;align-items:center;color:var(--t3);min-width:0;white-space:nowrap;overflow:hidden}
+.crumb b{color:var(--t1);font-weight:600;overflow:hidden;text-overflow:ellipsis}
+.search{margin-left:auto;display:flex;align-items:center;gap:8px;border:1px solid var(--border);background:var(--surface);border-radius:var(--r-md);padding:4px 8px;color:var(--t3);width:260px;max-width:40%}
+.search kbd{margin-left:auto;border:1px solid var(--border);border-radius:3px;padding:0 4px;font-size:11px}
+.demo{font-family:var(--mono);font-size:11px;padding:2px 8px;border-radius:var(--r-sm);background:var(--pending-bg);color:var(--pending);white-space:nowrap}
+.menu-btn{display:none}
+.content{padding:20px 24px 32px;display:flex;flex-direction:column;gap:16px;min-width:0}
+.view{display:flex;flex-direction:column;gap:16px;min-width:0}
+.foot{margin-top:auto;padding:14px 24px;border-top:1px solid var(--border);display:flex;gap:16px;flex-wrap:wrap;color:var(--t3);font-size:12px}
+.foot strong{color:var(--t2)}
+
+/* page header */
+.ph{display:flex;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.ph-l{display:flex;flex-direction:column;gap:4px;min-width:0;flex:1 1 320px}
+.ph-t{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.strip{font-family:var(--mono);font-size:12px;color:var(--t3);overflow-wrap:anywhere}
+.acts{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+
+/* buttons */
+.btn{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:var(--r-md);border:1px solid var(--bctl);background:var(--surface);color:var(--t1);cursor:pointer;font-weight:500;white-space:nowrap;transition:background var(--fast) var(--ease)}
+.btn:hover{background:var(--hover)}
+.btn.pri{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.btn.pri:hover{filter:brightness(1.08)}
+.btn.ghost{border-color:transparent;background:none}
+.btn.ghost:hover{background:var(--hover)}
+.btn.danger{background:var(--error);border-color:var(--error);color:var(--surface)}
+.btn[aria-disabled="true"],.btn:disabled{opacity:.55;cursor:not-allowed}
+.btn.sm{height:28px;padding:0 10px;font-size:12.5px}
+.ib{width:32px;height:32px;display:inline-grid;place-items:center;border-radius:var(--r-md);border:0;background:none;color:var(--t2);cursor:pointer}
+.ib:hover{background:var(--hover);color:var(--t1)}
+
+/* tabs and segmented */
+.tabs{display:flex;gap:20px;border-bottom:1px solid var(--border);overflow-x:auto}
+.tab{border:0;background:none;padding:8px 0 9px;color:var(--t2);cursor:pointer;font-weight:500;border-bottom:2px solid transparent;margin-bottom:-1px;white-space:nowrap}
+.tab[aria-selected="true"]{color:var(--t1);border-bottom-color:var(--accent);font-weight:600}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:var(--r-md);background:var(--sunken);padding:2px}
+.seg button{border:0;background:none;padding:3px 10px;border-radius:4px;color:var(--t2);cursor:pointer;font-size:12.5px}
+.seg button[aria-pressed="true"]{background:var(--surface);color:var(--t1);font-weight:600;box-shadow:0 0 0 1px var(--border)}
+
+/* panels, cards */
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);min-width:0}
+.panel>.hd{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+.panel>.hd .acts{margin-left:auto}
+.panel>.bd{padding:16px}
+.grid{display:grid;gap:12px}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))} .g3{grid-template-columns:repeat(3,minmax(0,1fr))} .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:14px 16px;display:flex;flex-direction:column;gap:8px;cursor:pointer;text-align:left;min-width:0;transition:box-shadow var(--fast) var(--ease)}
+.card:hover{box-shadow:0 1px 2px rgb(16 24 32 / .06);border-color:var(--bctl)}
+.card[aria-pressed="true"]{background:var(--selected);border-color:var(--accent);box-shadow:inset 2px 0 0 var(--accent)}
+.card .row1{display:flex;align-items:center;gap:8px}
+.card .row1 .badge{margin-left:auto}
+.card .meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--t3);font-size:12px}
+.ico{width:28px;height:28px;border-radius:var(--r-md);background:var(--sunken);border:1px solid var(--border);display:grid;place-items:center;color:var(--t2);flex:none}
+
+/* status */
+.badge{display:inline-flex;align-items:center;gap:5px;padding:1px 8px 1px 6px;border-radius:var(--r-sm);font-size:12px;line-height:18px;font-weight:600;white-space:nowrap}
+.badge svg{width:13px;height:13px}
+.st-ready{background:var(--ready-bg);color:var(--ready)} .st-pending{background:var(--pending-bg);color:var(--pending)}
+.st-refused{background:var(--refused-bg);color:var(--refused)} .st-error{background:var(--error-bg);color:var(--error)}
+.st-paused{background:var(--paused-bg);color:var(--paused)}
+.rail{display:flex;gap:4px;flex-wrap:wrap}
+.rc{display:flex;align-items:center;gap:5px;padding:2px 8px 2px 6px;border-radius:var(--r-sm);font-size:11px;line-height:16px;font-weight:600;border:1px solid transparent}
+.rc svg{width:12px;height:12px}
+.rc.none{border:1px dashed var(--bctl);color:var(--t3);background:none;font-weight:500}
+.pips{display:inline-flex;gap:3px}
+.pip{width:9px;height:9px;border-radius:2px}
+.pip.ready{background:var(--ready)} .pip.pending{background:var(--pending)} .pip.refused{background:var(--refused)} .pip.error{background:var(--error)} .pip.none{box-shadow:inset 0 0 0 1px var(--bctl)}
+.tag{display:inline-flex;align-items:center;gap:4px;font-family:var(--mono);font-size:11.5px;line-height:18px;padding:0 6px;border-radius:var(--r-sm);background:var(--sunken);border:1px solid var(--border);color:var(--t2);white-space:nowrap}
+.tag.acc{background:var(--accent-soft);border-color:transparent;color:var(--accent)}
+.tag.ref{background:var(--refused-bg);border-color:var(--refused);color:var(--refused)}
+.tag button{border:0;background:none;padding:0;cursor:pointer;color:inherit;display:grid}
+.tags{display:flex;gap:4px;flex-wrap:wrap}
+
+/* notice */
+.notice{display:flex;gap:10px;padding:10px 14px;border-radius:var(--r-lg);border:1px solid var(--border);align-items:flex-start}
+.notice svg{margin-top:2px}
+.notice .nt{font-weight:600}
+.notice.ro{background:var(--paused-bg);color:var(--t1)} .notice.ro>svg{color:var(--paused)}
+.notice.info{background:var(--accent-soft)} .notice.info>svg{color:var(--accent)}
+.notice.refused{background:var(--refused-bg);border-color:var(--refused)} .notice.refused>svg,.notice.refused .nt{color:var(--refused)}
+.notice.warn{background:var(--pending-bg)} .notice.warn>svg{color:var(--pending)}
+.notice ul{margin:6px 0 0;padding-left:18px;display:flex;flex-direction:column;gap:4px}
+.notice li{font-family:var(--mono);font-size:12px;line-height:18px}
+
+/* table */
+.tw{overflow-x:auto}
+table{border-collapse:collapse;width:100%;min-width:640px}
+th{font-size:12px;font-weight:600;color:var(--t2);text-align:left;padding:7px 12px;background:var(--sunken);border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0}
+th button{border:0;background:none;padding:0;font:inherit;color:inherit;cursor:pointer;display:inline-flex;gap:4px;align-items:center}
+td{padding:8px 12px;border-bottom:1px solid var(--border);vertical-align:top}
+tbody tr:hover{background:var(--hover)}
+tbody tr:last-child td{border-bottom:0}
+tr.clk{cursor:pointer}
+td.r,th.r{text-align:right}
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 12px;border-bottom:1px solid var(--border)}
+.input{height:32px;border:1px solid var(--bctl);border-radius:var(--r-md);background:var(--surface);color:var(--t1);padding:0 10px;font:inherit;min-width:0}
+.toolbar .input{height:28px;width:220px}
+
+/* fields */
+.field{display:flex;flex-direction:column;gap:5px;min-width:0}
+.field label,.flabel{font-weight:600;font-size:12.5px;color:var(--t2)}
+.field .hint{font-size:12px;color:var(--t3);display:flex;gap:8px;justify-content:space-between}
+.field input,.field select,.field textarea{border:1px solid var(--bctl);border-radius:var(--r-md);background:var(--surface);color:var(--t1);padding:6px 10px;font:inherit;width:100%}
+.field textarea{min-height:220px;resize:vertical;line-height:21px}
+.field input[readonly]{background:var(--sunken);border-color:var(--border);color:var(--t2)}
+.field .err{display:flex;gap:6px;color:var(--refused);font-size:12px;line-height:18px}
+.field.bad input,.field.bad textarea{border-color:var(--refused);box-shadow:0 0 0 1px var(--refused)}
+.stack{display:flex;flex-direction:column;gap:14px}
+.cap{display:flex;gap:12px;align-items:flex-start;padding:12px 0;border-top:1px solid var(--border)}
+.cap:first-child{border-top:0;padding-top:0}
+.cap .cx{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.sw{position:relative;width:34px;height:20px;border-radius:999px;border:1px solid var(--bctl);background:var(--sunken);cursor:pointer;flex:none;padding:0;transition:background var(--fast) var(--ease)}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:var(--t3);transition:transform var(--fast) var(--ease),background var(--fast)}
+.sw[aria-checked="true"]{background:var(--accent);border-color:var(--accent)}
+.sw[aria-checked="true"]::after{transform:translateX(14px);background:var(--on-accent)}
+.chk{display:flex;gap:8px;align-items:flex-start;padding:4px 0}
+.chk input{margin:2px 0 0;accent-color:var(--accent);width:15px;height:15px}
+.chk .dim{color:var(--t3)}
+.chk.bad code{color:var(--refused)}
+.chk.dis{color:var(--t3)}
+fieldset{border:0;margin:0;padding:0;min-width:0}
+legend{padding:0}
+
+/* kv */
+dl.kv{display:grid;grid-template-columns:minmax(120px,max-content) minmax(0,1fr);gap:6px 16px;margin:0}
+dl.kv dt{color:var(--t3);font-size:12.5px}
+dl.kv dd{margin:0;min-width:0;overflow-wrap:anywhere}
+
+/* list + detail */
+.ld{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px;align-items:start}
+.detail{position:sticky;top:64px;max-height:calc(100vh - 80px);overflow-y:auto}
+.detail .bd{display:flex;flex-direction:column;gap:16px}
+.close-d{display:none}
+
+/* tiles */
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:14px 16px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.tile .lbl{color:var(--t2);font-size:12.5px;font-weight:500}
+.tile .val{font-size:24px;line-height:30px;font-weight:600;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.tile .val small{font-size:13px;color:var(--t3);font-weight:500;margin-left:4px}
+.tile .cmp{font-size:12px;color:var(--t3)}
+.split{display:flex;gap:10px;flex-wrap:wrap;font-size:12px}
+.split span{display:inline-flex;align-items:center;gap:4px}
+.dot{width:8px;height:8px;border-radius:50%}
+.meter{height:6px;border-radius:3px;background:var(--sunken);box-shadow:inset 0 0 0 1px var(--border);overflow:hidden}
+.meter i{display:block;height:100%;background:var(--accent);border-radius:3px}
+
+/* code viewer */
+.code{background:var(--sunken);border:1px solid var(--border);border-radius:var(--r-md);overflow:auto;position:relative}
+.code pre{margin:0;padding:12px 14px;counter-reset:ln;white-space:pre}
+.code .ln{display:block}
+.code .ln::before{counter-increment:ln;content:counter(ln);display:inline-block;width:24px;margin-right:12px;text-align:right;color:var(--t3);user-select:none}
+.code .k{color:var(--t2)} .code .v{color:var(--t1)} .code .s{color:var(--accent)} .code .c{color:var(--t3)}
+.code .chg{background:var(--accent-soft)}
+.copy{position:absolute;top:6px;right:6px}
+
+/* overlay panel + dialog */
+.scrim{position:fixed;inset:0;background:var(--scrim);z-index:20}
+.sheet{position:fixed;top:0;right:0;bottom:0;width:min(560px,100%);background:var(--raised);border-left:1px solid var(--border);box-shadow:var(--sh-md);z-index:21;display:flex;flex-direction:column;padding-right:env(safe-area-inset-right,0px)}
+.sheet .hd{display:flex;align-items:center;gap:10px;padding:14px 16px;border-bottom:1px solid var(--border)}
+.sheet .bd{padding:16px;overflow:auto;display:flex;flex-direction:column;gap:12px}
+.dialog{position:fixed;left:50%;top:18vh;transform:translateX(-50%);width:min(480px,calc(100% - 32px));background:var(--raised);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:var(--sh-lg);z-index:21;padding:20px;display:flex;flex-direction:column;gap:12px}
+.dialog .acts{justify-content:flex-end}
+.toast{position:fixed;right:max(16px,env(safe-area-inset-right,0px));bottom:calc(16px + env(safe-area-inset-bottom,0px));background:var(--raised);border:1px solid var(--border);box-shadow:var(--sh-md);border-radius:var(--r-lg);padding:10px 14px;display:flex;gap:8px;align-items:center;z-index:30}
+.toast svg{color:var(--ready)}
+
+/* builder */
+.bgrid{display:grid;grid-template-columns:minmax(0,3fr) minmax(0,2fr);gap:16px;align-items:start}
+.mockctl{display:flex;align-items:center;gap:8px;padding:6px 10px;border:1px dashed var(--bctl);border-radius:var(--r-md);font-size:12px;color:var(--t2)}
+.prev{border-left:2px solid var(--refused);padding-left:10px;font-size:12px;color:var(--refused);font-family:var(--mono)}
+
+/* playground */
+.chat{display:flex;flex-direction:column;gap:14px;padding:16px}
+.msg{display:flex;flex-direction:column;gap:6px;max-width:720px}
+.msg .who{font-size:12px;color:var(--t3);display:flex;gap:8px;align-items:center}
+.msg .body{padding:10px 14px;border-radius:var(--r-lg);border:1px solid var(--border);background:var(--surface)}
+.msg.user{align-self:flex-end}
+.msg.user .body{background:var(--sunken)}
+.toolcall{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--t2);padding:6px 10px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--sunken)}
+.turnfoot{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--t3)}
+.composer{border-top:1px solid var(--border);padding:12px 16px;display:flex;gap:8px;align-items:flex-end}
+.composer textarea{flex:1;min-height:40px;max-height:160px;border:1px solid var(--bctl);border-radius:var(--r-md);padding:8px 10px;font:inherit;background:var(--surface);color:var(--t1);resize:vertical}
+
+/* charts */
+.chart{width:100%;height:auto;display:block}
+.chart text{fill:var(--t3);font-family:var(--sans);font-size:11px}
+.chart .gl{stroke:var(--grid);stroke-width:1}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--t2)}
+.legend span{display:inline-flex;gap:6px;align-items:center}
+.sq{width:10px;height:10px;border-radius:2px}
+.tip{position:fixed;pointer-events:none;background:var(--raised);border:1px solid var(--border);box-shadow:var(--sh-md);border-radius:var(--r-md);padding:8px 10px;font-size:12px;z-index:40;min-width:160px}
+.tip .tr{display:flex;gap:8px;align-items:center;justify-content:space-between}
+
+/* waterfall */
+.wf{display:flex;flex-direction:column;min-width:760px}
+.wf-row{display:grid;grid-template-columns:270px minmax(0,1fr) 230px;align-items:center;gap:8px;padding:5px 12px;border-bottom:1px solid var(--border);cursor:pointer}
+.wf-row:hover{background:var(--hover)}
+.wf-row[aria-selected="true"]{background:var(--selected)}
+.wf-name{display:flex;align-items:center;gap:6px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.wf-track{position:relative;height:16px}
+.wf-bar{position:absolute;top:3px;height:10px;border-radius:2px}
+.k-gate{background:var(--t3)} .k-agent{background:var(--paused)} .k-model{background:var(--c1)} .k-tool{background:var(--c2)} .k-mem{background:var(--c3)}
+.wf-axis{display:grid;grid-template-columns:270px minmax(0,1fr) 230px;gap:8px;padding:6px 12px;border-bottom:1px solid var(--border);font-size:11px;color:var(--t3)}
+.wf-axis .ticks{position:relative;height:14px}
+.wf-axis .ticks span{position:absolute;transform:translateX(-50%)}
+.wf-axis .ticks span:first-child{transform:none}
+.wf-meta{white-space:nowrap;font-size:12px;color:var(--t2);text-align:right;font-variant-numeric:tabular-nums}
+
+/* graph */
+.gwrap{display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:16px;align-items:start}
+.gsvg{width:100%;height:auto;display:block;background:var(--sunken);border-radius:0 0 var(--r-lg) var(--r-lg)}
+.gsvg .e{stroke:var(--bctl);stroke-width:1.2}
+.gsvg .e.cur{stroke-dasharray:4 3}
+.gsvg .e.path{stroke:var(--accent);stroke-width:2.4}
+.gsvg .pl{fill:var(--t3);font-size:10.5px;font-family:var(--mono)}
+.gsvg .pl.path{fill:var(--accent);font-weight:500}
+.gsvg .n rect{fill:var(--surface);stroke:var(--bctl);stroke-width:1}
+.gsvg .n.path rect{stroke:var(--accent);stroke-width:2}
+.gsvg .n.hl rect{fill:var(--accent-soft)}
+.gsvg .n text{fill:var(--t1);font-size:12px;font-family:var(--sans);font-weight:500}
+.gsvg .n .ty{fill:var(--t3);font-size:9.5px;font-family:var(--mono);font-weight:400}
+.gsvg .hop circle{fill:var(--accent)} .gsvg .hop text{fill:var(--on-accent);font-size:10px;font-weight:700;font-family:var(--sans)}
+ol.path{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:0}
+ol.path li{display:grid;grid-template-columns:22px minmax(0,1fr);gap:10px;padding:10px 0;border-top:1px solid var(--border);cursor:pointer}
+ol.path li:first-child{border-top:0}
+ol.path li:hover .fact{color:var(--accent)}
+.hopn{width:20px;height:20px;border-radius:50%;background:var(--accent);color:var(--on-accent);display:grid;place-items:center;font-size:11px;font-weight:700}
+.fact{font-weight:600}
+.ev{font-size:12px;color:var(--t2);border-left:2px solid var(--border);padding-left:8px;margin-top:4px}
+
+/* responsive */
+@media (max-width:1499px){.ld{grid-template-columns:minmax(0,1fr) 340px}.gwrap{grid-template-columns:minmax(0,1fr) 320px}}
+@media (max-width:1199px){
+  .app{--sbw:56px}
+  .app .word,.app .ctx,.app .ni span,.app .ni .lock,.app .sub{display:none}
+  .app .grp{font-size:0;padding:6px 0;border-top:1px solid var(--border);margin:8px 6px 4px}
+  .app .ni{justify-content:center}
+  .ld,.gwrap{grid-template-columns:minmax(0,1fr)}
+  .detail{position:static;max-height:none}
+  .g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g3{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
+@media (max-width:899px){
+  .app{grid-template-columns:minmax(0,1fr)}
+  .sb{position:fixed;left:0;top:0;bottom:0;width:260px;z-index:25;transform:translateX(-100%);transition:transform var(--slow) var(--ease);box-shadow:var(--sh-md);padding-left:max(10px,env(safe-area-inset-left,0px))}
+  .app.drawer .sb{transform:none}
+  .app .word,.app .ctx,.app .ni span,.app .ni .lock,.app .sub{display:revert}
+  .app .ni span{display:inline}
+  .app .sub{display:flex}
+  .app .grp{font-size:11px;padding:14px 8px 4px;border:0;margin:0}
+  .app .ni{justify-content:flex-start}
+  .menu-btn{display:inline-grid}
+  .bgrid{grid-template-columns:minmax(0,1fr)}
+  .top{padding:8px 16px}
+  .content{padding:16px 16px 28px}
+  .foot{padding:14px 16px}
+  .search{display:none}
+  .collapse-btn{display:none}
+}
+@media (max-width:639px){
+  .g4,.g3,.g2{grid-template-columns:minmax(0,1fr)}
+  dl.kv{grid-template-columns:minmax(0,1fr)} dl.kv dd{margin-bottom:6px}
+}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{transition-duration:.01ms!important;animation-duration:.01ms!important}}
+</style>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-overview" viewBox="0 0 16 16"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></symbol>
+    <symbol id="i-agent" viewBox="0 0 16 16"><rect x="3" y="4" width="10" height="9" rx="2"/><path d="M8 1.5V4M6 8h.01M10 8h.01M6 11h4"/></symbol>
+    <symbol id="i-play" viewBox="0 0 16 16"><path d="M2.5 3.5h11v7h-6l-3 2.5v-2.5h-2z"/><path d="M5.5 6.5h5M5.5 8.5h3"/></symbol>
+    <symbol id="i-skill" viewBox="0 0 16 16"><path d="M3 2.5h7l3 3v8H3z"/><path d="M10 2.5v3h3M5.5 8.5h5M5.5 11h3"/></symbol>
+    <symbol id="i-model" viewBox="0 0 16 16"><path d="M8 2 14 5 8 8 2 5z"/><path d="M2 8l6 3 6-3M2 11l6 3 6-3"/></symbol>
+    <symbol id="i-tool" viewBox="0 0 16 16"><path d="M10.5 2.5a3 3 0 0 0-3 3.9L2.8 11.1a1.4 1.4 0 0 0 2 2l4.7-4.6a3 3 0 0 0 3.9-3l-1.8 1.7-1.8-.2-.2-1.8z"/></symbol>
+    <symbol id="i-book" viewBox="0 0 16 16"><path d="M2.5 3h4a1.5 1.5 0 0 1 1.5 1.5V13a1.5 1.5 0 0 0-1.5-1.5h-4zM13.5 3h-4A1.5 1.5 0 0 0 8 4.5V13a1.5 1.5 0 0 1 1.5-1.5h4z"/></symbol>
+    <symbol id="i-graph" viewBox="0 0 16 16"><circle cx="4" cy="4" r="1.8"/><circle cx="12" cy="5" r="1.8"/><circle cx="7" cy="12" r="1.8"/><path d="M5.7 4.4l4.5.4M4.8 5.6l1.5 4.7M10.8 6.5l-2.7 4"/></symbol>
+    <symbol id="i-channel" viewBox="0 0 16 16"><path d="M2 8h3l2-4.5 2 9 2-4.5h3"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M8 4.8V8l2.2 1.4"/></symbol>
+    <symbol id="i-trace" viewBox="0 0 16 16"><path d="M2 3.5h7M4 6.5h8M6 9.5h4M8 12.5h6"/></symbol>
+    <symbol id="i-coin" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M9.8 5.8c-.4-.6-1-.9-1.8-.9-1 0-1.8.5-1.8 1.3 0 1.9 3.8 1 3.8 3 0 .8-.9 1.4-2 1.4-.9 0-1.6-.3-2-1M8 3.8v1.1M8 11.1v1.1"/></symbol>
+    <symbol id="i-memory" viewBox="0 0 16 16"><ellipse cx="8" cy="4" rx="5" ry="1.8"/><path d="M3 4v8c0 1 2.2 1.8 5 1.8s5-.8 5-1.8V4M3 8c0 1 2.2 1.8 5 1.8s5-.8 5-1.8"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 16 16"><path d="M8 1.8 13 3.6v4c0 3-2.1 5.4-5 6.6-2.9-1.2-5-3.6-5-6.6v-4z"/><path d="M5.8 8l1.6 1.6 3-3.2"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 16 16"><circle cx="8" cy="8" r="2"/><path d="M8 1.8v1.6M8 12.6v1.6M3.6 3.6l1.1 1.1M11.3 11.3l1.1 1.1M1.8 8h1.6M12.6 8h1.6M3.6 12.4l1.1-1.1M11.3 4.7l1.1-1.1"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.2"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2"/></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><circle cx="7" cy="7" r="4.5"/><path d="m10.5 10.5 3 3"/></symbol>
+    <symbol id="i-theme" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M8 2.2v11.6A5.8 5.8 0 0 0 8 2.2z" fill="currentColor"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 16 16"><path d="M8 3v10M3 8h10"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5" y="5" width="8.5" height="8.5" rx="1.3"/><path d="M3 10.5V3.8A1.3 1.3 0 0 1 4.3 2.5H10.5"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 16 16"><path d="M2.5 4.5h11M6 4.5V3h4v1.5M4 4.5l.7 9h6.6l.7-9"/></symbol>
+    <symbol id="i-code" viewBox="0 0 16 16"><path d="M5.5 4 2 8l3.5 4M10.5 4 14 8l-3.5 4"/></symbol>
+    <symbol id="i-x" viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2.5 4h11M2.5 8h11M2.5 12h11"/></symbol>
+    <symbol id="i-side" viewBox="0 0 16 16"><rect x="2" y="2.5" width="12" height="11" rx="1.5"/><path d="M6 2.5v11"/></symbol>
+    <symbol id="i-chev" viewBox="0 0 16 16"><path d="m6 3.5 4.5 4.5L6 12.5"/></symbol>
+    <symbol id="i-send" viewBox="0 0 16 16"><path d="M2.5 8 13.5 2.5 10.5 13.5 8 9z"/></symbol>
+    <symbol id="i-info" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.8"/><path d="M8 7.3v3.7M8 5h.01"/></symbol>
+    <symbol id="i-ext" viewBox="0 0 16 16"><path d="M9 2.5h4.5V7M13.5 2.5 7.5 8.5M11.5 9.5v3.5h-9v-9H6"/></symbol>
+    <symbol id="s-ready" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="currentColor" stroke="none"/><path d="m5.2 8.2 1.9 1.9 3.8-4" stroke="var(--surface)" stroke-width="1.8" fill="none"/></symbol>
+    <symbol id="s-pending" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" stroke-width="1.6" fill="none"/><path d="M8 2.4a5.6 5.6 0 0 1 0 11.2z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="s-refused" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="currentColor" stroke="none"/><path d="M4.8 8h6.4" stroke="var(--surface)" stroke-width="1.9"/></symbol>
+    <symbol id="s-error" viewBox="0 0 16 16"><path d="M8 1.8 14.6 13.6H1.4z" fill="currentColor" stroke="none"/><path d="M8 6v3.6M8 11.5h.01" stroke="var(--surface)" stroke-width="1.7"/></symbol>
+    <symbol id="s-paused" viewBox="0 0 16 16"><circle cx="8" cy="8" r="6.2" fill="currentColor" stroke="none"/><path d="M6.4 5.5v5M9.6 5.5v5" stroke="var(--surface)" stroke-width="1.7"/></symbol>
+    <symbol id="s-none" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.6" stroke-dasharray="2 2" fill="none"/></symbol>
+  </defs>
+</svg>
+
+<a class="skip" href="#content">Skip to content</a>
+<div class="app" id="app">
+  <nav class="sb" aria-label="Main" id="sidebar">
+    <div class="brand">
+      <div class="mark" aria-hidden="true"><svg viewBox="0 0 14 14"><circle cx="3" cy="7" r="1.8"/><circle cx="11" cy="7" r="1.8"/><path d="M4.8 7h4.4M7 4.5v5"/></svg></div>
+      <div class="word"><span>Open</span><b>Agentix</b></div>
+    </div>
+    <div class="ctx" title="Cluster context and agent namespace">kind-openagentix · kagent</div>
+    <div class="nav">
+      <a class="ni" href="#overview" data-nav="overview"><svg class="i"><use href="#i-overview"/></svg><span>Overview</span></a>
+    </div>
+    <div class="grp">Build</div>
+    <div class="nav">
+      <a class="ni" href="#agents" data-nav="agents"><svg class="i"><use href="#i-agent"/></svg><span>Agents</span></a>
+      <div class="sub" data-sub="agents"><a href="#agents" data-subnav="agents">Registry</a><a href="#playground" data-subnav="playground">Playground</a></div>
+      <a class="ni" href="#skills" data-nav="skills"><svg class="i"><use href="#i-skill"/></svg><span>Skills</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+    </div>
+    <div class="grp">Connect</div>
+    <div class="nav">
+      <a class="ni" href="#models" data-nav="models"><svg class="i"><use href="#i-model"/></svg><span>Models</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+      <a class="ni" href="#tools" data-nav="tools"><svg class="i"><use href="#i-tool"/></svg><span>Tools</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+      <a class="ni" href="#knowledge" data-nav="knowledge"><svg class="i"><use href="#i-book"/></svg><span>Knowledge</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+      <div class="sub" data-sub="knowledge"><a href="#knowledge" data-subnav="knowledge">Collections</a><a href="#knowledge" data-subnav="sources">Sources</a><a href="#graph" data-subnav="graph">Graph</a></div>
+      <a class="ni" href="#channels" data-nav="channels"><svg class="i"><use href="#i-channel"/></svg><span>Channels and triggers</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+      <a class="ni" href="#schedules" data-nav="schedules"><svg class="i"><use href="#i-clock"/></svg><span>Schedules</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+    </div>
+    <div class="grp">Operate</div>
+    <div class="nav">
+      <a class="ni" href="#traces" data-nav="traces"><svg class="i"><use href="#i-trace"/></svg><span>Traces</span></a>
+      <a class="ni" href="#costs" data-nav="costs"><svg class="i"><use href="#i-coin"/></svg><span>Costs</span></a>
+      <a class="ni" href="#memory" data-nav="memory"><svg class="i"><use href="#i-memory"/></svg><span>Memory</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+    </div>
+    <div class="grp">Govern</div>
+    <div class="nav">
+      <a class="ni" href="#governance" data-nav="governance"><svg class="i"><use href="#i-shield"/></svg><span>Governance</span><svg class="i lock" aria-label="Read-only"><use href="#i-lock"/></svg></a>
+    </div>
+    <div class="sb-foot">
+      <a class="ni" href="#platform" data-nav="platform"><svg class="i"><use href="#i-gear"/></svg><span>Settings</span></a>
+      <button class="ni collapse-btn" id="collapse" type="button" aria-label="Collapse sidebar"><svg class="i"><use href="#i-side"/></svg><span>Collapse</span></button>
+    </div>
+  </nav>
+
+  <div class="main">
+    <header class="top">
+      <button class="ib menu-btn" id="menuBtn" type="button" aria-label="Open navigation"><svg class="i"><use href="#i-menu"/></svg></button>
+      <div class="crumb" id="crumb"><b>Overview</b></div>
+      <div class="search" role="search"><svg class="i"><use href="#i-search"/></svg><span>Search agents, tools, pages</span><kbd>/</kbd></div>
+      <span class="demo" title="The demo values files are installed">Demo data</span>
+      <button class="ib" id="themeBtn" type="button" aria-label="Switch theme"><svg class="i"><use href="#i-theme"/></svg></button>
+    </header>
+
+    <main class="content" id="content" tabindex="-1">
+
+<!-- ============ OVERVIEW ============ -->
+<section class="view" data-view="overview" data-title="Overview">
+  <div class="ph"><div class="ph-l"><h1>Overview</h1><div class="strip">platform catalog · policy · gateway metrics · last refreshed 25 Nov 2026, 14:32</div></div></div>
+  <div class="grid g4">
+    <div class="tile"><div class="lbl">Agents</div><div class="val">5</div>
+      <div class="split"><span><span class="dot" style="background:var(--ready)"></span>3 ready</span><span><span class="dot" style="background:var(--pending)"></span>1 pending</span><span><span class="dot" style="background:var(--refused)"></span>1 refused</span></div></div>
+    <div class="tile"><div class="lbl">Definitions used</div><div class="val">3<small>of 5</small></div><div class="meter" aria-hidden="true"><i style="width:60%"></i></div><div class="cmp">policy <code>maxAgents: 5</code> · 2 chart agents not counted</div></div>
+    <div class="tile"><div class="lbl">Spend today</div><div class="val">$0.191</div><div class="cmp num">2.04M tokens in · 15.1K out · gateway price catalog</div></div>
+    <div class="tile"><div class="lbl">Turns, last 24 h</div><div class="val">63</div><div class="cmp">61 completed · 2 failed</div></div>
+  </div>
+  <div class="grid g2">
+    <div class="panel">
+      <div class="hd"><h2>Needs attention</h2></div>
+      <div class="tw"><table style="min-width:0"><tbody>
+        <tr class="clk" data-go="builder" data-refused="1"><td><span class="badge st-refused"><svg><use href="#s-refused"/></svg>Refused</span></td><td><a class="mono" href="#builder">cve-triage</a><div class="sm t3">2 rules refused this definition</div></td><td class="sm t3 r">12 min ago</td></tr>
+        <tr class="clk" data-go="agents"><td><span class="badge st-pending"><svg><use href="#s-pending"/></svg>Pending</span></td><td><a class="mono" href="#agents">release-notes</a><div class="sm t3">AgentPending: the runtime reports no Ready condition yet</div></td><td class="sm t3 r">40 s ago</td></tr>
+        <tr><td><span class="badge st-paused"><svg><use href="#s-paused"/></svg>Suspended</span></td><td><a class="mono" href="#schedules">demo-brief</a><div class="sm t3">Schedule is suspended on purpose in the demo values</div></td><td class="sm t3 r">since install</td></tr>
+        <tr><td><span class="badge st-error"><svg><use href="#s-error"/></svg>Failed</span></td><td><a href="#traces">2 turns failed</a><div class="sm t3">Both on <code>assistant</code>, caller <code>kourier:demo-assistant</code>: rate limit of the binding</div></td><td class="sm t3 r">3 h ago</td></tr>
+      </tbody></table></div>
+    </div>
+    <div class="panel">
+      <div class="hd"><h2>Platform</h2><span class="sm t3">active adapters and optional components</span></div>
+      <div class="bd">
+        <dl class="kv">
+          <dt>Runtime</dt><dd><code>kagent</code> 1.0.1 on Agent Substrate <span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></dd>
+          <dt>Model gateway</dt><dd><code>agentgateway</code> v1.7.0 <span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></dd>
+          <dt>Tools</dt><dd><code>toolhive</code> 0.67.1, vMCP with code mode <span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></dd>
+          <dt>Knowledge</dt><dd>on · graph on · 2 collections</dd>
+          <dt>Memory</dt><dd>on · expiry job on, nightly</dd>
+          <dt>Notify</dt><dd>on · 1 destination</dd>
+          <dt>Channels</dt><dd>Kourier on · Telegram bridge on</dd>
+          <dt>A2A gate</dt><dd>on · 4 caller rules</dd>
+          <dt>Observability</dt><dd>bundled VictoriaMetrics and Jaeger · content capture off</dd>
+        </dl>
+      </div>
+    </div>
+  </div>
+  <div class="panel">
+    <div class="hd"><h2>Recent changes</h2><span class="sm t3">AgentDefinition events</span></div>
+    <div class="tw"><table><thead><tr><th>Time</th><th>Agent</th><th>Event</th><th>Detail</th></tr></thead><tbody>
+      <tr><td class="sm t3 num">14:31</td><td class="mono">release-notes</td><td>Applied</td><td class="sm t2">5 objects applied; waiting for the runtime</td></tr>
+      <tr><td class="sm t3 num">14:31</td><td class="mono">release-notes</td><td>KeyReady</td><td class="sm t2">Secret <code>release-notes-virtual-key</code></td></tr>
+      <tr><td class="sm t3 num">14:20</td><td class="mono">cve-triage</td><td>Refused</td><td class="sm t2">2 rule(s) refused; see status.violations</td></tr>
+      <tr><td class="sm t3 num">11:05</td><td class="mono">researcher</td><td>Ready</td><td class="sm t2">generation 3</td></tr>
+    </tbody></table></div>
+  </div>
+</section>
+
+<!-- ============ AGENTS REGISTRY ============ -->
+<section class="view" data-view="agents" data-title="Agents" hidden>
+  <div class="ph">
+    <div class="ph-l"><h1>Agents</h1><div class="strip">AgentDefinition · openagentix.io/v1alpha1 · chart agents[]</div></div>
+    <div class="acts"><button class="btn pri" type="button" data-go="builder"><svg class="i"><use href="#i-plus"/></svg>New agent</button></div>
+  </div>
+  <div class="panel">
+    <div class="toolbar">
+      <input class="input" id="agentSearch" type="search" placeholder="Filter by name" aria-label="Filter agents by name">
+      <div class="seg" role="group" aria-label="Source"><button type="button" aria-pressed="true">All</button><button type="button" aria-pressed="false">Built</button><button type="button" aria-pressed="false">Chart</button></div>
+      <span class="sm t3" style="margin-left:auto">3 of 5 definitions used (policy <code>maxAgents: 5</code>)</span>
+    </div>
+    <div class="tw"><table id="agentTable">
+      <thead><tr><th aria-sort="ascending"><button type="button">Name <svg class="i" style="width:12px;height:12px;transform:rotate(90deg)"><use href="#i-chev"/></svg></button></th><th>Status</th><th>Conditions</th><th>Model</th><th>Tool profile</th><th>Capabilities</th><th>Source</th><th class="r">Updated</th></tr></thead>
+      <tbody>
+        <tr class="clk" data-go="builder" data-name="assistant"><td><a class="mono" href="#builder">assistant</a><div class="sm t3">General assistant reachable from messaging channels</div></td>
+          <td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td><td><span class="t3 sm">chart-managed</span></td>
+          <td class="mono">claude-haiku</td><td class="t3">None (shared vMCP)</td><td><div class="tags"><span class="tag">knowledge</span><span class="tag">notify</span><span class="tag">memory 30d</span></div></td><td><span class="tag">Chart</span></td><td class="r sm t3">2 d ago</td></tr>
+        <tr class="clk" data-go="builder" data-name="profile-demo"><td><a class="mono" href="#builder">profile-demo</a><div class="sm t3">Looks up vulnerabilities through the lookup profile</div></td>
+          <td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td><td><span class="t3 sm">chart-managed</span></td>
+          <td class="mono">claude-haiku</td><td class="mono">lookup</td><td><div class="tags"><span class="tag">egress 1</span></div></td><td><span class="tag">Chart</span></td><td class="r sm t3">2 d ago</td></tr>
+        <tr class="clk" data-go="builder" data-name="researcher"><td><a class="mono" href="#builder">researcher</a><div class="sm t3">Looks things up and cites what it found</div></td>
+          <td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td>
+          <td><span class="pips" aria-label="Accepted True, KeyReady True, Applied True, Ready True" title="Accepted · KeyReady · Applied · Ready"><i class="pip ready"></i><i class="pip ready"></i><i class="pip ready"></i><i class="pip ready"></i></span></td>
+          <td class="mono">claude-haiku</td><td class="mono">lookup</td><td><div class="tags"><span class="tag">memory 15d</span><span class="tag">skills 1</span><span class="tag">egress 1</span></div></td><td><span class="tag acc">Built</span></td><td class="r sm t3">3 h ago</td></tr>
+        <tr class="clk" data-go="builder" data-refused="1"><td><a class="mono" href="#builder">cve-triage</a><div class="sm" style="color:var(--refused)">the definition lists tool "knowledge_kb_get_document" which is not in profile "lookup" …</div></td>
+          <td><span class="badge st-refused"><svg><use href="#s-refused"/></svg>Refused</span></td>
+          <td><span class="pips" aria-label="Accepted False, KeyReady not reached, Applied False, Ready False" title="Accepted · KeyReady · Applied · Ready"><i class="pip refused"></i><i class="pip none"></i><i class="pip none"></i><i class="pip none"></i></span></td>
+          <td class="mono">claude-haiku</td><td class="mono">lookup</td><td><div class="tags"><span class="tag">knowledge</span><span class="tag">egress 2</span></div></td><td><span class="tag acc">Built</span></td><td class="r sm t3">12 min ago</td></tr>
+        <tr class="clk" data-go="agents"><td><a class="mono" href="#agents">release-notes</a><div class="sm t3">AgentPending: the runtime reports no Ready condition yet</div></td>
+          <td><span class="badge st-pending"><svg><use href="#s-pending"/></svg>Pending</span></td>
+          <td><span class="pips" aria-label="Accepted True, KeyReady True, Applied True, Ready False" title="Accepted · KeyReady · Applied · Ready"><i class="pip ready"></i><i class="pip ready"></i><i class="pip ready"></i><i class="pip pending"></i></span></td>
+          <td class="mono">claude-haiku</td><td class="mono">lookup</td><td><div class="tags"><span class="tag">notify</span></div></td><td><span class="tag acc">Built</span></td><td class="r sm t3">40 s ago</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+</section>
+
+<!-- ============ BUILDER ============ -->
+<section class="view" data-view="builder" data-title="Agents / researcher" hidden>
+  <div class="ph">
+    <div class="ph-l">
+      <div class="ph-t"><h1 class="mono" style="font-family:var(--mono);font-size:17px" id="bName">researcher</h1><span id="bBadge" class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></div>
+      <div class="strip">AgentDefinition · openagentix.io/v1alpha1 · namespace kagent · generation 3</div>
+    </div>
+    <div class="acts">
+      <label class="mockctl"><input type="checkbox" id="refToggle"> Mockup: show refused state</label>
+      <button class="btn" type="button" id="yamlBtn"><svg class="i"><use href="#i-code"/></svg>View YAML</button>
+      <button class="btn" type="button" id="delBtn"><svg class="i"><use href="#i-trash"/></svg>Delete</button>
+      <button class="btn pri" type="button" id="saveBtn">Save</button>
+    </div>
+  </div>
+  <div class="rail" role="list" aria-label="Conditions" id="bRail"></div>
+  <div class="tabs" role="tablist" aria-label="Agent">
+    <button class="tab" role="tab" aria-selected="true" data-btab="build" id="bt-build" aria-controls="bp-build">Build</button>
+    <button class="tab" role="tab" aria-selected="false" data-btab="play" id="bt-play">Playground</button>
+    <button class="tab" role="tab" aria-selected="false" data-btab="deploy" id="bt-deploy" aria-controls="bp-deploy">Deploy</button>
+  </div>
+
+  <div id="bp-build" role="tabpanel" aria-labelledby="bt-build" class="stack">
+    <div class="notice refused" id="refNotice" hidden role="alert">
+      <svg class="i"><use href="#s-refused"/></svg>
+      <div><div class="nt">Refused by the platform policy</div>
+        <p class="sm">2 rules refused this definition. Nothing was changed in the cluster; objects of an earlier version, if any, are left as they were.</p>
+        <ul>
+          <li>the definition lists tool "knowledge_kb_get_document" which is not in profile "lookup" (the profile offers: knowledge_kb_search, osv_query_vulnerability, osv_get_vulnerability, execute_tool_script)</li>
+          <li>egress.allow entry "https://services.nvd.nist.gov" is not matched by the platform policy</li>
+        </ul>
+      </div>
+    </div>
+    <div class="bgrid">
+      <div class="panel">
+        <div class="hd"><h2>Identity and instructions</h2></div>
+        <div class="bd stack">
+          <div class="grid g2">
+            <div class="field"><label for="f-name">Name</label><input id="f-name" class="mono" value="researcher" readonly><div class="hint"><span>Names cannot change; create a new agent instead.</span></div></div>
+            <div class="field"><label for="f-ns">Namespace</label><input id="f-ns" class="mono" value="kagent" readonly><div class="hint"><span>Only kagent is reconciled in v1alpha1.</span></div></div>
+          </div>
+          <div class="field"><label for="f-desc">Description</label><input id="f-desc" value="Looks things up and cites what it found" maxlength="256"><div class="hint"><span>One line about what the agent does.</span><span class="num">39 / 256</span></div></div>
+          <div class="field"><label for="f-ins">Instructions</label>
+<textarea id="f-ins" spellcheck="true">You are a careful research assistant for the platform team.
+Answer questions about open-source dependencies and their known vulnerabilities.
+
+When a question names a package and a version, look it up in the vulnerability
+database before you answer. Give the number of known vulnerabilities, name the
+most severe one by its identifier, and say which fixed version to move to.
+
+Cite every source you used by its title or identifier. If a lookup returns
+nothing, say so plainly instead of guessing. Keep answers short and in plain text.</textarea>
+            <div class="hint"><span>The system prompt. Checked for anything shaped like a secret.</span><span class="num">612 / 16,384 bytes</span></div></div>
+          <details class="sm"><summary class="t2" style="cursor:pointer">Prompts the platform adds (1)</summary>
+            <div class="code" style="margin-top:8px"><pre style="white-space:pre-wrap"><span class="c"># memory prompt from the platform catalog</span>
+You have long-term memory. Relevant facts from earlier conversations with this user may appear in your
+context; use them. When the user tells you something worth keeping across conversations (a preference, a
+project name, a codename, a standing instruction) or asks you to remember something, call the save_memory tool
+with one short, self-contained sentence. Never store passwords, tokens or other secrets.</pre></div>
+          </details>
+        </div>
+      </div>
+
+      <div class="stack">
+        <div class="panel">
+          <div class="hd"><h2>Model and capabilities</h2></div>
+          <div class="bd">
+            <div class="cap"><div class="cx">
+              <div class="field"><label for="f-model">Model</label>
+                <select id="f-model"><option>claude-haiku</option></select>
+                <div class="hint"><span>Gateway models the platform policy allows. The catalog has 1.</span></div></div>
+              <div class="field"><label for="f-prof">Tool profile</label>
+                <select id="f-prof"><option>lookup</option><option disabled>None — the platform policy requires a toolProfile</option></select>
+                <div class="hint"><span>Served by <code>toolhive-vmcp-lookup</code> · code mode on</span></div></div>
+            </div></div>
+            <div class="cap"><fieldset class="cx"><legend class="flabel">Tools offered by <code>lookup</code></legend>
+              <label class="chk"><input type="checkbox" checked id="t1"><span><code><span class="dim">osv_</span>query_vulnerability</code></span></label>
+              <label class="chk"><input type="checkbox" checked id="t2"><span><code><span class="dim">osv_</span>get_vulnerability</code></span></label>
+              <label class="chk"><input type="checkbox" checked id="t3"><span><code><span class="dim">knowledge_</span>kb_search</code></span></label>
+              <label class="chk"><input type="checkbox" id="t4"><span><code>execute_tool_script</code> <span class="sm t3">Code mode: the model writes a short script that calls several tools in one step</span></span></label>
+              <label class="chk bad" id="t5row" hidden><input type="checkbox" checked disabled id="t5"><span><code>knowledge_kb_get_document</code> <span class="sm" style="color:var(--refused)">not offered by lookup</span></span></label>
+            </fieldset></div>
+            <div class="cap"><div class="cx"><span class="flabel" id="lk">Knowledge</span><span class="sm t3">Adds 6 knowledge tools and a prompt to search the knowledge base and cite documents.</span>
+              <div class="prev" id="kPrev">This draft would be refused: profile lookup offers only knowledge_kb_search, not the other 5 knowledge tools.</div></div>
+              <button class="sw" role="switch" aria-checked="false" aria-labelledby="lk" id="swK" type="button"></button></div>
+            <div class="cap"><div class="cx"><span class="flabel" id="ln">Notify</span><span class="sm t3">The agent can send a message to a named destination when a task asks it to.</span></div>
+              <button class="sw" role="switch" aria-checked="false" aria-labelledby="ln" type="button"></button></div>
+            <div class="cap"><div class="cx"><span class="flabel" id="lm">Memory</span><span class="sm t3">Remembers facts per user across conversations.</span>
+              <div class="field" style="max-width:260px;margin-top:4px"><label for="f-ttl" class="sm">Keep memories for</label><div style="display:flex;gap:8px;align-items:center"><input id="f-ttl" type="number" min="1" max="30" value="15" style="width:80px"> <span class="sm t2">days</span></div><div class="hint"><span>1 to 30 days, platform maximum. Expiry job on.</span></div></div></div>
+              <button class="sw" role="switch" aria-checked="true" aria-labelledby="lm" type="button"></button></div>
+            <div class="cap"><fieldset class="cx"><legend class="flabel">Skills</legend>
+              <label class="chk"><input type="checkbox" checked><span><code>openagentix-canary</code> <span class="sm t3">approved</span></span></label></fieldset></div>
+            <div class="cap"><div class="cx" style="gap:6px"><span class="flabel">Egress</span>
+              <div class="tags" id="egTags"><span class="tag">https://api.osv.dev<button type="button" aria-label="Remove https://api.osv.dev"><svg class="i" style="width:12px;height:12px"><use href="#i-x"/></svg></button></span></div>
+              <input class="input" placeholder="https://host[:port]" aria-label="Add an origin" style="height:28px">
+              <span class="sm t3">The policy allows <code>https://api.osv.dev</code> and <code>https://*.example.org</code>. Nothing else is reachable.</span>
+              <div class="prev" id="egPrev" hidden>egress.allow entry "https://services.nvd.nist.gov" is not matched by the platform policy</div></div></div>
+            <p class="sm t3" style="border-top:1px solid var(--border);padding-top:12px">Model access, image, tool server and budget come from the platform. Callers are set by an operator in the gate rules.</p>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="hd"><h2>Platform policy</h2><a class="sm" href="#governance" style="margin-left:auto">Governance</a></div>
+          <div class="bd"><dl class="kv sm">
+            <dt>Models</dt><dd><code>claude-haiku</code></dd><dt>Tool profiles</dt><dd><code>lookup</code> (required)</dd>
+            <dt>Knowledge, notify</dt><dd>allowed</dd><dt>Memory</dt><dd>allowed, at most 30 days, expiry required</dd>
+            <dt>Skills</dt><dd><code>openagentix-canary</code></dd><dt>Egress</dt><dd><code>https://api.osv.dev</code>, <code>https://*.example.org</code></dd>
+            <dt>Agents</dt><dd>3 of 5 definitions</dd></dl></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="hd"><h2>Status</h2><span class="sm t3" id="genLine">Status is for generation 3, the current one.</span></div>
+      <div class="tw"><table><thead><tr><th>Condition</th><th>Status</th><th>Reason</th><th>Message</th><th class="r">Last change</th></tr></thead><tbody id="condBody"></tbody></table></div>
+      <div class="bd" style="border-top:1px solid var(--border)"><dl class="kv" id="statusKv">
+        <dt>Endpoint</dt><dd><code>http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/researcher</code> <button class="ib" type="button" aria-label="Copy endpoint" style="width:24px;height:24px;vertical-align:middle"><svg class="i" style="width:13px;height:13px"><use href="#i-copy"/></svg></button></dd>
+        <dt>Gateway user</dt><dd><code>researcher</code></dd>
+        <dt>Tool server</dt><dd><code>toolhive-vmcp-lookup</code></dd>
+        <dt>Effective tools</dt><dd><div class="tags"><span class="tag">osv_query_vulnerability</span><span class="tag">osv_get_vulnerability</span><span class="tag">knowledge_kb_search</span><span class="tag">save_memory</span><span class="tag">load_memory</span></div></dd>
+        <dt>Effective egress</dt><dd><code>https://api.osv.dev</code></dd>
+        <dt>Runtime object</dt><dd><code>api.kagent.dev/v1alpha3 Agent researcher</code></dd>
+      </dl></div>
+    </div>
+  </div>
+
+  <div id="bp-deploy" role="tabpanel" aria-labelledby="bt-deploy" class="stack" hidden>
+    <div class="notice warn"><svg class="i"><use href="#s-pending"/></svg><div><div class="nt">Nobody can call this agent yet</div><p class="sm">An operator adds a gate caller rule with <code>agents: [kagent/researcher]</code>. The console does not write gate rules.</p></div></div>
+    <div class="grid g2">
+      <div class="panel"><div class="hd"><h2>Objects the runtime adapter owns</h2></div>
+        <div class="tw"><table style="min-width:0"><thead><tr><th>Kind</th><th>Name</th><th>Status</th></tr></thead><tbody>
+          <tr><td>ModelConfig</td><td class="mono">researcher-model</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+          <tr><td>Harness</td><td class="mono">researcher-harness</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+          <tr><td>AgentTemplate</td><td class="mono">researcher-template</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+          <tr><td>EgressPolicy</td><td class="mono">researcher-egress</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+          <tr><td>Agent</td><td class="mono">researcher</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+          <tr><td>Secret</td><td class="mono">researcher-virtual-key</td><td class="sm t3">exists · value never shown</td></tr>
+        </tbody></table></div>
+        <div class="bd sm t3">Labels <code>app.kubernetes.io/managed-by: openagentix-control-plane</code>, <code>openagentix.io/agent-definition: researcher</code></div>
+      </div>
+      <div class="panel"><div class="hd"><h2>Caller rule to hand to an operator</h2></div><div class="bd">
+        <div class="code"><button class="ib copy" type="button" aria-label="Copy rule"><svg class="i"><use href="#i-copy"/></svg></button><pre><span class="ln"><span class="k">governance:</span></span><span class="ln"><span class="k">  a2a:</span></span><span class="ln"><span class="k">    callers:</span></span><span class="ln"><span class="k">      - name: </span><span class="s">research-hook</span></span><span class="ln"><span class="k">        agents: </span><span class="v">[kagent/researcher]</span></span><span class="ln"><span class="k">        userIds: </span><span class="v">{exact: [</span><span class="s">"kourier:research-hook"</span><span class="v">]}</span></span></pre></div>
+        <p class="sm t3" style="margin-top:8px">Example for a webhook binding. The operator chooses the caller.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ PLAYGROUND ============ -->
+<section class="view" data-view="playground" data-title="Agents / Playground" hidden>
+  <div class="ph">
+    <div class="ph-l"><h1>Playground</h1><div class="strip">A2A gate · caller console · user id console:7c2e19</div></div>
+    <div class="acts">
+      <div class="field" style="flex-direction:row;align-items:center;gap:8px"><label for="pgAgent">Agent</label><select id="pgAgent" style="width:180px"><option>assistant</option><option>profile-demo</option><option>researcher</option><option disabled>release-notes (Pending)</option><option disabled>cve-triage (Refused)</option></select></div>
+      <button class="btn" type="button">New conversation</button>
+    </div>
+  </div>
+  <div class="notice info"><svg class="i"><use href="#i-info"/></svg><p class="sm">This agent remembers. Facts saved here are stored for user <code>console:7c2e19</code> for up to 30 days.</p></div>
+  <div class="ld">
+    <div class="panel" style="display:flex;flex-direction:column">
+      <div class="chat">
+        <div class="msg user"><div class="who">You · 14:28</div><div class="body">Does lodash 4.17.20 on npm have known vulnerabilities? Give the count.</div></div>
+        <div class="msg"><div class="who"><svg class="i"><use href="#i-agent"/></svg><code>assistant</code> · 14:28</div>
+          <div class="toolcall"><svg class="i"><use href="#i-tool"/></svg><code>osv_query_vulnerability</code><span class="t3">{"package": "lodash", "ecosystem": "npm", "version": "4.17.20"}</span><span style="margin-left:auto" class="num">2.9 s</span></div>
+          <div class="body">Yes. lodash 4.17.20 on npm has 4 known vulnerabilities in the OSV database. The most severe is GHSA-35jh-r3h4-6jhm, a command injection in <code>template</code>, fixed in 4.17.21. I used the OSV vulnerability lookup.</div>
+          <div class="turnfoot num"><span>2 model calls</span><span>30,782 tokens in · 263 out</span><span>cache read 71%</span><span>$0.00321</span><span>9.3 s</span><a href="#traces">Open trace</a></div>
+        </div>
+      </div>
+      <div class="composer"><textarea id="pgInput" aria-label="Message" placeholder="Message assistant. Enter sends, Shift+Enter adds a line."></textarea><button class="btn pri" type="button"><svg class="i"><use href="#i-send"/></svg>Send</button></div>
+    </div>
+    <aside class="panel detail" aria-labelledby="pgSide">
+      <div class="hd"><h2 id="pgSide">This conversation</h2></div>
+      <div class="bd"><dl class="kv sm">
+        <dt>Agent</dt><dd><code>kagent/assistant</code></dd><dt>Caller</dt><dd><code>console</code></dd><dt>User id</dt><dd><code>console:7c2e19</code></dd>
+        <dt>Context id</dt><dd><code>c81f…a02d</code></dd><dt>Turns</dt><dd class="num">1</dd><dt>Spend</dt><dd class="num">$0.00321</dd>
+        <dt>Memory</dt><dd>on, 30 days</dd><dt>Tools</dt><dd>shared vMCP, 9 tools</dd></dl>
+        <p class="sm t3">Prompts and answers are kept only in the runtime's task store. Traces carry no content (content capture is off).</p></div>
+    </aside>
+  </div>
+</section>
+
+<!-- ============ SKILLS ============ -->
+<section class="view" data-view="skills" data-title="Skills" hidden>
+  <div class="ph"><div class="ph-l"><h1>Skills</h1><div class="strip">chart values · skills (digest-pinned OCI images)</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the Skill kind exists</div><p class="sm">Today skills are OCI images listed under <code>skills</code> in chart values with a pinned digest. Change them there and run <code>install.sh</code>.</p></div></div>
+  <div class="ld">
+    <div class="grid g2" style="align-content:start">
+      <button class="card" type="button" aria-pressed="true"><div class="row1"><span class="ico"><svg class="i"><use href="#i-skill"/></svg></span><b class="mono">openagentix-canary</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Approved</span></div>
+        <p class="sm t2">Example skill built and pushed by the installer. Proves skill loading from the in-cluster registry.</p>
+        <div class="meta"><span>1 version</span><span>used by 2 agents</span></div></button>
+    </div>
+    <aside class="panel detail" aria-labelledby="skD"><div class="hd"><h2 id="skD" class="mono" style="font-family:var(--mono);font-size:14px">openagentix-canary</h2></div>
+      <div class="bd"><dl class="kv sm"><dt>Reference</dt><dd><code>openagentix-registry:5000/skills/openagentix-canary@sha256:9c1e…b07d</code></dd><dt>State</dt><dd>approved (catalog)</dd><dt>Used by</dt><dd><code>assistant</code>, <code>researcher</code></dd><dt>Source</dt><dd><code>components/tools/</code> example skill</dd></dl>
+      <p class="sm t3">Versions, publishers and <code>SKILL.md</code> appear here once the organisation skill registry exists.</p></div></aside>
+  </div>
+</section>
+
+<!-- ============ MODELS ============ -->
+<section class="view" data-view="models" data-title="Models" hidden>
+  <div class="ph"><div class="ph-l"><h1>Models</h1><div class="strip">agentgateway · AgentgatewayModel · chart values gateway.models</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the ModelProvider and ModelRoute kinds exist</div><p class="sm">Today models are set in chart values under <code>gateway.models</code>, and provider keys are Secrets in <code>agentgateway-system</code>. Change them there and run <code>install.sh</code>.</p></div></div>
+  <div class="tabs" role="tablist" aria-label="Models"><button class="tab" role="tab" aria-selected="true" type="button">Providers and routes</button><button class="tab" role="tab" aria-selected="false" type="button" data-go="costs">Keys and budgets</button></div>
+  <div class="ld">
+    <div class="stack">
+      <div class="grid g3">
+        <button class="card" type="button" aria-pressed="true"><div class="row1"><span class="ico"><svg class="i"><use href="#i-model"/></svg></span><b class="mono">claude-haiku</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Healthy</span></div>
+          <p class="sm t2">Anthropic · <code>claude-haiku-5-5</code></p><div class="meta"><span>credential set 23 Nov</span><span>4 agents</span></div></button>
+        <button class="card" type="button" aria-pressed="false"><div class="row1"><span class="ico"><svg class="i"><use href="#i-model"/></svg></span><b class="mono">embed-default</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Healthy</span></div>
+          <p class="sm t2">In-cluster · <code>bge-small-en-v1.5</code>, 384 dims</p><div class="meta"><span>no credential</span><span>used by kb</span></div></button>
+        <button class="card" type="button" aria-pressed="false"><div class="row1"><span class="ico"><svg class="i"><use href="#i-model"/></svg></span><b class="mono">embed-memory</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Healthy</span></div>
+          <p class="sm t2">In-cluster · <code>bge-base-en-v1.5</code>, 768 dims</p><div class="meta"><span>no credential</span><span>used by memory</span></div></button>
+      </div>
+      <div class="panel"><div class="hd"><h2>Routes</h2><span class="sm t3">aliases that agents name</span></div>
+        <div class="tw"><table><thead><tr><th>Alias</th><th>Strategy</th><th>Targets</th><th>Health rules</th><th class="r">Requests 24 h</th></tr></thead><tbody>
+          <tr><td class="mono">claude-haiku</td><td>failover</td><td><code>anthropic/claude-haiku-5-5</code> priority 1</td><td class="sm">evict on 402, 429, 5xx</td><td class="r num">151</td></tr>
+          <tr><td class="mono">embed-default</td><td>single</td><td><code>kb-embeddings</code></td><td class="sm t3">none</td><td class="r num">88</td></tr>
+          <tr><td class="mono">embed-memory</td><td>single</td><td><code>memory-embeddings</code></td><td class="sm t3">none</td><td class="r num">126</td></tr>
+        </tbody></table></div></div>
+    </div>
+    <aside class="panel detail" aria-labelledby="mdD"><div class="hd"><h2 id="mdD" class="mono" style="font-family:var(--mono);font-size:14px">claude-haiku</h2><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Healthy</span></div>
+      <div class="bd"><dl class="kv sm"><dt>Provider</dt><dd>Anthropic</dd><dt>Upstream model</dt><dd><code>claude-haiku-5-5</code></dd><dt>Credential</dt><dd>set on 23 Nov 2026 · never shown</dd><dt>Price</dt><dd>$0.10 per million input tokens, $0.50 per million output (gateway catalog)</dd><dt>Prompt caching</dt><dd>on (<code>gateway.policy.promptCaching</code>)</dd><dt>Token budget</dt><dd>1,000,000 tokens per hour per key, per proxy replica</dd><dt>Used by</dt><dd><code>assistant</code>, <code>profile-demo</code>, <code>researcher</code>, <code>kb-extract</code></dd></dl>
+      <p class="sm t3">Rules-based routing and a router service are planned (ADR 0008). No route here changes until it is measured.</p></div></aside>
+  </div>
+</section>
+
+<!-- ============ TOOLS ============ -->
+<section class="view" data-view="tools" data-title="Tools" hidden>
+  <div class="ph"><div class="ph-l"><h1>Tools</h1><div class="strip">ToolHive · MCPServer, MCPServerEntry, VirtualMCPServer · chart values mcp.servers, mcp.profiles</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the ToolServer and ToolProfile kinds exist</div><p class="sm">Today servers and profiles are set in chart values under <code>mcp.servers</code> and <code>mcp.profiles</code>. A new server image is a supply-chain decision and will need operator approval.</p></div></div>
+  <div class="tabs" role="tablist" aria-label="Tools"><button class="tab" role="tab" aria-selected="true" type="button" data-ttab="servers">MCP servers</button><button class="tab" role="tab" aria-selected="false" type="button" data-ttab="profiles">Tool profiles</button></div>
+  <div class="ld">
+    <div class="grid g2" id="toolCards" style="align-content:start"></div>
+    <aside class="panel detail" aria-labelledby="tdTitle" id="toolDetail"></aside>
+  </div>
+</section>
+
+<!-- ============ KNOWLEDGE ============ -->
+<section class="view" data-view="knowledge" data-title="Knowledge / Collections" hidden>
+  <div class="ph"><div class="ph-l"><h1>Knowledge</h1><div class="strip">kb service · namespace openagentix-knowledge</div></div><div class="acts"><a class="btn" href="#graph"><svg class="i"><use href="#i-graph"/></svg>Open graph</a></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the KnowledgeCollection and KnowledgeSource kinds exist</div><p class="sm">Today documents are added with <code>hack/kb-ingest.sh &lt;dir&gt; &lt;collection&gt;</code> and curated facts with <code>hack/kb-graph-load.sh</code>.</p></div></div>
+  <div class="tabs" role="tablist" aria-label="Knowledge"><button class="tab" role="tab" aria-selected="true" type="button" data-ktab="col">Collections</button><button class="tab" role="tab" aria-selected="false" type="button" data-ktab="src">Sources</button><a class="tab" href="#graph">Graph</a></div>
+  <div class="ld" id="kCol">
+    <div class="grid g2" style="align-content:start">
+      <button class="card" type="button" aria-pressed="true" data-kc="graph-canary"><div class="row1"><span class="ico"><svg class="i"><use href="#i-book"/></svg></span><b class="mono">graph-canary</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></div>
+        <p class="sm t2">Fictional corpus for checking multi-hop answers.</p>
+        <div class="meta num"><span>26 documents</span><span>graph on</span><span>71 entities · 53 relations</span><span>1 fact set</span></div></button>
+      <button class="card" type="button" aria-pressed="false" data-kc="openagentix"><div class="row1"><span class="ico"><svg class="i"><use href="#i-book"/></svg></span><b class="mono">openagentix</b><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></div>
+        <p class="sm t2">Sample corpus about the platform, ingested by the installer.</p>
+        <div class="meta num"><span>4 documents</span><span>graph off</span><span>last ingest 23 Nov</span></div></button>
+    </div>
+    <aside class="panel detail" aria-labelledby="kcD"><div class="hd"><h2 id="kcD" class="mono" style="font-family:var(--mono);font-size:14px">graph-canary</h2><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></div>
+      <div class="bd">
+        <dl class="kv sm"><dt>Documents</dt><dd class="num">26</dd><dt>Graph</dt><dd>on · extraction model <code>claude-haiku</code> · key <code>kb-extract</code></dd>
+          <dt>Extracted</dt><dd class="num">71 entities, 53 relations</dd><dt>Curated</dt><dd>fact set <code>org-catalogue</code>: 19 entities, 12 relations</dd>
+          <dt>Jobs</dt><dd class="num">26 done · 0 pending · 0 failed</dd><dt>Extraction budget</dt><dd class="num">300,000 tokens per hour</dd></dl>
+        <div class="notice warn"><svg class="i"><use href="#s-pending"/></svg><p class="sm">The five-hop canary has not passed against a real model since the entity-resolution change. Treat graph answers as unproven.</p></div>
+        <div><h3 style="margin-bottom:6px">Documents</h3><ul class="sm" style="margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:4px">
+          <li><code>docs:orion-ownership</code> <span class="t3">Orion service ownership</span></li><li><code>docs:orion-dependencies</code> <span class="t3">Orion downstream calls</span></li><li><code>docs:quill-storage</code> <span class="t3">Quill data storage</span></li><li><code>docs:basalt-on-call</code> <span class="t3">Basalt on-call rota</span></li><li><code>docs:teal-region-incident</code> <span class="t3">Cluster Teal region and incident</span></li><li class="t3">and 21 more</li></ul></div>
+      </div></aside>
+  </div>
+  <div id="kSrc" hidden class="panel"><div class="bd" style="display:flex;flex-direction:column;gap:10px;align-items:flex-start;padding:28px">
+    <span class="ico"><svg class="i"><use href="#i-book"/></svg></span><h2>No sources yet</h2>
+    <p class="t2" style="max-width:62ch">Documents reach the knowledge base by ingest today. Sources with a sync schedule (Git, web, object storage) come with the KnowledgeSource kind.</p>
+    <div class="code" style="width:min(520px,100%)"><button class="ib copy" type="button" aria-label="Copy command"><svg class="i"><use href="#i-copy"/></svg></button><pre>hack/kb-ingest.sh ./my-docs my-collection</pre></div></div></div>
+</section>
+
+<!-- ============ GRAPH ============ -->
+<section class="view" data-view="graph" data-title="Knowledge / Graph" hidden>
+  <div class="ph"><div class="ph-l"><h1>Knowledge graph</h1><div class="strip">collection graph-canary · knowledge_kb_graph_paths</div></div>
+    <div class="acts"><input class="input" value="Teal, Mira Okafor" aria-label="Entities to connect" style="width:220px"><button class="btn" type="button">Find path</button></div></div>
+  <div class="notice info"><svg class="i"><use href="#i-info"/></svg><p class="sm">Facts were extracted by a model from documents. Check the cited document before you rely on one. Curated facts are drawn with a dashed line.</p></div>
+  <div class="gwrap">
+    <div class="panel"><div class="hd"><h2>Neighbourhood of the path</h2><div class="legend" style="margin-left:auto"><span><svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="var(--accent)" stroke-width="2.4"/></svg>path</span><span><svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="var(--bctl)" stroke-width="1.2"/></svg>extracted</span><span><svg width="22" height="8"><line x1="0" y1="4" x2="22" y2="4" stroke="var(--bctl)" stroke-width="1.2" stroke-dasharray="4 3"/></svg>curated</span></div></div>
+      <div style="overflow-x:auto"><svg class="gsvg" id="gsvg" viewBox="0 0 780 470" role="img" aria-label="Graph of 13 entities. The path from cluster Teal to Mira Okafor has five hops, listed in the path panel."></svg></div></div>
+    <aside class="panel" aria-labelledby="pathT"><div class="hd"><h2 id="pathT">Path to answer</h2><span class="sm t3">5 hops</span></div>
+      <div class="bd stack">
+        <div class="sm t2" style="background:var(--sunken);border:1px solid var(--border);border-radius:var(--r-md);padding:8px 10px">A cluster in region Vane-3 had a disk outage. Which service calls the API that stores its data in that cluster, and who is the on-call engineer of the team that owns that service?</div>
+        <ol class="path" id="pathList"></ol>
+        <div class="sm"><b>Answer:</b> Mira Okafor, on call for team Basalt, which owns Orion.</div>
+        <div class="sm t3">Also on Basalt, curated: escalates to Priya Venkat (fact set <code>org-catalogue</code>, no document).</div>
+      </div></aside>
+  </div>
+</section>
+
+<!-- ============ CHANNELS ============ -->
+<section class="view" data-view="channels" data-title="Channels and triggers" hidden>
+  <div class="ph"><div class="ph-l"><h1>Channels and triggers</h1><div class="strip">Agent Kourier 0.6.0 · ChatConnection, Binding · Telegram bridge</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the Channel and Trigger kinds exist</div><p class="sm">Today connections and bindings are set in chart values under <code>channels.connections</code> and <code>channels.bindings</code>. Credentials will be entered once and never shown again.</p></div></div>
+  <div class="panel"><div class="hd"><h2>Connections</h2></div><div class="tw"><table><thead><tr><th>Name</th><th>Platform</th><th>Verification</th><th>Secret</th><th>Status</th></tr></thead><tbody>
+    <tr><td class="mono">demo-webhook</td><td>Signed webhook</td><td class="mono">hmac-sha256 · X-Demo-Signature</td><td class="sm">set · never shown</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+    <tr><td class="mono">telegram-bridge</td><td>Telegram</td><td class="sm">chat allowlist, 1 chat</td><td class="sm">bot token set</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr></tbody></table></div></div>
+  <div class="panel"><div class="hd"><h2>Bindings and triggers</h2></div><div class="tw"><table><thead><tr><th>Binding</th><th>Channel</th><th>Agent</th><th>Trigger</th><th>Limits</th><th>User id the agent sees</th><th>Status</th></tr></thead><tbody>
+    <tr><td class="mono">demo-assistant</td><td class="mono">demo</td><td class="mono">assistant</td><td class="sm">webhookEvent <code>^question\.asked$</code></td><td class="sm num">20 per hour · 2 at once · 100 a day</td><td class="mono">kourier:demo-assistant</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+    <tr><td class="mono">demo-assistant-notify</td><td class="mono">demo-notify</td><td class="mono">assistant</td><td class="sm">webhookEvent, delivers to <code>deliver_to</code></td><td class="sm num">20 per hour · 2 at once</td><td class="mono">kourier:demo-assistant-notify</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr>
+    <tr><td class="mono">telegram</td><td class="sm">direct messages</td><td class="mono">assistant</td><td class="sm">every message</td><td class="sm t3">allowlist</td><td class="mono">telegram:&lt;chat id&gt;</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span></td></tr></tbody></table></div>
+    <div class="bd sm t3" style="border-top:1px solid var(--border)">A webhook has no reply route: answers stay in the runtime's task store unless the agent uses notify. Built agents cannot be bound until the Channel kind exists.</div></div>
+</section>
+
+<!-- ============ SCHEDULES ============ -->
+<section class="view" data-view="schedules" data-title="Schedules" hidden>
+  <div class="ph"><div class="ph-l"><h1>Schedules</h1><div class="strip">CronJob · namespace openagentix-schedules · chart values schedules[]</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Read-only until the Schedule kind exists</div><p class="sm">Today schedules are set in chart values under <code>schedules</code>. Every firing is at least one model call.</p></div></div>
+  <div class="panel"><div class="tw"><table><thead><tr><th>Name</th><th>Agent</th><th>When</th><th>State</th><th>Last run</th><th>User id (memory scope)</th></tr></thead><tbody>
+    <tr><td class="mono">demo-brief</td><td class="mono">assistant</td><td><code>0 8 * * 1-5</code><div class="sm t3">At 08:00, Monday to Friday, UTC</div></td><td><span class="badge st-paused"><svg><use href="#s-paused"/></svg>Suspended</span></td><td class="sm">manual run <code>demo-brief-manual-1</code><br><span class="badge st-ready" style="margin-top:2px"><svg><use href="#s-ready"/></svg>Completed</span> <span class="t3 num">9.3 s · 24 Nov, 16:12</span></td><td class="mono">schedule:demo-brief</td></tr></tbody></table></div>
+    <div class="bd" style="border-top:1px solid var(--border)"><h3 style="margin-bottom:6px">Prompt</h3><div class="code"><pre style="white-space:pre-wrap">Check the vulnerability database for known vulnerabilities of the npm package lodash 4.17.20 and answer in
+two sentences: how many you found and which one is the most severe. Only after you have that answer, deliver those two
+sentences as a short message, with the title "demo-brief", to the destination owner-telegram. The message must start with
+"OpenAgentix demo:".</pre></div><p class="sm t3" style="margin-top:6px">Prompts are configuration, not secrets: anyone who can read ConfigMaps in openagentix-schedules can read them.</p></div></div>
+</section>
+
+<!-- ============ TRACES ============ -->
+<section class="view" data-view="traces" data-title="Traces" hidden>
+  <div class="ph"><div class="ph-l"><h1>Traces</h1><div class="strip">Observability adapter · bundled Jaeger · last 2,000 traces in memory</div></div></div>
+  <div class="notice info"><svg class="i"><use href="#i-info"/></svg><p class="sm">Prompts and answers are not stored (content capture is off). Tool arguments are removed before storage.</p></div>
+  <div class="panel"><div class="hd"><h2>Recent turns</h2><div class="seg" role="group" aria-label="Outcome" style="margin-left:auto"><button type="button" aria-pressed="true">All</button><button type="button" aria-pressed="false">Failed</button></div></div>
+    <div class="tw"><table><thead><tr><th>Time</th><th>Agent</th><th>Caller</th><th>User</th><th class="r">Model calls</th><th class="r">Duration</th><th class="r">Cost</th><th>Outcome</th></tr></thead><tbody>
+      <tr style="background:var(--selected)"><td class="num sm">14:28:03</td><td class="mono">assistant</td><td class="mono">telegram-bridge</td><td class="mono t3">u:7f3a…91c2</td><td class="r num">2</td><td class="r num">9.3 s</td><td class="r num">$0.00321</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Completed</span></td></tr>
+      <tr><td class="num sm">14:11:40</td><td class="mono">researcher</td><td class="mono">console</td><td class="mono t3">u:0b44…e7d1</td><td class="r num">3</td><td class="r num">6.8 s</td><td class="r num">$0.00415</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Completed</span></td></tr>
+      <tr><td class="num sm">11:52:17</td><td class="mono">assistant</td><td class="mono">kourier:demo-assistant</td><td class="mono t3">kourier:demo-assistant</td><td class="r num">0</td><td class="r num">12 ms</td><td class="r num">$0.00000</td><td><span class="badge st-error"><svg><use href="#s-error"/></svg>Failed</span></td></tr>
+      <tr><td class="num sm">11:30:02</td><td class="mono">profile-demo</td><td class="mono">console</td><td class="mono t3">u:0b44…e7d1</td><td class="r num">2</td><td class="r num">4.1 s</td><td class="r num">$0.00198</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Completed</span></td></tr>
+    </tbody></table></div></div>
+  <div class="ld">
+    <div class="panel"><div class="hd"><h2>Turn <code>4bf92f35…0e4736</code></h2><span class="sm t3 num">assistant · 9.31 s · 30,782 tokens in · 263 out · $0.00321</span>
+      <div class="legend" style="margin-left:auto"><span><i class="sq k-model"></i>model</span><span><i class="sq k-tool"></i>tool</span><span><i class="sq k-mem"></i>memory</span><span><i class="sq k-agent"></i>agent, gate</span></div></div>
+      <div class="tw"><div class="wf" role="treegrid" aria-label="Spans of the turn" id="wf"></div></div></div>
+    <aside class="panel detail" aria-labelledby="spanT" id="spanDetail"></aside>
+  </div>
+</section>
+
+<!-- ============ COSTS ============ -->
+<section class="view" data-view="costs" data-title="Costs" hidden>
+  <div class="ph"><div class="ph-l"><h1>Costs</h1><div class="strip">gateway metrics · agentgateway_gen_ai_client_cost_usd_total · VictoriaMetrics</div></div>
+    <div class="acts"><div class="seg" role="group" aria-label="Window"><button type="button" aria-pressed="false">24 h</button><button type="button" aria-pressed="true">7 days</button><button type="button" aria-pressed="false">30 days</button></div></div></div>
+  <div class="grid g4">
+    <div class="tile"><div class="lbl">Spend, 7 days</div><div class="val">$0.929</div><div class="cmp">19 to 25 Nov · gateway price catalog</div></div>
+    <div class="tile"><div class="lbl">Tokens in</div><div class="val">9.84M</div><div class="cmp">72.5K tokens out</div></div>
+    <div class="tile"><div class="lbl">Read from prompt cache</div><div class="val">78%</div><div class="cmp">of input tokens · prompt caching on</div></div>
+    <div class="tile"><div class="lbl">Most expensive agent</div><div class="val mono" style="font-family:var(--mono);font-size:20px">assistant</div><div class="cmp">$0.707 · 76% of spend</div></div>
+  </div>
+  <div class="panel"><div class="hd"><h2>Daily spend by gateway user</h2><div class="legend" style="margin-left:auto"><span><i class="sq" style="background:var(--c1)"></i>assistant</span><span><i class="sq" style="background:var(--c2)"></i>profile-demo</span><span><i class="sq" style="background:var(--c3)"></i>kb-extract</span></div>
+      <button class="btn sm" type="button" id="tblToggle" aria-expanded="false">Show table</button></div>
+    <div class="bd"><svg class="chart" id="costChart" viewBox="0 0 1100 280" role="img" aria-describedby="costSum"></svg>
+      <p id="costSum" class="sm t3">Spend was between $0.071 and $0.191 a day. Today, 25 Nov, is the highest at $0.191, mostly assistant.</p>
+      <div class="tw" id="costTbl" hidden style="margin-top:10px"></div></div></div>
+  <div class="panel"><div class="hd"><h2>By gateway user</h2><span class="sm t3">7 days · kb and memory use local embedding models with no price</span></div>
+    <div class="tw"><table><thead><tr><th>Gateway user</th><th>Model</th><th class="r">Calls</th><th class="r">Tokens in</th><th class="r">Tokens out</th><th class="r">Cache read</th><th class="r">Cost</th><th>Share</th><th>Token budget, this hour</th></tr></thead><tbody class="num">
+      <tr><td class="mono">assistant</td><td class="mono">claude-haiku</td><td class="r">412</td><td class="r">7,912,340</td><td class="r">48,910</td><td class="r">79%</td><td class="r">$0.707</td><td>76%</td><td><div class="meter" title="41,200 of 1,000,000"><i style="width:4.1%"></i></div><span class="sm t3">41,200 of 1,000,000</span></td></tr>
+      <tr><td class="mono">profile-demo</td><td class="mono">claude-haiku</td><td class="r">118</td><td class="r">1,684,220</td><td class="r">10,402</td><td class="r">74%</td><td class="r">$0.191</td><td>21%</td><td><div class="meter"><i style="width:0"></i></div><span class="sm t3">0 of 1,000,000</span></td></tr>
+      <tr><td class="mono">kb-extract</td><td class="mono">claude-haiku</td><td class="r">31</td><td class="r">241,800</td><td class="r">13,200</td><td class="r">0%</td><td class="r">$0.031</td><td>3%</td><td><div class="meter"><i style="width:0"></i></div><span class="sm t3">0 of 300,000 (kb limit)</span></td></tr>
+      <tr><td class="mono">kb</td><td class="mono">embed-default</td><td class="r">612</td><td class="r">188,400</td><td class="r">0</td><td class="r t3">n/a</td><td class="r t3">no price</td><td class="t3">0%</td><td class="sm t3">not used for chat</td></tr>
+      <tr><td class="mono">memory</td><td class="mono">embed-memory</td><td class="r">854</td><td class="r">96,310</td><td class="r">0</td><td class="r t3">n/a</td><td class="r t3">no price</td><td class="t3">0%</td><td class="sm t3">not used for chat</td></tr>
+    </tbody></table></div>
+    <div class="bd sm t3" style="border-top:1px solid var(--border)">Budgets are in tokens per key today. Budgets in US dollars come with the Budget kind (ADR 0009). The first hour after install reads high in the metrics store.</div></div>
+</section>
+
+<!-- ============ MEMORY ============ -->
+<section class="view" data-view="memory" data-title="Memory" hidden>
+  <div class="ph"><div class="ph-l"><h1>Memory</h1><div class="strip">kagent memory · PostgreSQL with pgvector · CronJob memory-expiry</div></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Settings are edited per agent in the builder</div><p class="sm">A person's memories are never listed in the console. A Telegram user can list and forget their own with <code>/memories</code> and <code>/forget</code>.</p></div></div>
+  <div class="grid g2">
+    <div class="panel"><div class="hd"><h2>Agents that remember</h2></div><div class="tw"><table style="min-width:0"><thead><tr><th>Agent</th><th>Keeps for</th><th>Source</th></tr></thead><tbody>
+      <tr><td class="mono">assistant</td><td>30 days</td><td><span class="tag">Chart</span></td></tr><tr><td class="mono">researcher</td><td>15 days (catalog default)</td><td><span class="tag acc">Built</span></td></tr></tbody></table></div></div>
+    <div class="panel"><div class="hd"><h2>Expiry job</h2><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Last run completed</span></div><div class="bd"><dl class="kv sm">
+      <dt>Schedule</dt><dd><code>memory-expiry</code> · nightly</dd><dt>Last run</dt><dd>25 Nov 2026, 02:00 UTC</dd>
+      <dt>Counts</dt><dd class="mono num">total_before 14 · expired 2 · extended 0 · deleted 2 · total_after 12</dd>
+      <dt>Secret scan</dt><dd>report only · 0 matches</dd></dl></div></div>
+  </div>
+</section>
+
+<!-- ============ GOVERNANCE ============ -->
+<section class="view" data-view="governance" data-title="Governance" hidden>
+  <div class="ph"><div class="ph-l"><h1>Governance</h1><div class="strip">ConfigMap control-plane-policy · A2A gate caller rules · EgressPolicy</div></div>
+    <div class="acts"><button class="btn" type="button" id="polYamlBtn"><svg class="i"><use href="#i-code"/></svg>View YAML</button></div></div>
+  <div class="notice ro"><svg class="i"><use href="#i-lock"/></svg><div><div class="nt">Owned by operators</div><p class="sm">The platform policy and the gate rules are not edited in the console. Change <code>controlPlane.policy</code> and <code>governance.a2a.callers</code> in chart values or Git.</p></div></div>
+  <div class="tabs" role="tablist" aria-label="Governance"><button class="tab" role="tab" aria-selected="true" type="button" data-gtab="pol">Policy</button><button class="tab" role="tab" aria-selected="false" type="button" data-gtab="cal">Gate callers</button><button class="tab" role="tab" aria-selected="false" type="button" data-gtab="eg">Egress</button></div>
+  <div id="g-pol" class="grid g2">
+    <div class="panel"><div class="hd"><h2>What a definition may use</h2></div><div class="bd"><dl class="kv">
+      <dt>Agents</dt><dd>at most 5 definitions · 3 used</dd><dt>Models</dt><dd><code>claude-haiku</code></dd>
+      <dt>Tool profile</dt><dd>required · allowed <code>lookup</code></dd><dt>Knowledge</dt><dd>allowed</dd><dt>Notify</dt><dd>allowed</dd>
+      <dt>Memory</dt><dd>allowed · at most 30 days · expiry job required</dd><dt>Skills</dt><dd><code>openagentix-canary</code></dd>
+      <dt>Egress</dt><dd><code>https://api.osv.dev</code>, <code>https://*.example.org</code></dd><dt>Reserved names</dt><dd><code>assistant</code>, <code>profile-demo</code>, <code>kb</code>, <code>kb-extract</code>, <code>memory</code></dd></dl></div></div>
+    <div class="panel"><div class="hd"><h2>Always enforced</h2></div><div class="bd"><ul class="sm t2" style="margin:0;padding-left:18px;display:flex;flex-direction:column;gap:6px">
+      <li>Tools only through a tool profile; the shared vMCP filters on the client side only.</li>
+      <li>No outbound access unless an origin matches the policy.</li>
+      <li>Nobody may call a built agent until an operator adds a gate caller rule.</li>
+      <li>Instructions are scanned for ten secret shapes.</li>
+      <li>Each agent has its own gateway key and token budget.</li>
+      <li>The output guard limits what even the controller may write.</li></ul></div></div>
+  </div>
+  <div id="g-cal" class="panel" hidden><div class="tw"><table><thead><tr><th>Caller</th><th>Proves identity with</th><th>Agents</th><th>User ids it may assert</th><th>Methods</th><th>Memory RPCs</th></tr></thead><tbody>
+    <tr><td class="mono">telegram-bridge</td><td class="sm">ServiceAccount token</td><td class="mono">kagent/assistant</td><td class="mono">prefix telegram:</td><td class="mono sm">SendMessage, GetTask</td><td>List, Delete</td></tr>
+    <tr><td class="mono">schedule demo-brief</td><td class="sm">ServiceAccount token</td><td class="mono">kagent/assistant</td><td class="mono">exactly schedule:demo-brief</td><td class="mono sm">SendMessage</td><td class="t3">none</td></tr>
+    <tr><td class="mono">kourier demo-assistant</td><td class="sm">static key</td><td class="mono">kagent/assistant</td><td class="mono">exactly kourier:demo-assistant</td><td class="mono sm">SendMessage, SendStreamingMessage</td><td class="t3">none</td></tr>
+    <tr><td class="mono">console</td><td class="sm">ServiceAccount token</td><td class="mono">kagent/assistant, kagent/profile-demo, kagent/researcher</td><td class="mono">prefix console:</td><td class="mono sm">SendMessage</td><td class="t3">none</td></tr></tbody></table></div></div>
+  <div id="g-eg" class="panel" hidden><div class="tw"><table><thead><tr><th>Agent</th><th>Asked for</th><th>Effective</th><th>Status</th></tr></thead><tbody>
+    <tr><td class="mono">assistant</td><td class="t3">none</td><td class="t3">none</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Within policy</span></td></tr>
+    <tr><td class="mono">profile-demo</td><td class="mono">https://api.osv.dev</td><td class="mono">https://api.osv.dev</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Within policy</span></td></tr>
+    <tr><td class="mono">researcher</td><td class="mono">https://api.osv.dev</td><td class="mono">https://api.osv.dev</td><td><span class="badge st-ready"><svg><use href="#s-ready"/></svg>Within policy</span></td></tr>
+    <tr><td class="mono">cve-triage</td><td class="mono">https://api.osv.dev, https://services.nvd.nist.gov</td><td class="t3">none (refused)</td><td><span class="badge st-refused"><svg><use href="#s-refused"/></svg>Refused</span></td></tr></tbody></table></div>
+    <div class="bd sm t3" style="border-top:1px solid var(--border)">The demo cluster's network plugin (kindnet) does not enforce egress rules toward the internet; the sandbox egress proxy does.</div></div>
+</section>
+
+<!-- ============ SETTINGS ============ -->
+<section class="view" data-view="platform" data-title="Settings" hidden>
+  <div class="ph"><div class="ph-l"><h1>Settings</h1><div class="strip">console · platform catalog</div></div></div>
+  <div class="grid g2">
+    <div class="panel"><div class="hd"><h2>Appearance</h2></div><div class="bd stack">
+      <div class="field"><span class="flabel">Theme</span><div class="seg" role="group" aria-label="Theme" id="themeSeg"><button type="button" data-th="system" aria-pressed="true">System</button><button type="button" data-th="light" aria-pressed="false">Light</button><button type="button" data-th="dark" aria-pressed="false">Dark</button></div></div>
+      <div class="cap" style="padding-top:12px"><div class="cx"><span class="flabel" id="lks">Single-key shortcuts</span><span class="sm t3"><kbd>g</kbd> then a letter to move between pages, <kbd>/</kbd> to search.</span></div><button class="sw" role="switch" aria-checked="true" aria-labelledby="lks" type="button"></button></div></div></div>
+    <div class="panel"><div class="hd"><h2>Session</h2></div><div class="bd stack"><dl class="kv sm"><dt>Signed in with</dt><dd>console token (Secret <code>console-token</code>) · held in memory for this tab</dd><dt>Acts as</dt><dd>ServiceAccount <code>openagentix-console</code> · builder and viewer roles</dd></dl><div><button class="btn" type="button">Sign out</button></div></div></div>
+    <div class="panel"><div class="hd"><h2>Adapters</h2></div><div class="bd"><dl class="kv sm"><dt>Runtime</dt><dd><code>kagent</code> 1.0.1</dd><dt>Model gateway</dt><dd><code>agentgateway</code> v1.7.0</dd><dt>Tools</dt><dd><code>toolhive</code> 0.67.1</dd><dt>Observability</dt><dd>bundled VictoriaMetrics and Jaeger</dd><dt>Gateway URL</dt><dd><code>http://model-gateway.agentgateway-system.svc.cluster.local/v1</code></dd></dl></div></div>
+    <div class="panel"><div class="hd"><h2>About</h2></div><div class="bd"><dl class="kv sm"><dt>Licence</dt><dd>OpenAgentix · Apache-2.0</dd><dt>Chart</dt><dd><code>openagentix-0.2.0</code></dd><dt>Decisions</dt><dd>ADR 0007 control plane and builder · ADR 0010 editions</dd></dl></div></div>
+  </div>
+</section>
+
+    </main>
+    <footer class="foot"><strong>Design mockup — not the product</strong><span>Demo data from the OpenAgentix demo values</span><span><svg class="i" style="width:12px;height:12px;vertical-align:-2px"><use href="#i-lock"/></svg> marks pages that are read-only in the first release</span><span>Contract: docs/console/UI-SPEC.md</span></footer>
+  </div>
+</div>
+
+<div id="overlay" hidden></div>
+<div id="tip" class="tip" hidden></div>
+
+<script>
+(function(){
+var $=function(s,r){return (r||document).querySelector(s)}, $$=function(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))};
+var app=$('#app'), root=document.documentElement;
+function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
+
+/* ---------- theme ---------- */
+function applyTheme(t){ if(t==='light'||t==='dark') root.setAttribute('data-theme',t); else root.removeAttribute('data-theme');
+  $$('#themeSeg button').forEach(function(b){b.setAttribute('aria-pressed',String(b.dataset.th===(t||'system')))}); }
+applyTheme(store('oa-theme'));
+$('#themeBtn').addEventListener('click',function(){
+  var cur=root.getAttribute('data-theme'); var dark=cur?cur==='dark':matchMedia('(prefers-color-scheme: dark)').matches;
+  var n=dark?'light':'dark'; applyTheme(n); store('oa-theme',n); });
+$$('#themeSeg button').forEach(function(b){b.addEventListener('click',function(){applyTheme(b.dataset.th);store('oa-theme',b.dataset.th)})});
+
+/* ---------- sidebar ---------- */
+if(store('oa-sidebar')==='collapsed') app.classList.add('collapsed');
+$('#collapse').addEventListener('click',function(){app.classList.toggle('collapsed');store('oa-sidebar',app.classList.contains('collapsed')?'collapsed':'expanded')});
+$('#menuBtn').addEventListener('click',function(){app.classList.add('drawer');showOverlay('drawer')});
+
+/* ---------- router ---------- */
+var views=$$('[data-view]').map(function(v){return v.dataset.view});
+var parent={builder:'agents',playground:'agents',graph:'knowledge'};
+function route(){
+  var h=(location.hash||'').replace('#','')||'overview'; if(views.indexOf(h)<0) h='overview';
+  $$('[data-view]').forEach(function(v){v.hidden=v.dataset.view!==h});
+  var top=parent[h]||h;
+  $$('[data-nav]').forEach(function(a){ if(a.dataset.nav===top) a.setAttribute('aria-current','page'); else a.removeAttribute('aria-current')});
+  $$('[data-sub]').forEach(function(s){s.hidden=s.dataset.sub!==top});
+  $$('[data-subnav]').forEach(function(a){a.classList.toggle('on',a.dataset.subnav===h)});
+  var v=$('[data-view="'+h+'"]'); var parts=(v.dataset.title||'').split(' / ');
+  $('#crumb').innerHTML=parts.map(function(p,i){return i<parts.length-1?'<span>'+p+'</span><svg class="i" style="width:12px;height:12px"><use href="#i-chev"/></svg>':'<b>'+p+'</b>'}).join('');
+  app.classList.remove('drawer'); hideOverlay();
+  window.scrollTo(0,0);
+}
+window.addEventListener('hashchange',route);
+document.addEventListener('click',function(e){
+  var g=e.target.closest('[data-go]'); if(!g) return;
+  if(g.dataset.go==='builder'){ var r=!!g.dataset.refused; setRefused(r); $('#refToggle').checked=r; }
+  if(!e.target.closest('a[href]')){ e.preventDefault(); location.hash=g.dataset.go; }
+});
+
+/* ---------- overlay (sheet, dialog, drawer) ---------- */
+var lastFocus=null;
+function showOverlay(kind,html){
+  var o=$('#overlay'); lastFocus=document.activeElement;
+  o.innerHTML='<div class="scrim" data-close></div>'+(html||''); o.hidden=false;
+  var f=o.querySelector('.sheet .ib, .dialog input, .dialog .btn'); if(f) f.focus();
+}
+function hideOverlay(){var o=$('#overlay'); if(o.hidden)return; o.hidden=true; o.innerHTML=''; app.classList.remove('drawer'); if(lastFocus&&lastFocus.focus) lastFocus.focus();}
+document.addEventListener('click',function(e){ if(e.target.closest('[data-close]')) hideOverlay(); });
+document.addEventListener('keydown',function(e){ if(e.key==='Escape') hideOverlay(); });
+
+function toast(msg){var t=document.createElement('div');t.className='toast';t.setAttribute('role','status');t.innerHTML='<svg class="i"><use href="#s-ready"/></svg>'+msg;document.body.appendChild(t);setTimeout(function(){t.remove()},3500)}
+document.addEventListener('click',function(e){var c=e.target.closest('.copy, [aria-label^="Copy"]'); if(c){toast('Copied')}});
+
+/* ---------- builder ---------- */
+var conds={
+  ok:[['Accepted','True','Accepted','','3 h ago','ready'],['KeyReady','True','KeyReady','Secret researcher-virtual-key','3 h ago','ready'],['Applied','True','Applied','','3 h ago','ready'],['Ready','True','Ready','','3 h ago','ready']],
+  ref:[['Accepted','False','PolicyViolation','2 rule(s) refused; see status.violations','12 min ago','refused'],['KeyReady','Unknown','','not reached','','none'],['Applied','False','NotAccepted','the definition is refused; objects of an earlier version, if any, are left as they were','12 min ago','none'],['Ready','False','NotAccepted','','12 min ago','none']]
+};
+var stIcon={ready:'s-ready',pending:'s-pending',refused:'s-refused',error:'s-error',none:'s-none'};
+function renderConds(set){
+  $('#bRail').innerHTML=set.map(function(c){var cls=c[5]==='none'?'rc none':'rc st-'+c[5];return '<span role="listitem" class="'+cls+'" title="'+c[0]+': '+c[1]+(c[2]?', '+c[2]:'')+'"><svg><use href="#'+stIcon[c[5]]+'"/></svg>'+c[0]+'</span>'}).join('');
+  $('#condBody').innerHTML=set.map(function(c){return '<tr><td>'+c[0]+'</td><td>'+(c[5]==='none'?'<span class="t3">'+c[1]+'</span>':'<span class="badge st-'+c[5]+'"><svg><use href="#'+stIcon[c[5]]+'"/></svg>'+c[1]+'</span>')+'</td><td class="mono">'+(c[2]||'<span class="t3">—</span>')+'</td><td class="sm t2">'+(c[3]||'<span class="t3">None</span>')+'</td><td class="r sm t3">'+c[4]+'</td></tr>'}).join('');
+}
+function setRefused(on){
+  $('#bName').textContent=on?'cve-triage':'researcher';
+  $('[data-view="builder"]').dataset.title='Agents / '+(on?'cve-triage':'researcher');
+  $('#bBadge').className='badge '+(on?'st-refused':'st-ready'); $('#bBadge').innerHTML='<svg><use href="#'+(on?'s-refused':'s-ready')+'"/></svg>'+(on?'Refused':'Ready');
+  $('#refNotice').hidden=!on; $('#t5row').hidden=!on; $('#egPrev').hidden=!on;
+  $('#swK').setAttribute('aria-checked',String(on)); $('#kPrev').hidden=!on;
+  $('#f-name').value=on?'cve-triage':'researcher';
+  $('#f-desc').value=on?'Triages new CVEs against our dependency list':'Looks things up and cites what it found';
+  $('#egTags').innerHTML='<span class="tag">https://api.osv.dev<button type="button" aria-label="Remove https://api.osv.dev"><svg class="i" style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>'+(on?'<span class="tag ref">https://services.nvd.nist.gov<button type="button" aria-label="Remove https://services.nvd.nist.gov"><svg class="i" style="width:12px;height:12px"><use href="#i-x"/></svg></button></span>':'');
+  $('#statusKv').hidden=on; $('#genLine').textContent=on?'Status is for generation 1, the current one. Nothing was created in the cluster.':'Status is for generation 3, the current one.';
+  renderConds(on?conds.ref:conds.ok);
+  if(location.hash==='#builder') route();
+}
+setRefused(false);
+$('#kPrev').hidden=true;
+$('#refToggle').addEventListener('change',function(){setRefused(this.checked)});
+$$('.sw').forEach(function(s){s.addEventListener('click',function(){var on=s.getAttribute('aria-checked')!=='true';s.setAttribute('aria-checked',String(on)); if(s.id==='swK'){$('#kPrev').hidden=!on}})});
+$$('[data-btab]').forEach(function(b){b.addEventListener('click',function(){
+  if(b.dataset.btab==='play'){location.hash='playground';return}
+  $$('[data-btab]').forEach(function(x){x.setAttribute('aria-selected',String(x===b))});
+  $('#bp-build').hidden=b.dataset.btab!=='build'; $('#bp-deploy').hidden=b.dataset.btab!=='deploy';
+})});
+$('#saveBtn').addEventListener('click',function(){toast($('#refToggle').checked?'Saved cve-triage. The controller refused it again; see the notice.':'Saved researcher. Waiting for the controller.')});
+
+function yamlSheet(title,lines){
+  return '<div class="sheet" role="dialog" aria-modal="true" aria-labelledby="shT"><div class="hd"><h2 id="shT">'+title+'</h2><div class="seg" role="group" aria-label="Version" style="margin-left:auto"><button type="button" aria-pressed="true">Cluster</button><button type="button" aria-pressed="false">Draft</button></div><button class="ib" type="button" data-close aria-label="Close"><svg class="i"><use href="#i-x"/></svg></button></div>'+
+  '<div class="bd"><div class="code"><button class="ib copy" type="button" aria-label="Copy YAML"><svg class="i"><use href="#i-copy"/></svg></button><pre tabindex="0">'+lines.map(function(l){return '<span class="ln'+(l[1]?' chg':'')+'">'+l[0]+'</span>'}).join('')+'</pre></div><p class="sm t3">Read-only. To change this resource outside the form, use <code>kubectl apply</code>.</p></div></div>';
+}
+function k(s){return '<span class="k">'+s+'</span>'} function s(x){return '<span class="s">'+x+'</span>'} function c(x){return '<span class="c">'+x+'</span>'}
+$('#yamlBtn').addEventListener('click',function(){
+  var ref=$('#refToggle').checked, n=ref?'cve-triage':'researcher';
+  var L=[[k('apiVersion: ')+s('openagentix.io/v1alpha1')],[k('kind: ')+s('AgentDefinition')],[k('metadata:')],[k('  name: ')+s(n)],[k('  namespace: ')+s('kagent')],[k('  generation: ')+(ref?'1':'3')],[k('spec:')],
+    [k('  description: ')+(ref?'Triages new CVEs against our dependency list':'Looks things up and cites what it found')],[k('  model: ')+s('claude-haiku')],[k('  instructions: |')],['    You are a careful research assistant for the platform team.'],['    '+c('# 9 more lines')],
+    [k('  toolProfile: ')+s('lookup')],[k('  tools: ')+'[osv_query_vulnerability, osv_get_vulnerability, knowledge_kb_search]'],[k('  knowledge: ')+(ref?'true':'false'),ref],[k('  notify: ')+'false'],
+    [k('  memory: ')+(ref?'{enabled: false}':'{enabled: true, ttlDays: 15}')],[k('  skills: ')+(ref?'[]':'[openagentix-canary]')],[k('  egress: ')+(ref?'{allow: [https://api.osv.dev, https://services.nvd.nist.gov]}':'{allow: [https://api.osv.dev]}'),ref],
+    [k('status:')],[k('  observedGeneration: ')+(ref?'1':'3')],[k('  conditions:')]];
+  (ref?conds.ref:conds.ok).forEach(function(cd){L.push([k('  - type: ')+cd[0]+k(', status: ')+'"'+cd[1]+'"'+(cd[2]?k(', reason: ')+cd[2]:'')])});
+  if(ref){L.push([k('  violations:')]);L.push(['  - the definition lists tool "knowledge_kb_get_document" which is not in profile "lookup" (…)']);L.push(['  - egress.allow entry "https://services.nvd.nist.gov" is not matched by the platform policy'])}
+  else{L.push([k('  agentRef: ')+'{apiVersion: api.kagent.dev/v1alpha3, kind: Agent, name: researcher}']);L.push([k('  gatewayUserId: ')+s('researcher')]);L.push([k('  toolServer: ')+s('toolhive-vmcp-lookup')]);L.push([k('  a2aUrl: ')+s('http://a2a-gate.openagentix-gateway.svc.cluster.local:8080/agents/kagent/researcher')])}
+  showOverlay('sheet',yamlSheet(n+'.yaml',L));
+});
+$('#polYamlBtn').addEventListener('click',function(){
+  var L=[[k('maxAgents: ')+'5'],[k('allowedModels: ')+'[claude-haiku]'],[k('requireToolProfile: ')+'true'],[k('allowedProfiles: ')+'[lookup]'],[k('allowKnowledge: ')+'true'],[k('allowNotify: ')+'true'],[k('allowedSkills: ')+'[openagentix-canary]'],[k('memory: ')+'{allowed: true, maxTtlDays: 30, requireExpiry: true}'],[k('egress:')],[k('  allowedOrigins: ')+'[https://api.osv.dev, "https://*.example.org"]'],[k('reservedNames: ')+'[]']];
+  showOverlay('sheet',yamlSheet('controlPlane.policy',L));
+});
+$('#delBtn').addEventListener('click',function(){
+  var n=$('#bName').textContent;
+  showOverlay('dialog','<div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dT" aria-describedby="dB"><h2 id="dT">Delete agent <span class="mono" style="font-family:var(--mono)">'+n+'</span>?</h2>'+
+  '<p id="dB" class="t2">This deletes the definition and everything the controller made for it: the runtime agent and its template, model config, harness and egress policy, and the gateway key. Running conversations stop. Memories saved by this agent stay in the memory database until they expire.</p>'+
+  '<div class="field"><label for="dIn">Type '+n+' to confirm</label><input id="dIn" class="mono" autocomplete="off"></div>'+
+  '<div class="acts"><button class="btn" type="button" data-close>Cancel</button><button class="btn danger" type="button" id="dGo" aria-disabled="true">Delete agent</button></div></div>');
+  var inp=$('#dIn'), go=$('#dGo');
+  inp.addEventListener('input',function(){go.setAttribute('aria-disabled',String(inp.value!==n))});
+  go.addEventListener('click',function(){ if(go.getAttribute('aria-disabled')==='true') return; hideOverlay(); toast('Deleting '+n+'. The registry shows it until the finalizer is done.'); });
+});
+
+/* ---------- tools ---------- */
+var servers={
+  osv:{name:'osv',kind:'MCPServer',desc:'Open Source Vulnerabilities database lookups.',tools:['osv_query_vulnerability','osv_get_vulnerability','osv_query_vulnerabilities_batch'],calls:'214',profiles:'lookup (2 of 3 tools)',agents:'assistant, profile-demo, researcher',image:'ghcr.io/stacklok/osv-mcp@sha256:5e0d…a91f',egress:'https://api.osv.dev'},
+  fetch:{name:'fetch',kind:'MCPServer',desc:'Fetches a web page and returns it as text.',tools:['fetch_fetch'],calls:'37',profiles:'none',agents:'assistant',image:'ghcr.io/stacklok/fetch@sha256:21b7…0c4e',egress:'any address the pod network allows'},
+  knowledge:{name:'knowledge',kind:'MCPServerEntry',desc:'The knowledge base service, attached as an entry. No extra pods.',tools:['knowledge_kb_search','knowledge_kb_get_document','knowledge_kb_list_collections','knowledge_kb_graph_search','knowledge_kb_graph_entity','knowledge_kb_graph_paths'],calls:'96',profiles:'lookup (1 of 6 tools)',agents:'assistant, researcher',image:'entry: services/kb',egress:'none'},
+  delivery:{name:'delivery',kind:'MCPServerEntry',desc:'Notify service: send a message to a named destination.',tools:['delivery_notify_send','delivery_notify_list_destinations'],calls:'3',profiles:'none',agents:'assistant',image:'entry: services/notify',egress:'TCP 443 to public addresses'}
+};
+var profiles={
+  lookup:{name:'lookup',kind:'VirtualMCPServer',desc:'Profile server that advertises only the listed tools. Code mode on.',tools:['knowledge_kb_search','osv_query_vulnerability','osv_get_vulnerability','execute_tool_script'],calls:'131',profiles:'served by toolhive-vmcp-lookup',agents:'profile-demo, researcher, cve-triage, release-notes',image:'OIDC audience per profile',egress:'none'},
+  shared:{name:'toolhive-vmcp',kind:'VirtualMCPServer (shared)',desc:'Shared server with every tool. Filters on the client side only, so built agents cannot use it.',tools:['all 12 tools'],calls:'219',profiles:'none',agents:'assistant (chart)',image:'Cedar policy permit-all',egress:'none',warn:true}
+};
+var curTab='servers', sel='osv';
+function toolCard(d,id){var on=id===sel;return '<button class="card" type="button" aria-pressed="'+on+'" data-tool="'+id+'"><div class="row1"><span class="ico"><svg class="i"><use href="#i-tool"/></svg></span><b class="mono">'+d.name+'</b>'+(d.warn?'<span class="badge st-pending"><svg><use href="#s-pending"/></svg>Shared</span>':'<span class="badge st-ready"><svg><use href="#s-ready"/></svg>Ready</span>')+'</div><p class="sm t2">'+d.desc+'</p><div class="meta num"><span>'+d.kind+'</span><span>'+(d.tools[0].indexOf('all')===0?d.tools[0]:d.tools.length+' tools')+'</span><span>'+d.calls+' calls, 24 h</span></div></button>'}
+function renderTools(){
+  var set=curTab==='servers'?servers:profiles;
+  $('#toolCards').innerHTML=Object.keys(set).map(function(id){return toolCard(set[id],id)}).join('');
+  var d=set[sel];
+  $('#toolDetail').innerHTML='<div class="hd"><h2 id="tdTitle" class="mono" style="font-family:var(--mono);font-size:14px">'+d.name+'</h2><span class="sm t3">'+d.kind+'</span></div><div class="bd">'+
+   (d.warn?'<div class="notice warn"><svg class="i"><use href="#s-pending"/></svg><p class="sm">Filters on the client side only. A definition must name a tool profile.</p></div>':'')+
+   '<div><h3 style="margin-bottom:6px">Tools</h3><div class="tags">'+d.tools.map(function(t){return '<span class="tag">'+t+'</span>'}).join('')+'</div></div>'+
+   '<dl class="kv sm"><dt>Offered by profiles</dt><dd>'+d.profiles+'</dd><dt>Used by agents</dt><dd>'+d.agents+'</dd><dt>Calls, 24 h</dt><dd class="num">'+d.calls+' · toolhive_mcp_tool_calls_total</dd><dt>'+(curTab==='servers'?'Image':'Identity')+'</dt><dd><code>'+d.image+'</code></dd><dt>Outbound</dt><dd>'+d.egress+'</dd></dl></div>';
+  $$('[data-tool]').forEach(function(b){b.addEventListener('click',function(){sel=b.dataset.tool;renderTools()})});
+}
+$$('[data-ttab]').forEach(function(b){b.addEventListener('click',function(){curTab=b.dataset.ttab;sel=curTab==='servers'?'osv':'lookup';$$('[data-ttab]').forEach(function(x){x.setAttribute('aria-selected',String(x===b))});renderTools()})});
+renderTools();
+
+/* simple tab groups */
+function tabGroup(attr,map){$$('['+attr+']').forEach(function(b){b.addEventListener('click',function(){$$('['+attr+']').forEach(function(x){x.setAttribute('aria-selected',String(x===b))});Object.keys(map).forEach(function(key){$(map[key]).hidden=key!==b.getAttribute(attr)})})})}
+tabGroup('data-ktab',{col:'#kCol',src:'#kSrc'});
+tabGroup('data-gtab',{pol:'#g-pol',cal:'#g-cal',eg:'#g-eg'});
+$$('.seg').forEach(function(g){ if(g.id==='themeSeg')return; $$('button',g).forEach(function(b){b.addEventListener('click',function(){$$('button',g).forEach(function(x){x.setAttribute('aria-pressed',String(x===b))})})})});
+$$('[data-kc]').forEach(function(b){b.addEventListener('click',function(){$$('[data-kc]').forEach(function(x){x.setAttribute('aria-pressed',String(x===b))})})});
+
+/* ---------- graph ---------- */
+var N={vane3:[90,80,'Vane-3','region'],teal:[250,150,'Teal','cluster'],quill:[420,90,'Quill','api'],orion:[580,175,'Orion','service'],basalt:[510,320,'Basalt','team'],mira:[680,410,'Mira Okafor','person'],
+  priya:[310,400,'Priya Venkat','person'],tier1:[700,60,'Tier 1','concept'],jade:[95,250,'Jade','cluster'],quire:[230,320,'Quire','api'],sparrow:[90,410,'Sparrow','service'],granite:[700,255,'Granite','team'],lind:[705,165,'Mira Lindqvist','person']};
+var E=[['teal','vane3','runs_in',1],['quill','teal','stores_data_in',2],['orion','quill','calls',3],['basalt','orion','owns',4],['mira','basalt','on_call_for',5],
+  ['basalt','priya','escalates_to',0,1],['orion','tier1','has_tier',0,1],['jade','vane3','runs_in'],['quire','jade','stores_data_in'],['sparrow','quire','calls'],['lind','granite','member_of']];
+function nodeW(l){return Math.max(64,l.length*7.2+24)}
+var g='';
+E.forEach(function(e){var a=N[e[0]],b=N[e[1]];var mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+  g+='<line class="e'+(e[3]?' path':'')+(e[4]?' cur':'')+'" x1="'+a[0]+'" y1="'+a[1]+'" x2="'+b[0]+'" y2="'+b[1]+'"/>';
+  g+='<text class="pl'+(e[3]?' path':'')+'" x="'+mx+'" y="'+(my-6)+'" text-anchor="middle" paint-order="stroke" stroke="var(--sunken)" stroke-width="4">'+e[2]+'</text>';});
+Object.keys(N).forEach(function(id){var n=N[id],w=nodeW(n[2]);var onPath=['vane3','teal','quill','orion','basalt','mira'].indexOf(id)>=0;
+  g+='<g class="n'+(onPath?' path':'')+'" data-node="'+id+'" tabindex="0" role="button" aria-label="'+n[3]+' '+n[2]+'"><rect x="'+(n[0]-w/2)+'" y="'+(n[1]-17)+'" width="'+w+'" height="34" rx="6"/><text x="'+n[0]+'" y="'+(n[1]-1)+'" text-anchor="middle">'+n[2]+'</text><text class="ty" x="'+n[0]+'" y="'+(n[1]+11)+'" text-anchor="middle">'+n[3]+'</text></g>';});
+E.forEach(function(e){ if(!e[3])return; var a=N[e[0]],b=N[e[1]];var mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+  g+='<g class="hop"><circle cx="'+mx+'" cy="'+(my+9)+'" r="8"/><text x="'+mx+'" y="'+(my+12.5)+'" text-anchor="middle">'+e[3]+'</text></g>';});
+$('#gsvg').innerHTML=g;
+var hops=[
+  ['Teal runs in Vane-3','docs:teal-region-incident','Cluster Teal runs in region Vane-3 and had a disk outage on 3 March.',['teal','vane3']],
+  ['Quill stores its data in Teal','docs:quill-storage','Quill stores its data in cluster Teal, using a dedicated database with synchronous replication.',['quill','teal']],
+  ['Orion calls Quill','docs:orion-dependencies','Orion calls the ledger API Quill to record each payment intent before it confirms the order.',['orion','quill']],
+  ['Basalt owns Orion','docs:orion-ownership','Service Orion is owned by team Basalt, which approves every change to its deployment manifests.',['basalt','orion']],
+  ['Mira Okafor is on call for Basalt','docs:basalt-on-call',"Team Basalt's on-call engineer is Mira Okafor for the current quarter.",['mira','basalt']]];
+$('#pathList').innerHTML=hops.map(function(h,i){return '<li tabindex="0" data-hop="'+i+'"><span class="hopn">'+(i+1)+'</span><div><div class="fact">'+h[0]+'</div><div class="sm t3"><code>'+h[1]+'</code></div><div class="ev">"'+h[2]+'"</div></div></li>'}).join('');
+function hl(ids){$$('#gsvg .n').forEach(function(n){n.classList.toggle('hl',ids.indexOf(n.dataset.node)>=0)})}
+$$('#pathList li').forEach(function(li){var ids=hops[+li.dataset.hop][3];li.addEventListener('mouseenter',function(){hl(ids)});li.addEventListener('focus',function(){hl(ids)});li.addEventListener('mouseleave',function(){hl([])});li.addEventListener('blur',function(){hl([])})});
+
+/* ---------- traces waterfall ---------- */
+var T=9.31;
+var spans=[
+  {n:'POST /agents/kagent/assistant',k:'gate',d:0,s:0,e:9.31,m:'caller telegram-bridge',a:[['Service','a2a-gate'],['Caller','telegram-bridge'],['User id','u:7f3a…91c2 (salted hash)'],['Method','SendMessage'],['Outcome','200']]},
+  {n:'invoke_agent assistant',k:'agent',d:1,s:0.04,e:9.28,m:'',a:[['Agent','kagent/assistant'],['Conversation','c81f…a02d'],['Sandbox','gVisor, session identity']]},
+  {n:'memory preload · embed',k:'mem',d:2,s:0.10,e:1.55,m:'1 call',a:[['Model','embed-memory'],['Recalled','2 memories, similarity ≥ 0.3'],['Gateway user','memory']]},
+  {n:'generate_content claude-haiku-5-5',k:'model',d:2,s:1.60,e:3.20,m:'15,280 in · 61 out · $0.00170',a:[['Model','claude-haiku-5-5'],['Tokens in','15,280 (6,635 from cache)'],['Tokens out','61'],['Cost','$0.00170'],['Gateway user','assistant']]},
+  {n:'execute_tool osv_query_vulnerability',k:'tool',d:2,s:3.22,e:6.12,m:'',a:[['Tool','osv_query_vulnerability'],['Server','toolhive-vmcp → osv'],['Arguments','not stored (content capture off)'],['Outcome','success']]},
+  {n:'vMCP tools/call',k:'tool',d:3,s:4.60,e:5.90,m:'osv',a:[['MCP method','tools/call'],['Backend','osv'],['Audit','actor/kagent/session-c81f…']]},
+  {n:'generate_content claude-haiku-5-5',k:'model',d:2,s:6.15,e:7.75,m:'15,502 in · 202 out · $0.00151',a:[['Model','claude-haiku-5-5'],['Tokens in','15,502 (15,140 from cache)'],['Tokens out','202'],['Cost','$0.00151'],['Gateway user','assistant']]},
+  {n:'save_memory · embed',k:'mem',d:2,s:7.80,e:9.25,m:'1 call',a:[['Model','embed-memory'],['Saved','1 memory'],['Gateway user','memory']]}];
+var cls={gate:'k-gate',agent:'k-agent',model:'k-model',tool:'k-tool',mem:'k-mem'};
+var ticks=[0,2,4,6,8];
+var wf='<div class="wf-axis" role="row"><span role="columnheader">Span</span><div class="ticks">'+ticks.map(function(t){return '<span style="left:'+(t/T*100)+'%">'+t+' s</span>'}).join('')+'</div><span role="columnheader" style="text-align:right">Duration · usage</span></div>';
+spans.forEach(function(sp,i){var dur=sp.e-sp.s;
+  wf+='<div class="wf-row" role="row" tabindex="'+(i===3?0:-1)+'" aria-level="'+(sp.d+1)+'" aria-selected="'+(i===3)+'" data-span="'+i+'"><div class="wf-name" role="gridcell" style="padding-left:'+(sp.d*14)+'px"><i class="sq '+cls[sp.k]+'"></i><span class="'+(sp.k==='gate'||sp.k==='agent'?'':'mono')+'" style="'+(sp.k==='gate'||sp.k==='agent'?'':'font-size:12px')+'">'+sp.n+'</span></div>'+
+  '<div class="wf-track" role="gridcell"><div class="wf-bar '+cls[sp.k]+'" style="left:'+(sp.s/T*100)+'%;width:'+Math.max(0.6,dur/T*100)+'%"></div></div><div class="wf-meta" role="gridcell">'+dur.toFixed(2)+' s'+(sp.m?'<div class="sm t3">'+sp.m+'</div>':'')+'</div></div>';});
+$('#wf').innerHTML=wf;
+function showSpan(i){var sp=spans[i];$$('.wf-row').forEach(function(r){var on=+r.dataset.span===i;r.setAttribute('aria-selected',String(on));r.tabIndex=on?0:-1});
+  $('#spanDetail').innerHTML='<div class="hd"><h2 id="spanT" class="mono" style="font-family:var(--mono);font-size:13px">'+sp.n+'</h2></div><div class="bd"><dl class="kv sm"><dt>Starts</dt><dd class="num">'+sp.s.toFixed(2)+' s</dd><dt>Lasts</dt><dd class="num">'+(sp.e-sp.s).toFixed(2)+' s</dd>'+sp.a.map(function(a){return '<dt>'+a[0]+'</dt><dd>'+a[1]+'</dd>'}).join('')+'</dl><p class="sm t3">Trace <code>4bf92f3577b34da6a3ce929d0e0e4736</code></p></div>';}
+$$('.wf-row').forEach(function(r){r.addEventListener('click',function(){showSpan(+r.dataset.span)});r.addEventListener('keydown',function(e){var i=+r.dataset.span;if(e.key==='ArrowDown'&&i<spans.length-1){showSpan(i+1);$$('.wf-row')[i+1].focus();e.preventDefault()}if(e.key==='ArrowUp'&&i>0){showSpan(i-1);$$('.wf-row')[i-1].focus();e.preventDefault()}})});
+showSpan(3);
+
+/* ---------- cost chart ---------- */
+var days=['19 Nov','20 Nov','21 Nov','22 Nov','23 Nov','24 Nov','25 Nov'];
+var ser=[{n:'assistant',c:'var(--c1)',v:[0.084,0.112,0.097,0.131,0.076,0.058,0.149]},{n:'profile-demo',c:'var(--c2)',v:[0.021,0.034,0.018,0.042,0.027,0.011,0.038]},{n:'kb-extract',c:'var(--c3)',v:[0.004,0.003,0.011,0.004,0.003,0.002,0.004]}];
+var W=1100,H=280,pl=48,pr=12,pt=14,pb=30,max=0.20,cw=(W-pl-pr)/days.length,bw=24;
+function y(v){return pt+(H-pt-pb)*(1-v/max)}
+var svg='';
+[0,0.05,0.10,0.15,0.20].forEach(function(t){svg+='<line class="gl" x1="'+pl+'" x2="'+(W-pr)+'" y1="'+y(t)+'" y2="'+y(t)+'"/><text x="'+(pl-8)+'" y="'+(y(t)+4)+'" text-anchor="end">$'+t.toFixed(2)+'</text>'});
+days.forEach(function(d,i){var x=pl+cw*i+cw/2-bw/2,acc=0,tot=0;ser.forEach(function(s){tot+=s.v[i]});
+  ser.slice().reverse().forEach(function(s,j){var v=s.v[i],y0=y(acc),y1=y(acc+v);var h=y0-y1-(j>0?2:0);if(h<0.5)h=0.5;var top=y1;
+    if(j===ser.length-1&&h>=6){svg+='<path d="M'+x+' '+(top+h)+'V'+(top+4)+'q0 -4 4 -4h'+(bw-8)+'q4 0 4 4V'+(top+h)+'z" fill="'+s.c+'"/>'}
+    else svg+='<rect x="'+x+'" y="'+top+'" width="'+bw+'" height="'+h+'" fill="'+s.c+'"/>';acc+=v});
+  svg+='<text x="'+(x+bw/2)+'" y="'+(H-10)+'" text-anchor="middle">'+d+'</text>';
+  if(i===days.length-1) svg+='<text x="'+(x+bw/2)+'" y="'+(y(tot)-6)+'" text-anchor="middle" style="fill:var(--t1);font-weight:600">$'+tot.toFixed(3)+'</text>';
+  svg+='<rect x="'+(pl+cw*i)+'" y="'+pt+'" width="'+cw+'" height="'+(H-pt-pb)+'" fill="transparent" data-day="'+i+'" tabindex="0" aria-label="'+d+': $'+tot.toFixed(3)+'"/>';});
+svg+='<line x1="'+pl+'" x2="'+(W-pr)+'" y1="'+y(0)+'" y2="'+y(0)+'" stroke="var(--bctl)"/>';
+$('#costChart').innerHTML=svg;
+var tip=$('#tip');
+function showTip(i,ev){var tot=0;ser.forEach(function(s){tot+=s.v[i]});
+  tip.innerHTML='<b>'+days[i]+'</b>'+ser.map(function(s){return '<div class="tr"><span style="display:inline-flex;gap:6px;align-items:center"><i class="sq" style="background:'+s.c+'"></i>'+s.n+'</span><span class="num">$'+s.v[i].toFixed(3)+'</span></div>'}).join('')+'<div class="tr" style="border-top:1px solid var(--border);margin-top:4px;padding-top:4px"><span>Total</span><b class="num">$'+tot.toFixed(3)+'</b></div>';
+  tip.hidden=false;var r=ev.target.getBoundingClientRect();var tx=Math.min(window.innerWidth-190,r.left+r.width/2+12);tip.style.left=tx+'px';tip.style.top=(r.top+20)+'px';}
+$$('#costChart [data-day]').forEach(function(r){var i=+r.dataset.day;r.addEventListener('mouseenter',function(e){showTip(i,e)});r.addEventListener('focus',function(e){showTip(i,e)});r.addEventListener('mouseleave',function(){tip.hidden=true});r.addEventListener('blur',function(){tip.hidden=true})});
+$('#costTbl').innerHTML='<table><thead><tr><th>Day</th>'+ser.map(function(s){return '<th class="r mono">'+s.n+'</th>'}).join('')+'<th class="r">Total</th></tr></thead><tbody class="num">'+days.map(function(d,i){var t=0;return '<tr><td>'+d+'</td>'+ser.map(function(s){t+=s.v[i];return '<td class="r">$'+s.v[i].toFixed(3)+'</td>'}).join('')+'<td class="r">$'+t.toFixed(3)+'</td></tr>'}).join('')+'</tbody></table>';
+$('#tblToggle').addEventListener('click',function(){var t=$('#costTbl');t.hidden=!t.hidden;this.textContent=t.hidden?'Show table':'Hide table';this.setAttribute('aria-expanded',String(!t.hidden))});
+
+/* ---------- keyboard ---------- */
+var gPending=false, gmap={o:'overview',a:'agents',p:'playground',t:'tools',k:'knowledge',m:'models',c:'costs',r:'traces',v:'governance'};
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||tg==='SELECT'||e.metaKey||e.ctrlKey||e.altKey)return;
+  if(gPending&&gmap[e.key]){location.hash=gmap[e.key];gPending=false;return}
+  gPending=e.key==='g'; if(e.key==='['){$('#collapse').click()} });
+
+route();
+})();
+</script>

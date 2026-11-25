@@ -199,6 +199,17 @@ gateway:
   #       eviction: {consecutiveFailures: 1, duration: 30s}
   #   - name: auto
   #     failover: [gemini, claude-haiku]
+  # A scripted stand-in for a model, for trying the platform without a provider key (ADR 0014, README "Try it in 10 minutes"). It is NOT
+  # a language model. OFF: nothing renders. ON: a Deployment, a Service and a NetworkPolicy (only the gateway's proxy pods may call it; it may
+  # call nothing) in `gateway.namespace`; add a gateway.models entry with provider OpenAI and
+  # baseURL http://stub-model.<gateway.namespace>.svc.cluster.local:8080/v1 (components/quickstart/values.yaml does). install.sh builds and loads the image.
+  stubModel:
+    enabled: false
+    image: {repository: openagentix/stub-model, tag: dev, pullPolicy: IfNotPresent}   # built from services/stub-model and loaded into kind by install.sh
+    sourceHash: ""                # install.sh sets it to a hash of services/stub-model (the tag stays "dev")
+    resources:
+      requests: {cpu: 5m, memory: 8Mi}
+      limits: {cpu: 100m, memory: 32Mi}
   policy:
     name: model-gateway-policy    # the ONE AgentgatewayPolicy (docs warn that several can overwrite each other)
     apiKeyLabel: agentgateway.dev/apikey   # ConfigMaps with this label hold virtual-key hashes (install.sh)
@@ -557,6 +568,12 @@ console:
   # API server ports towards ANY address (a closed policy would cut the console off).
   apiServerCIDRs: []
   apiServerPorts: [443, 6443]
+  # Metrics for the Overview and Costs pages. With observability.enabled and observability.bundled.enabled the console reads the bundled
+  # VictoriaMetrics (query API, port 8428) and only the console may reach it. url overrides that with your own Prometheus-compatible store
+  # (http or https, host[:port], no credentials, path or query); the chart then opens no egress for it. Empty and no bundled store: no metrics.
+  metrics: {url: ""}
+  # Traces for the Traces page: the bundled Jaeger query API (port 16686) under the same conditions, or this URL for your own Jaeger query API.
+  traces: {url: ""}
   resources:
     requests: {cpu: 10m, memory: 32Mi}
     limits: {cpu: 250m, memory: 128Mi}

@@ -1841,7 +1841,7 @@ rm -f "$CNX"
 eq "the ten demo files render"                         "$([ -z "$(render_err "${CN10[@]}")" ] && echo rendered || echo failed)" rendered
 
 echo "# console: the objects"
-D=$(docs "${CN10[@]}")
+D=$(docs "${CN10[@]}" --set observability.enabled=false)
 CNNS=openagentix-system
 CND='.[]|select(.kind=="Deployment" and .metadata.name=="openagentix-console")'
 CNP="$CND|.spec.template.spec"
@@ -1927,7 +1927,7 @@ eq "no ingress at all"                                 "$(q "$D" "$CNN|[(.spec.p
 eq "egress: DNS first"                                 "$(q "$D" "$CNN|.spec.egress[0]|[.to[0].namespaceSelector.matchLabels[\"kubernetes.io/metadata.name\"],.to[0].podSelector.matchLabels[\"k8s-app\"],(.ports|map(.protocol+(.port|tostring))|sort|join(\",\"))]|join(\" \")")" "kube-system kube-dns TCP53,UDP53"
 eq "egress: two rules without CIDRs"                   "$(q "$D" "$CNN|.spec.egress|length")" 2
 eq "egress without CIDRs: the API server ports towards any address (documented fallback)" "$(q "$D" "$CNN|.spec.egress[1]|[(.to//[]|length|tostring),(.ports|map(.port|tostring)|join(\",\"))]|join(\" \")")" "0 443,6443"
-DCA=$(docs "${CN10[@]}" --set 'console.apiServerCIDRs={172.18.0.0/24,10.1.2.3/32}')
+DCA=$(docs "${CN10[@]}" --set observability.enabled=false --set 'console.apiServerCIDRs={172.18.0.0/24,10.1.2.3/32}')
 eq "egress with CIDRs: only those, on the API server ports" "$(q "$DCA" "$CNN|.spec.egress[1]|[(.to|map(.ipBlock.cidr)|join(\",\")),(.ports|map(.port|tostring)|join(\",\"))]|join(\" \")")" "172.18.0.0/24,10.1.2.3/32 443,6443"
 eq "networkPolicy.enabled=false renders no NetworkPolicy for the console" "$(count "$(docs "${CN10[@]}" --set networkPolicy.enabled=false)" '.kind=="NetworkPolicy" and .metadata.name=="openagentix-console"')" 0
 
@@ -1950,12 +1950,76 @@ cnfail "a bad API server port fails"                   --set 'console.apiServerP
 cnfail "an empty token Secret name fails"              --set console.tokenSecret.name=
 cnfail "an empty token Secret key fails"               --set console.tokenSecret.key=
 cnfail "a token Secret key with a slash fails"         --set console.tokenSecret.key=a/b
+echo "# stub model (ADR 0014): off by default, nothing renders"
+D=$(docs)
+eq "no stub-model Deployment by default"               "$(count "$D" '.metadata.name=="stub-model"')" 0
+D=$(docs --set gateway.stubModel.enabled=true)
+SM='.metadata.name=="stub-model"'
+eq "stub-model: Deployment, Service, NetworkPolicy"    "$(count "$D" "$SM")" 3
+eq "stub-model lives in the gateway namespace"         "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="stub-model")|.metadata.namespace')" agentgateway-system
+eq "stub-model image"                                  "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="stub-model")|.spec.template.spec.containers[0].image')" openagentix/stub-model:dev
+eq "stub-model runs non-root, read-only, no caps"      "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="stub-model")|.spec.template.spec|[.securityContext.runAsNonRoot,.containers[0].securityContext.readOnlyRootFilesystem,.containers[0].securityContext.allowPrivilegeEscalation,.containers[0].securityContext.capabilities.drop[0],.automountServiceAccountToken]|join(",")')" "true,true,false,ALL,false"
+eq "stub-model has limits and a probe"                 "$(q "$D" '.[]|select(.kind=="Deployment" and .metadata.name=="stub-model")|.spec.template.spec.containers[0]|(.resources.limits.memory!=null) and (.readinessProbe.httpGet.path=="/healthz")')" true
+eq "stub-model: only the gateway proxy may call it"    "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="stub-model")|[.spec.policyTypes[0],(.spec.ingress|length),.spec.ingress[0].from[0].podSelector.matchLabels["gateway.networking.k8s.io/gateway-name"],.spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"]]|join(",")')" "Ingress,1,model-gateway,agentgateway-system"
+eq "stub-model: egress closed"                         "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="stub-model")|.spec.policyTypes|index("Egress")!=null')" true
+eq "stub-model NetworkPolicy has no egress rule"       "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="stub-model")|(.spec.egress//[])|length')" 0
+eq "stub-model sourceHash annotates the pod"           "$(q "$(docs --set gateway.stubModel.enabled=true --set-string gateway.stubModel.sourceHash=abc)" '.[]|select(.kind=="Deployment" and .metadata.name=="stub-model")|.spec.template.metadata.annotations["openagentix.io/source-hash"]')" abc
+eq "stub-model off when the gateway is off"            "$(count "$(docs --set gateway.stubModel.enabled=true --set gateway.enabled=false)" "$SM")" 0
+
+echo "# quick start profile (components/quickstart/values.yaml)"
+QS="$CHART/../../components/quickstart/values.yaml"
+D=$(docs -f "$QS")
+eq "profile renders"                                   "$(q "$D" 'length>0')" true
+eq "profile: stub-model rendered"                      "$(count "$D" "$SM and .kind==\"Deployment\"")" 1
+eq "profile: no Telegram bridge"                       "$(count "$D" '.kind=="Deployment" and .metadata.name=="telegram-bridge"')" 0
+eq "profile: no chart agents"                          "$(count "$D" '.kind=="Agent"')" 0
+eq "profile: no knowledge base"                        "$(count "$D" '.metadata.name=="kb" or .metadata.name=="kb-embeddings"')" 0
+eq "profile: no notify, no memory embeddings"          "$(count "$D" '.metadata.name=="notify" or .metadata.name=="memory-embeddings"')" 0
+eq "profile: no schedules, no Kourier objects"         "$(count "$D" '.kind=="CronJob" or (.apiVersion|startswith("agentkourier"))')" 0
+eq "profile: control plane, console and gate on"       "$(count "$D" '.kind=="Deployment" and (.metadata.name|IN("openagentix-control-plane","openagentix-console","a2a-gate"))')" 3
+eq "profile: one tool server and one profile vMCP"     "$(count "$D" '.kind=="MCPServer"')/$(count "$D" '.kind=="VirtualMCPServer" and (.metadata.annotations["openagentix.io/tool-profile"]//"")!=""')" 1/1
+eq "profile: bundled observability on, content capture off"  "$(count "$D" '.kind=="Deployment" and (.metadata.name|IN("jaeger","victoria-metrics"))')/$(q "$D" '[.[]|select(.kind=="ConfigMap" and .metadata.name=="openagentix-observability")|.data.captureContent]|first')" 2/false
+eq "profile: the model alias goes through the gateway" "$(q "$D" '.[]|select(.kind=="AgentgatewayModel")|.metadata.name')" quickstart-model
+eq "profile: the gate has the ask rule"                "$(q "$D" '.[]|select(.kind=="ConfigMap" and (.data["rules.json"]//"")!="")|.data["rules.json"]|fromjson|.callers[]|select(.name=="quickstart-ask")|.agents[0]')" kagent/quickstart
+eq "profile: the policy admits the alias and profile"  "$(q "$D" '[.[]|select(.kind=="ConfigMap")|.data["policy.json"]//empty|fromjson|(.allowedModels[0],.allowedProfiles[0])]|join(",")')" quickstart-model,lookup
+
 echo "# secrets hygiene"
 D=$(docs --set bridge.token=SENTINEL-TOKEN-123 --set gateway.apiKey=SENTINEL-TOKEN-123)
 eq "chart renders no Secret objects"                   "$(count "$D" '.kind=="Secret"')" 0
 eq "no stringData/data anywhere"                       "$(q "$D" '[.[]|select(has("data") or has("stringData"))]|length')" 0
 eq "stray secret-looking values are never rendered"    "$(q "$D" 'tostring|contains("SENTINEL-TOKEN-123")')" false
 eq "no Secret-valued env var has a literal value"      "$(q "$D" '[.[]|select(.kind=="Deployment")|.spec.template.spec.containers[].env[]|select((.name|test("TOKEN|KEY|CHAT_IDS")) and has("value"))]|length')" 0
+
+echo "# console: metrics (the bundled metrics store is reachable by the console only)"
+D=$(docs "${CN10[@]}")
+VMURL="http://victoria-metrics.openagentix-observability.svc:8428"
+eq "console on + observability on: CONSOLE_METRICS_URL is the bundled store" "$(q "$D" "$CNC|.env[]|select(.name==\"CONSOLE_METRICS_URL\")|.value")" "$VMURL"
+eq "the console NetworkPolicy gets one egress rule to the store's pod and port 8428 only" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-console")|[.spec.egress[]|select(.to[0].podSelector.matchLabels.app=="victoria-metrics")|[.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],(.ports|map(.port)|join(","))]]|tostring')" '[["openagentix-observability","8428"]]'
+eq "the store's ingress admits the console pods only, on 8428 only" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="victoria-metrics-ingress")|[.spec.ingress[]|[.from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],.from[0].podSelector.matchLabels.app,(.ports|map(.port)|join(","))]]|tostring')" '[["openagentix-system","console","8428"]]'
+D=$(docs "${CP9[@]}")
+eq "observability on, console off: the store's ingress still admits nobody" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="victoria-metrics-ingress")|(.spec.ingress // [])|length')" 0
+D=$(docs "${CN10[@]}" --set observability.enabled=false)
+eq "console on, observability off: no CONSOLE_METRICS_URL" "$(q "$D" "$CNC|[.env[]|select(.name==\"CONSOLE_METRICS_URL\")]|length")" 0
+eq "console on, observability off: no egress to a metrics store" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-console")|[.spec.egress[]|select(.to[0].podSelector.matchLabels.app=="victoria-metrics")]|length')" 0
+D=$(docs "${CN10[@]}" --set console.metrics.url=https://metrics.example.org:8428)
+eq "console.metrics.url overrides the bundled store" "$(q "$D" "$CNC|.env[]|select(.name==\"CONSOLE_METRICS_URL\")|.value")" "https://metrics.example.org:8428"
+eq "an override opens no egress to the bundled store" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-console")|[.spec.egress[]|select(.to[0].podSelector.matchLabels.app=="victoria-metrics")]|length')" 0
+eq "a console.metrics.url with a query or credentials is refused" "$(render_err "${CN10[@]}" --set 'console.metrics.url=http://u:p@x:1/?q=1' | /usr/bin/grep -c 'console.metrics.url')" 1
+
+echo "# console: traces (Jaeger's query port is reachable by the console only)"
+D=$(docs "${CN10[@]}")
+JGURL="http://jaeger.openagentix-observability.svc:16686"
+eq "console on + observability on: CONSOLE_TRACES_URL is the bundled Jaeger" "$(q "$D" "$CNC|.env[]|select(.name==\"CONSOLE_TRACES_URL\")|.value")" "$JGURL"
+eq "the console NetworkPolicy gets one egress rule to Jaeger's pod and port 16686 only" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-console")|[.spec.egress[]|select(.to[0].podSelector.matchLabels.app=="jaeger")|[.to[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],(.ports|map(.port)|join(","))]]|tostring')" '[["openagentix-observability","16686"]]'
+eq "Jaeger's ingress keeps its OTLP ports and adds the console on 16686 only" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="jaeger-ingress")|[.spec.ingress[]|(.ports|map(.port)|join(","))]|tostring')" '["4317,4318","16686"]'
+eq "the console rule on Jaeger admits the console pods of the console namespace" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="jaeger-ingress")|.spec.ingress[]|select(.ports[0].port==16686)|[.from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"],.from[0].podSelector.matchLabels.app]|join(" ")')" "openagentix-system console"
+D=$(docs "${CP9[@]}")
+eq "console off: Jaeger's ingress is OTLP only" "$(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="jaeger-ingress")|[.spec.ingress[]|(.ports|map(.port)|join(","))]|tostring')" '["4317,4318"]'
+D=$(docs "${CN10[@]}" --set observability.enabled=false)
+eq "observability off: no CONSOLE_TRACES_URL" "$(q "$D" "$CNC|[.env[]|select(.name==\"CONSOLE_TRACES_URL\")]|length")" 0
+D=$(docs "${CN10[@]}" --set console.traces.url=https://jaeger.example.org:16686)
+eq "console.traces.url overrides the bundled Jaeger and opens no egress for it" "$(q "$D" "$CNC|.env[]|select(.name==\"CONSOLE_TRACES_URL\")|.value") $(q "$D" '.[]|select(.kind=="NetworkPolicy" and .metadata.name=="openagentix-console")|[.spec.egress[]|select(.to[0].podSelector.matchLabels.app=="jaeger")]|length')" "https://jaeger.example.org:16686 0"
+eq "a console.traces.url with credentials is refused" "$(render_err "${CN10[@]}" --set 'console.traces.url=http://u:p@x:1/' | /usr/bin/grep -c 'console.traces.url')" 1
 
 echo
 echo "passed=$PASS failed=$FAIL"

@@ -73,6 +73,19 @@ Sizes are relative. Each release has its own decision records before code.
 
 Candidates to adopt behind adapters (licences as read on 2026-11-25; check again before bundling): SPIFFE/SPIRE and Keycloak for identity, OpenBao with External Secrets for credentials, Presidio and NeMo Guardrails for safety, Argo Rollouts or Flagger for canary, promptfoo, DeepEval and Inspect for evaluation, garak and PyRIT for red teaming, Capsule or vCluster and Kueue for tenancy, OpenCost for cluster cost, `kubernetes-sigs/agent-sandbox` for code execution, Playwright MCP for the browser, Argo Workflows or Temporal for workflows, Karmada or Open Cluster Management for fleets. A broker for on-behalf-of-user OAuth with a consent step has no mature open-source project that we could confirm; expect to build a small one.
 
+## After v1: a software factory on top (idea, not planned work)
+
+Raised by the project owner on 2026-11-25: once v1 is done, support building a Kubernetes-native software factory, meaning agents that take a work item through plan, code, test, review and release, each step in a sandbox, governed and auditable.
+
+Working position, to be decided with its own decision record when v1 is done:
+
+- **A separate project on top of OpenAgentix, not part of this repository.** Foundation reviewers have declined proposals for having too much in one repository. OpenAgentix stays the neutral platform; the factory is the first serious application built on it, with its own resource kinds (for example repository, work item, pipeline, review gate) in its own API group.
+- **Shown inside the console through the plugin registry** that ADR 0010 already plans, so users see one product while the projects stay separate.
+- **It sets priorities for the platform.** A factory needs things the roadmap has in later releases: durable workflows, a code sandbox, credentials for Git and registries, human approval, evaluation, long-running tasks. If the factory is the goal, those move earlier.
+- **It is the adoption story.** The strongest evidence for a platform is a demanding application running on it, ideally building the platform itself.
+
+Open: how it differs from existing coding agents and agent runners (to be researched then), and whether it is open, commercial, or both.
+
 ## Community and enterprise
 
 Decided in [ADR 0010](decisions/0010-community-and-enterprise-editions.md). The rule: what one team needs to build, run and govern agents safely on one cluster is community; what an organisation needs because it has many teams, auditors, several clusters and a support contract is enterprise. Security is never an enterprise feature, the community edition has no limits by count, and nothing moves from community to enterprise later.

@@ -1,0 +1,24 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
+
+  # One entry per Go module (dependabot does not discover them). Add a block when a new module is added.
+  - package-ecosystem: gomod
+    directories:
+      - /services/a2a-gate
+      - /services/control-plane
+      - /services/kb
+      - /services/notify
+      - /bridges/telegram
+      - /tools/a2a-call
+    schedule:
+      interval: weekly
+    groups:
+      go-dependencies:
+        patterns: ['*']

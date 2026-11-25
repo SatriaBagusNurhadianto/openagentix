@@ -1,0 +1,2 @@
+# Go modules CI does not build (one directory per line). Modules whose go.mod replaces a module with a path outside this
+# repository are skipped automatically; list anything else here, with a reason.
